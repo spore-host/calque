@@ -28,13 +28,17 @@ type scriptedLauncher struct {
 	calls int
 }
 
-func (s *scriptedLauncher) Provision(_ context.Context, instanceType, region string) (LaunchOutcome, error) {
+func (s *scriptedLauncher) Provision(_ context.Context, instanceType, region, az string) (LaunchOutcome, error) {
 	i := s.calls
 	s.calls++
 	if i < len(s.errs) {
 		return LaunchOutcome{}, s.errs[i]
 	}
-	return LaunchOutcome{InstanceID: "i-abc123", AvailabilityZone: region + "a", PublicIP: "1.2.3.4", State: "pending"}, nil
+	landedAZ := az
+	if landedAZ == "" {
+		landedAZ = region + "a"
+	}
+	return LaunchOutcome{InstanceID: "i-abc123", AvailabilityZone: landedAZ, PublicIP: "1.2.3.4", State: "pending"}, nil
 }
 
 // noSleep makes retries instant so tests don't wait.
@@ -131,6 +135,47 @@ func TestAcquireDeadline(t *testing.T) {
 	_, err := acq.Acquire(context.Background(), tgt, "us-west-2")
 	if err == nil {
 		t.Fatal("expected deadline give-up, got success")
+	}
+}
+
+// azTrackingLauncher records the AZ of each Provision call and lands on a target AZ.
+type azTrackingLauncher struct {
+	landOn string   // AZ that succeeds; others return capacity failure
+	seen   []string // AZs tried, in order
+}
+
+func (l *azTrackingLauncher) Provision(_ context.Context, instanceType, region, az string) (LaunchOutcome, error) {
+	l.seen = append(l.seen, az)
+	if az == l.landOn {
+		return LaunchOutcome{InstanceID: "i-az", AvailabilityZone: az, State: "pending"}, nil
+	}
+	return LaunchOutcome{}, apiErr{"InsufficientInstanceCapacity"}
+}
+
+// TestAcquireSweepsAZs: capacity failures fall through to the next AZ within the
+// SAME round (no sleep), mirroring lagotto's launchAcrossAZs. Landing on the 3rd
+// AZ should require zero backoff sleeps.
+func TestAcquireSweepsAZs(t *testing.T) {
+	l := &azTrackingLauncher{landOn: "us-west-2c"}
+	sleeps := 0
+	acq := &Acquirer{
+		Launcher: l,
+		AZs:      []string{"us-west-2a", "us-west-2b", "us-west-2c", "us-west-2d"},
+		sleep:    func(_ context.Context, _ time.Duration) error { sleeps++; return nil },
+	}
+	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g6.2xlarge"}
+	got, err := acq.Acquire(context.Background(), tgt, "us-west-2")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if got.AvailabilityZone != "us-west-2c" {
+		t.Errorf("landed AZ = %q, want us-west-2c", got.AvailabilityZone)
+	}
+	if len(l.seen) != 3 || l.seen[0] != "us-west-2a" || l.seen[2] != "us-west-2c" {
+		t.Errorf("AZ sweep order = %v, want [2a 2b 2c]", l.seen)
+	}
+	if sleeps != 0 {
+		t.Errorf("landing within the first sweep should need 0 backoff sleeps, got %d", sleeps)
 	}
 }
 

@@ -34,8 +34,9 @@ func (a Acquired) TimeToAcquire() time.Duration { return a.AcquiredAt.Sub(a.Requ
 // in spawn#351: spawn OWNS RunInstances (there is no pre-acquired-instance
 // bring-up). The real implementation wraps spawn.launcher.Provision; a fake drives
 // tests offline. Returns a *LaunchOutcome or an error whose code we classify.
+// az selects a specific Availability Zone; "" lets EC2 choose.
 type Launcher interface {
-	Provision(ctx context.Context, instanceType, region string) (LaunchOutcome, error)
+	Provision(ctx context.Context, instanceType, region, az string) (LaunchOutcome, error)
 }
 
 // LaunchOutcome mirrors the fields calque needs from spawn's *aws.LaunchResult.
@@ -62,6 +63,12 @@ type Acquirer struct {
 	OnProgress   Progress
 	PollInterval time.Duration // backoff between capacity retries (default 15s)
 	Deadline     time.Duration // give up after this (default 30m); 0 => default
+	// AZs to sweep within the region before backing off, in preference order.
+	// On a capacity failure the Acquirer tries the next AZ immediately (AZ breadth
+	// within a region is free — mirrors lagotto's launchAcrossAZs). Empty => a
+	// single attempt letting EC2 choose the AZ. Only after the whole sweep returns
+	// capacity failures does the Acquirer sleep and retry the sweep.
+	AZs []string
 	// now is injectable so tests don't sleep in real time.
 	now   func() time.Time
 	sleep func(context.Context, time.Duration) error
@@ -87,58 +94,75 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 		deadline = 30 * time.Minute
 	}
 
+	// AZ sweep list: each round tries every AZ (in order) before backing off.
+	// Empty => one attempt per round letting EC2 choose ("" AZ). AZ breadth within
+	// a region is free — mirrors lagotto's launchAcrossAZs (spawner.go:167).
+	azs := a.AZs
+	if len(azs) == 0 {
+		azs = []string{""}
+	}
+
 	start := now()
 	giveUp := start.Add(deadline)
 	attempt := 0
 	unknownStreak := 0
 	const maxUnknown = 3 // tolerate a few transient/unknown blips, then fail fast
 	for {
-		attempt++
-		out, err := a.Launcher.Provision(ctx, t.Instance, region)
-		if err == nil {
-			acq := Acquired{
-				InstanceID: out.InstanceID, Region: out.Region, AvailabilityZone: out.AvailabilityZone,
-				PublicIP: out.PublicIP, State: out.State, RequestedAt: start, AcquiredAt: now(),
+		var lastCode string
+		// One round = a full sweep across AZs. A capacity failure in one AZ falls
+		// through to the next AZ immediately (no sleep); only a fully-failed sweep sleeps.
+		for _, az := range azs {
+			attempt++
+			out, err := a.Launcher.Provision(ctx, t.Instance, region, az)
+			if err == nil {
+				acq := Acquired{
+					InstanceID: out.InstanceID, Region: out.Region, AvailabilityZone: out.AvailabilityZone,
+					PublicIP: out.PublicIP, State: out.State, RequestedAt: start, AcquiredAt: now(),
+				}
+				if acq.Region == "" {
+					acq.Region = region // spawn#351: LaunchResult has no Region; carry ours
+				}
+				if acq.AvailabilityZone == "" {
+					acq.AvailabilityZone = az
+				}
+				t.Region = acq.Region
+				// Free ground truth: time-to-acquire per (card, region, AZ) (§5).
+				if a.Report != nil && attempt > 1 {
+					a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
+						"acquired %s in %s/%s after %d attempts / %s waiting for capacity",
+						t.Instance, acq.Region, acq.AvailabilityZone, attempt, acq.TimeToAcquire().Round(time.Second))
+				}
+				return acq, nil
 			}
-			if acq.Region == "" {
-				acq.Region = region // spawn#351: LaunchResult has no Region; carry ours
+
+			kind, code := classify(err)
+			lastCode = code
+			if kind == failureTerminal {
+				return Acquired{}, fmt.Errorf("acquire %s/%s: terminal failure %q: %w", t.Instance, region, code, err)
 			}
-			t.Region = acq.Region
-			// Free ground truth: time-to-acquire per (card, region) (§5).
-			if a.Report != nil && attempt > 1 {
-				a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
-					"acquired %s in %s after %d attempts / %s waiting for capacity",
-					t.Instance, acq.Region, attempt, acq.TimeToAcquire().Round(time.Second))
+			if kind == failureUnknown {
+				unknownStreak++
+				if unknownStreak > maxUnknown {
+					return Acquired{}, fmt.Errorf("acquire %s/%s: %d consecutive unrecognized errors (last %q); failing fast rather than looping on a likely misconfig: %w",
+						t.Instance, region, unknownStreak, code, err)
+				}
+			} else {
+				unknownStreak = 0 // a real capacity signal resets the unknown counter
 			}
-			return acq, nil
 		}
 
-		kind, code := classify(err)
-		if kind == failureTerminal {
-			return Acquired{}, fmt.Errorf("acquire %s/%s: terminal failure %q: %w", t.Instance, region, code, err)
-		}
-		if kind == failureUnknown {
-			unknownStreak++
-			if unknownStreak > maxUnknown {
-				return Acquired{}, fmt.Errorf("acquire %s/%s: %d consecutive unrecognized errors (last %q); failing fast rather than looping on a likely misconfig: %w",
-					t.Instance, region, unknownStreak, code, err)
-			}
-		} else {
-			unknownStreak = 0 // a real capacity signal resets the unknown counter
-		}
-		// capacity (or a bounded unknown): wait and retry, unless the deadline has
-		// passed. This is what lagotto's warm pool hides on Modal.
-		waited := now().Sub(start)
+		// The whole AZ sweep returned capacity failures. Back off, unless the
+		// deadline has passed. This wait is what lagotto's warm pool hides on Modal.
 		if a.OnProgress != nil {
-			a.OnProgress(attempt, code, waited)
+			a.OnProgress(attempt, lastCode, now().Sub(start))
 		}
 		if now().After(giveUp) {
 			if a.Report != nil {
 				a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
-					"gave up acquiring %s in %s after %s (%d attempts); last code %q",
-					t.Instance, region, deadline, attempt, code)
+					"gave up acquiring %s in %s after %s (%d attempts across %d AZ(s)); last code %q",
+					t.Instance, region, deadline, attempt, len(azs), lastCode)
 			}
-			return Acquired{}, fmt.Errorf("acquire %s/%s: no capacity after %s (%d attempts)", t.Instance, region, deadline, attempt)
+			return Acquired{}, fmt.Errorf("acquire %s/%s: no capacity after %s (%d attempts, %d AZ(s))", t.Instance, region, deadline, attempt, len(azs))
 		}
 		if err := sleep(ctx, poll); err != nil {
 			return Acquired{}, err

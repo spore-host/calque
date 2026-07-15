@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 
@@ -92,6 +93,17 @@ func smoke(o smokeOpts) (err error) {
 		}
 	}
 
+	// Discover the AZs that offer this instance in the region, so the Acquirer can
+	// sweep them (try each on a capacity failure before backing off — AZ breadth is
+	// free, mirroring lagotto's launchAcrossAZs). Falls back to EC2-chooses on error.
+	var azs []string
+	if ec2Client := ec2.NewFromConfig(cfg); true {
+		if found, aerr := calexec.AZsForInstance(ctx, ec2Client, inst); aerr == nil && len(found) > 0 {
+			azs = found
+			fmt.Printf("      AZ sweep: %v (offering %s)\n", azs, inst)
+		}
+	}
+
 	// 3. acquire via the Acquirer over spawn.Provision.
 	spawnClient, err := spawnaws.NewClientWithRegion(ctx, o.region)
 	if err != nil {
@@ -102,9 +114,9 @@ func smoke(o smokeOpts) (err error) {
 		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami, PricePerHour: pricePerHr,
 	}
 	acq := &plan.Acquirer{
-		Launcher: launcher, Report: rep, Deadline: o.deadline,
+		Launcher: launcher, Report: rep, Deadline: o.deadline, AZs: azs,
 		OnProgress: func(attempt int, code string, waited time.Duration) {
-			fmt.Printf("      ...waiting for capacity (attempt %d, %s, %s)\n", attempt, code, waited.Round(time.Second))
+			fmt.Printf("      ...swept %d attempt(s), still no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 		},
 	}
 	tgt := &target.Target{Card: target.DefaultCard, Instance: inst}

@@ -38,6 +38,8 @@ github.com/aws/aws-sdk-go-v2/service/ebs v1.34.7 h1:8cSeObfW/xr+s2Hra2kArFisWz05
 github.com/aws/aws-sdk-go-v2/service/ebs v1.34.7/go.mod h1:u+YbhSelj9tbG7rWdjRbRnUi6izHK5hjZnxxA9dtCvQ=
 github.com/aws/aws-sdk-go-v2/service/ec2 v1.301.0 h1:U+cZAMc8mN0jne8/ae7KrrFuILTXrZReAvc6BIpXGls=
 github.com/aws/aws-sdk-go-v2/service/ec2 v1.301.0/go.mod h1:Y95W0Hm6FYLPa6o0hbnJ+sWgmdc4ifcLFjGkdobWVhY=
+github.com/aws/aws-sdk-go-v2/service/ec2 v1.316.1 h1:x3XE3BMK8aUpGx/m4CwmCmxc1LnN6saZujJ5K6pIFXU=
+github.com/aws/aws-sdk-go-v2/service/ec2 v1.316.1/go.mod h1:eoF0SIRbTgKWnTcTPYckiURPba/7ilfEkvwL4V1iHK4=
 github.com/aws/aws-sdk-go-v2/service/efs v1.41.16 h1:qHmh61/S6g+scI9M4U3XYivCiEp1tUadKgyrczuLJpM=
 github.com/aws/aws-sdk-go-v2/service/efs v1.41.16/go.mod h1:Q7WcY1H6krqZEnFyxyuzfLAnEad1Q69U4CrBbY4P2Fg=
 github.com/aws/aws-sdk-go-v2/service/fsx v1.65.10 h1:Hbq4SjVDCTnJ4leFO35t3xkUWriD8EwIpydTMV8WxEo=

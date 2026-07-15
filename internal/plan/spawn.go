@@ -38,7 +38,7 @@ type SpawnLauncher struct {
 // Provision launches one instance of instanceType in region and returns the
 // live handle fields calque needs. A capacity failure surfaces as a
 // *spawnaws.LaunchError, which the Acquirer's classify() reads via smithy.
-func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region string) (LaunchOutcome, error) {
+func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region, az string) (LaunchOutcome, error) {
 	if s.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
@@ -53,14 +53,15 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region stri
 		ttl = "2h"
 	}
 	cfg := spawnaws.LaunchConfig{
-		InstanceType:    instanceType,
-		Region:          region,
-		AMI:             s.AMI, // empty => spawn auto-selects (broken for GPU; pin for GPU)
-		TTL:             ttl,
-		OnComplete:      onComplete,
-		Username:        s.Username,
-		JobArrayCommand: s.RunCmd,
-		PricePerHour:    s.PricePerHour, // >0 => spawn skips its per-launch price lookup
+		InstanceType:     instanceType,
+		Region:           region,
+		AvailabilityZone: az,    // "" => EC2 chooses; set by the Acquirer's AZ sweep
+		AMI:              s.AMI, // empty => spawn auto-selects (broken for GPU; pin for GPU)
+		TTL:              ttl,
+		OnComplete:       onComplete,
+		Username:         s.Username,
+		JobArrayCommand:  s.RunCmd,
+		PricePerHour:     s.PricePerHour, // >0 => spawn skips its per-launch price lookup
 	}
 	res, err := launcher.Provision(ctx, s.Client, cfg, launcher.Options{})
 	if err != nil {
