@@ -65,6 +65,14 @@ func (m *Model) awsRectangleSecondsAt(n int) float64 {
 	return compute/p + m.M.AcquireSeconds + m.M.EnterSeconds
 }
 
+// ErrNoComputeMeasured means per-item compute is ~0 — the model can't produce a
+// meaningful K (both sides collapse toward the fixed overheads). This happens on a
+// dry-run with a trivial stand-in body; the caller should treat K as undefined.
+var ErrNoComputeMeasured = fmt.Errorf("per-item compute is ~0; K is undefined (no real measurement)")
+
+// hasCompute reports whether the per-item measurement is substantial enough for K.
+func (m *Model) hasCompute() bool { return m.M.SecPerItem >= 1e-4 }
+
 // ModalAt returns Modal's cost for n items (R_m for the card asked for).
 func (m *Model) ModalAt(n int) (SideCost, error) {
 	rm, ok := m.Rates.ModalRate(m.M.CardAskedFor)
@@ -157,6 +165,9 @@ func (m *Model) Crossover(fraction float64) (int, bool, error) {
 // Verdict renders the §9 headline: the boundary the user locates themselves
 // against, willing to say STAY ON MODAL. `atItems` is the user's actual workload.
 func (m *Model) Verdict(atItems int) (string, error) {
+	if !m.hasCompute() {
+		return "", ErrNoComputeMeasured
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Your workload:   %s (asked for %s -> substituted %s), %d items, measured %.3fs/item, occupancy %.0f%%\n",
 		"map-batch", m.M.CardAskedFor, m.M.InstanceUsed, atItems, m.M.SecPerItem, m.M.Occupancy*100)

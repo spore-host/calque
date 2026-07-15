@@ -189,10 +189,11 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 
 func buildFn(f pyFunc, script string, rep *leak.Report, mapped map[string]bool) ir.Function {
 	fn := ir.Function{
-		Name:  f.Name,
-		Body:  f.Body,
-		Line:  f.Lineno,
-		IsMap: mapped[f.Name],
+		Name:    f.Name,
+		Body:    f.Body,
+		Line:    f.Lineno,
+		IsMap:   mapped[f.Name],
+		ItemArg: firstItemArg(f.Args),
 	}
 	// The function-config decorator is the one named "*.function" (or "*.method"
 	// for class methods); enter/method markers carry no gpu/volumes.
@@ -324,6 +325,18 @@ func stringifyArgs(args []any, method, script string, rep *leak.Report) []string
 		}
 	}
 	return out
+}
+
+// firstItemArg returns the first non-self/cls parameter — the per-item argument
+// the warm runner binds each work item to (e.g. "prompt" in generate(self, prompt)).
+func firstItemArg(args []string) string {
+	for _, a := range args {
+		if a == "self" || a == "cls" {
+			continue
+		}
+		return a
+	}
+	return "item"
 }
 
 func asInt(v any) int {

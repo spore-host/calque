@@ -41,6 +41,7 @@ type Function struct {
 	Timeout int               // seconds; 0 if unset
 	IsMap   bool              // is this callable's .map() invoked anywhere in the script?
 	Body    string            // verbatim payload, shipped to the worker
+	ItemArg string            // first non-self parameter name — the per-item arg the warm runner binds
 	Line    int               // source line of the def, for leak attribution
 }
 

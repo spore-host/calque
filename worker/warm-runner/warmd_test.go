@@ -1,28 +1,16 @@
-package main
+package warm
 
 import (
 	"context"
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"sync"
 	"testing"
 )
 
-// memSink is an in-memory result sink for tests (S3 stands in here).
-type memSink struct {
-	mu      sync.Mutex
-	results map[int]Result
-}
-
-func newMemSink() *memSink { return &memSink{results: map[int]Result{}} }
-
-func (m *memSink) Put(_ context.Context, r Result) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.results[r.Index] = r
-	return nil
-}
+// Tests use the package's exported MemSink (same type the dry-run uses), so the
+// dry-run path and the tests exercise identical sink behavior.
+func newMemSink() *MemSink { return NewMemSink() }
 
 // capturingLeaker records leaks so tests can assert rough edges were surfaced.
 type capturingLeaker struct{ msgs []string }

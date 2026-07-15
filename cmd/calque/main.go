@@ -1,16 +1,20 @@
-// Command calque is the spike CLI. For now it wires the *static* spine that
-// needs no live AWS: parse -> gpu rewrite/guard -> leak + substitution report.
-// The live stages (gate/plan/exec/measure/cost) attach here as they land.
+// Command calque is the spike CLI (spec §12).
 //
 // Usage:
 //
-//	calque analyze <script.py> [<script.py> ...]   # static passes over a corpus
-//	calque run <script.py>                          # full pipeline (TODO: live stages)
+//	calque analyze <script.py> [<script.py> ...]        # static passes over a corpus
+//	calque run [--n N] [--region R] [--dry-run] <script.py>   # full pipeline -> crossover K
+//
+// `run --dry-run` exercises every stage end-to-end WITHOUT launching a billable
+// instance: it drives the warm worker locally on a synthetic sample and emits a
+// crossover K with its inputs honestly flagged measured|proxy. Dropping --dry-run
+// (a real launch) is gated pending explicit authorization.
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,28 +31,48 @@ import (
 const bedrockRegion = "us-east-1"
 
 func main() {
-	if len(os.Args) < 3 {
+	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
-	cmd, scripts := os.Args[1], os.Args[2:]
-	switch cmd {
+	switch os.Args[1] {
 	case "analyze":
-		if err := analyze(scripts); err != nil {
+		if len(os.Args) < 3 {
+			usage()
+			os.Exit(2)
+		}
+		if err := analyze(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
 	case "run":
-		fmt.Fprintln(os.Stderr, "run: live stages (plan/exec/measure/cost) not wired yet; use `analyze` for the static spine")
-		os.Exit(2)
+		if err := runCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
 	}
 }
 
+func runCmd(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	n := fs.Int("n", 100000, "item count the verdict locates the user against")
+	region := fs.String("region", "us-west-2", "AWS region for acquisition/pricing")
+	dryRun := fs.Bool("dry-run", true, "exercise every stage without launching a billable instance (default true; real launch is gated)")
+	rates := fs.String("rates", "config/rates.json", "path to the dated rate table")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: calque run [--n N] [--region R] [--dry-run] <script.py>")
+	}
+	return run(runOpts{script: fs.Arg(0), n: *n, region: *region, dryRun: *dryRun, ratesFP: *rates})
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: calque analyze <script.py> [...]   |   calque run <script.py>")
+	fmt.Fprintln(os.Stderr, "usage: calque analyze <script.py> [...]   |   calque run [--n N] [--region R] [--dry-run] <script.py>")
 }
 
 // pyastDir locates the helper relative to the repo. We resolve it from this

@@ -21,7 +21,7 @@
 // This "Go supervises warm Python" boundary is the riskiest plumbing in the spike.
 // Every rough edge here (lifecycle, protocol, backpressure, flush) is logged as a
 // leak (§10) — those are exactly the findings the spike exists to surface.
-package main
+package warm
 
 import (
 	"bufio"
@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
-	"time"
 )
 
 // Config is the warm unit's verbatim bodies (from the parser) plus its item arg.
@@ -297,11 +296,38 @@ func unsettled(items []Item, settled func(int) bool) []int {
 	return out
 }
 
-// main is the on-instance entrypoint (invoked inside the worker image). For the
-// spike it is exercised primarily via the test harness; the production wiring
-// (read config + items from the launch payload, sink to S3) attaches in exec.
-func main() {
-	// Intentionally minimal: the supervisor is a library used by exec and tests.
-	// A standalone CLI mode can be added when the worker image is assembled.
-	_ = time.Now
+// MemSink is an in-memory result sink: results keyed by index, plus the per-item
+// wall-clock series for the tach hook (§8). Used by the dry-run and tests; the
+// real run uses an S3 sink. Safe for the serial supervisor (single writer).
+type MemSink struct {
+	results map[int]Result
+	order   []int
 }
+
+// NewMemSink builds an empty in-memory sink.
+func NewMemSink() *MemSink { return &MemSink{results: map[int]Result{}} }
+
+// Put records a result.
+func (m *MemSink) Put(_ context.Context, r Result) error {
+	if _, seen := m.results[r.Index]; !seen {
+		m.order = append(m.order, r.Index)
+	}
+	m.results[r.Index] = r
+	return nil
+}
+
+// Seconds returns the per-item wall-clock series (in completion order) for
+// measure.Aggregate.
+func (m *MemSink) Seconds() []float64 {
+	out := make([]float64, 0, len(m.order))
+	for _, idx := range m.order {
+		out = append(out, m.results[idx].Seconds)
+	}
+	return out
+}
+
+// Results exposes the keyed results (for ordered collection / assertions).
+func (m *MemSink) Results() map[int]Result { return m.results }
+
+// Count reports how many results landed.
+func (m *MemSink) Count() int { return len(m.results) }
