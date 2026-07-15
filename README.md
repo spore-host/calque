@@ -47,7 +47,11 @@ The Go control plane understands **decorators** (configuration). It does **not**
 
 ## Layout
 
-See `docs/DECISIONS.md`. Directory tree follows the spike spec §12.
+Directory tree follows the spike spec §12, with one rename: the spec's worker
+supervisor is called `spored`, but that name is already the spore.host lifecycle
+daemon (systemd service on every instance). Ours is **`warmd`** (`worker/warm-runner/`),
+which runs *under* the real spored. Project tracking lives on GitHub (Issues /
+Projects / milestones), not in local files.
 
 ## Build
 
