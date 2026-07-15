@@ -1,0 +1,9 @@
+[project]
+name = "calque-pyast"
+version = "0.1.0"
+description = "Modal-decorator AST -> JSON helper for the calque Go control plane (spec §13)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+calque-pyast = "pyast:main"

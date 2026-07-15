@@ -1,0 +1,16 @@
+# Go
+/bin/
+*.test
+*.out
+
+# Python helper (uv)
+tools/pyast/.venv/
+__pycache__/
+*.pyc
+
+# Local run artifacts (never commit measured runs — they're reproduced, not stored)
+/runs/
+*.local.json
+
+# Env / creds — never commit
+.env
