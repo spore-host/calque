@@ -90,6 +90,8 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 	start := now()
 	giveUp := start.Add(deadline)
 	attempt := 0
+	unknownStreak := 0
+	const maxUnknown = 3 // tolerate a few transient/unknown blips, then fail fast
 	for {
 		attempt++
 		out, err := a.Launcher.Provision(ctx, t.Instance, region)
@@ -115,8 +117,17 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 		if kind == failureTerminal {
 			return Acquired{}, fmt.Errorf("acquire %s/%s: terminal failure %q: %w", t.Instance, region, code, err)
 		}
-		// capacity (or unknown, treated as retryable): wait and retry, unless the
-		// deadline has passed. This is what lagotto's warm pool hides on Modal.
+		if kind == failureUnknown {
+			unknownStreak++
+			if unknownStreak > maxUnknown {
+				return Acquired{}, fmt.Errorf("acquire %s/%s: %d consecutive unrecognized errors (last %q); failing fast rather than looping on a likely misconfig: %w",
+					t.Instance, region, unknownStreak, code, err)
+			}
+		} else {
+			unknownStreak = 0 // a real capacity signal resets the unknown counter
+		}
+		// capacity (or a bounded unknown): wait and retry, unless the deadline has
+		// passed. This is what lagotto's warm pool hides on Modal.
 		waited := now().Sub(start)
 		if a.OnProgress != nil {
 			a.OnProgress(attempt, code, waited)
@@ -148,6 +159,7 @@ const (
 	failureNone failureKind = iota
 	failureCapacity
 	failureTerminal
+	failureUnknown // unrecognized code: retry, but only a bounded number of times
 )
 
 var capacityCodes = map[string]bool{
@@ -172,6 +184,15 @@ var terminalCodes = map[string]bool{
 	"InvalidSubnetID.NotFound":     true,
 	"InvalidGroup.NotFound":        true,
 	"Unsupported":                  true,
+	// Config/setup errors surfaced by spawn's pre-launch steps (AMI resolution via
+	// SSM, IAM). These will NEVER resolve by waiting — retrying them just masks a
+	// misconfiguration as a capacity wait (observed: spawn's GPU AL2023 SSM param
+	// doesn't exist, yielding ParameterNotFound on every g6/g7 attempt).
+	"ParameterNotFound":     true,
+	"AccessDenied":          true,
+	"AccessDeniedException": true,
+	"ValidationError":       true,
+	"ValidationException":   true,
 }
 
 // classify returns the failure kind and the AWS error code (for status/logging).
@@ -193,10 +214,13 @@ func classify(err error) (failureKind, string) {
 			strings.Contains(code, "InsufficientCapacity"):
 			return failureCapacity, code
 		default:
-			return failureCapacity, code // unknown AWS code: retry, bounded by deadline
+			// A recognized AWS error we haven't classified: retry, but bounded — an
+			// unknown code looping for the whole deadline masks a real misconfig as a
+			// capacity wait (the ParameterNotFound lesson).
+			return failureUnknown, code
 		}
 	}
-	return failureCapacity, "" // non-AWS error: transient, retry
+	return failureUnknown, "" // non-AWS error (e.g. network): retry, bounded
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

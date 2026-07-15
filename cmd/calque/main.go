@@ -87,6 +87,8 @@ func smokeCmd(args []string) error {
 	runID := fs.String("run-id", "", "unique run id (required; e.g. smoke-YYYYMMDD-HHMM)")
 	ttl := fs.String("ttl", "30m", "instance TTL hard cap (spawn reaps at this)")
 	deadlineMin := fs.Int("deadline-min", 20, "give up acquiring/waiting after N minutes")
+	instance := fs.String("instance", "", "override instance type (capacity fallback, e.g. g6.2xlarge); empty => g7e.2xlarge")
+	ami := fs.String("ami", "", "pin the AMI (spawn's GPU auto-select is broken); empty => let spawn choose")
 	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable g7e")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -99,7 +101,7 @@ func smokeCmd(args []string) error {
 	}
 	return smoke(smokeOpts{
 		bucket: *bucket, region: *region, runID: *runID, ttl: *ttl,
-		deadline: time.Duration(*deadlineMin) * time.Minute,
+		deadline: time.Duration(*deadlineMin) * time.Minute, instance: *instance, ami: *ami,
 	})
 }
 

@@ -26,6 +26,8 @@ type smokeOpts struct {
 	runID    string
 	ttl      string
 	deadline time.Duration
+	instance string // override the resolved instance (capacity fallback, e.g. g6.2xlarge)
+	ami      string // pinned AMI (spawn's GPU auto-select is broken; see spawn issue)
 }
 
 // smoke is the acquire-only smoke test (§16.1 de-risking): acquire a g7e, run
@@ -81,7 +83,7 @@ func smoke(o smokeOpts) (err error) {
 	}
 	launcher := &plan.SpawnLauncher{
 		Client: spawnClient, RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
-		Username: "ubuntu", Timeout: 5 * time.Minute,
+		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami,
 	}
 	acq := &plan.Acquirer{
 		Launcher: launcher, Report: rep, Deadline: o.deadline,
@@ -89,7 +91,11 @@ func smoke(o smokeOpts) (err error) {
 			fmt.Printf("      ...waiting for capacity (attempt %d, %s, %s)\n", attempt, code, waited.Round(time.Second))
 		},
 	}
-	tgt := &target.Target{Card: target.DefaultCard, Instance: "g7e.2xlarge"}
+	inst := o.instance
+	if inst == "" {
+		inst = "g7e.2xlarge"
+	}
+	tgt := &target.Target{Card: target.DefaultCard, Instance: inst}
 	fmt.Printf("[4/7] acquiring %s in %s (block-and-wait)...\n", tgt.Instance, o.region)
 	acquired, err := acq.Acquire(ctx, tgt, o.region)
 	if err != nil {

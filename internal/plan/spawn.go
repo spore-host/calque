@@ -23,6 +23,11 @@ type SpawnLauncher struct {
 	OnComplete string        // "terminate" (default) so the instance dies when the job signals done
 	Username   string        // primary linux user (for pre-stop hook $HOME resolution)
 	Timeout    time.Duration // per-Provision call timeout
+	// AMI pins the machine image. Empty lets spawn auto-select, but spawn's
+	// GetRecommendedAMI resolves a GPU AL2023 SSM parameter that AWS does not
+	// publish (ParameterNotFound) and misdetects g6e/g7/g7e as non-GPU — so for
+	// GPU instances we pin a Deep Learning AMI explicitly. See spawn issue.
+	AMI string
 }
 
 // Provision launches one instance of instanceType in region and returns the
@@ -45,6 +50,7 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region stri
 	cfg := spawnaws.LaunchConfig{
 		InstanceType:    instanceType,
 		Region:          region,
+		AMI:             s.AMI, // empty => spawn auto-selects (broken for GPU; pin for GPU)
 		TTL:             ttl,
 		OnComplete:      onComplete,
 		Username:        s.Username,

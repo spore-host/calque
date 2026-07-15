@@ -50,8 +50,9 @@ func TestClassify(t *testing.T) {
 		{apiErr{"Server.InsufficientInstanceCapacity"}, failureCapacity},
 		{apiErr{"VcpuLimitExceeded"}, failureTerminal},
 		{apiErr{"UnauthorizedOperation"}, failureTerminal},
-		{apiErr{"SomeNovelCode"}, failureCapacity},                  // unknown AWS -> retry
-		{errors.New("connection reset"), failureCapacity},           // non-AWS -> retry
+		{apiErr{"ParameterNotFound"}, failureTerminal},              // spawn AMI/SSM misconfig -> fail fast
+		{apiErr{"SomeNovelCode"}, failureUnknown},                   // unknown AWS -> bounded retry
+		{errors.New("connection reset"), failureUnknown},            // non-AWS -> bounded retry
 		{apiErr{"WeirdInsufficientCapacityThing"}, failureCapacity}, // substring fallback
 	}
 	for _, c := range cases {
@@ -130,6 +131,27 @@ func TestAcquireDeadline(t *testing.T) {
 	_, err := acq.Acquire(context.Background(), tgt, "us-west-2")
 	if err == nil {
 		t.Fatal("expected deadline give-up, got success")
+	}
+}
+
+// TestAcquireUnknownFailsFast: an unrecognized error must NOT loop to the
+// deadline (the ParameterNotFound lesson — a config bug masqueraded as capacity
+// for 18 min). It should bail after a few consecutive unknowns.
+func TestAcquireUnknownFailsFast(t *testing.T) {
+	// 100 unknown errors queued, but we should stop after maxUnknown (3) + 1.
+	errs := make([]error, 100)
+	for i := range errs {
+		errs[i] = apiErr{"ParameterNotFoundLikeButUnclassified"}
+	}
+	l := &scriptedLauncher{errs: errs}
+	acq := &Acquirer{Launcher: l, PollInterval: time.Millisecond, Deadline: time.Hour, sleep: noSleep}
+	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g7e.2xlarge"}
+	_, err := acq.Acquire(context.Background(), tgt, "us-west-2")
+	if err == nil {
+		t.Fatal("expected fail-fast on repeated unknown errors")
+	}
+	if l.calls > 5 { // maxUnknown=3, so ~4 calls; certainly not 100 or deadline-bound
+		t.Errorf("unknown errors should fail fast, but made %d attempts", l.calls)
 	}
 }
 
