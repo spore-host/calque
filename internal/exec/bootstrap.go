@@ -19,6 +19,10 @@ type BootstrapConfig struct {
 	ManifestKey    string // s3 key of the work manifest
 	WorkerDir      string // in-container dir for artifacts, e.g. "/opt/calque"
 	Region         string
+	// HostMode runs warmd directly on the instance host (no docker) — used by the
+	// acquire-only smoke test to isolate acquisition + instance-role S3 + collect +
+	// terminate from the docker/GPU/model layer. Real inference uses docker mode.
+	HostMode bool
 }
 
 // Command builds the shell command the instance runs (via spawn JobArrayCommand /
@@ -38,12 +42,26 @@ func (b BootstrapConfig) Command() string {
 
 	lines := []string{
 		"set -euxo pipefail",
-		// Host prep: ensure aws + docker + nvidia runtime are present (DL AMIs have them).
+		// Host prep: ensure aws cli is present (DL AMIs have it).
 		"command -v aws >/dev/null || (apt-get update && apt-get install -y awscli)",
 		fmt.Sprintf("mkdir -p %s", wd),
 		// Pull tiny worker artifacts from S3 (warmd binary + python scripts).
 		fmt.Sprintf("aws s3 cp --recursive %s/ %s/", art, wd),
 		fmt.Sprintf("chmod +x %s/warmd", wd),
+	}
+
+	if b.HostMode {
+		// Smoke test: run warmd directly on the host — no docker, no GPU, no model.
+		// Isolates acquisition + instance-role S3 + collect + terminate. runner.py
+		// needs only python3, which DL AMIs (and most Ubuntu AMIs) have.
+		lines = append(lines,
+			"command -v python3 >/dev/null || (apt-get update && apt-get install -y python3)",
+			fmt.Sprintf("AWS_REGION=%s %s/warmd run --manifest %s", b.Region, wd, manifest),
+		)
+		return strings.Join(lines, "\n")
+	}
+
+	lines = append(lines,
 		// Pull the base inference image (fast from within AWS).
 		fmt.Sprintf("docker pull %s", b.BaseImage),
 		// Run the worker: GPU on, artifacts mounted, AWS creds via instance role
@@ -56,6 +74,6 @@ func (b BootstrapConfig) Command() string {
 			b.BaseImage,
 			"run --manifest " + manifest,
 		}, " "),
-	}
+	)
 	return strings.Join(lines, "\n")
 }

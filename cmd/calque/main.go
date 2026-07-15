@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spore-host/calque/internal/gate"
 	"github.com/spore-host/calque/internal/gpu"
@@ -50,6 +51,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "smoke":
+		if err := smokeCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -71,8 +77,37 @@ func runCmd(args []string) error {
 	return run(runOpts{script: fs.Arg(0), n: *n, region: *region, dryRun: *dryRun, ratesFP: *rates})
 }
 
+// smokeCmd runs the acquire-only smoke test — the FIRST billable action. Gated
+// behind an explicit --i-understand-this-spends-money flag so it can never fire
+// by accident.
+func smokeCmd(args []string) error {
+	fs := flag.NewFlagSet("smoke", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "S3 bucket for artifacts/results (required)")
+	region := fs.String("region", "us-west-2", "AWS region")
+	runID := fs.String("run-id", "", "unique run id (required; e.g. smoke-YYYYMMDD-HHMM)")
+	ttl := fs.String("ttl", "30m", "instance TTL hard cap (spawn reaps at this)")
+	deadlineMin := fs.Int("deadline-min", 20, "give up acquiring/waiting after N minutes")
+	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable g7e")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *bucket == "" || *runID == "" {
+		return fmt.Errorf("usage: calque smoke --bucket B --run-id ID [--region R] [--ttl 30m] --i-understand-this-spends-money")
+	}
+	if !*confirm {
+		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money (this acquires a billable g7e)")
+	}
+	return smoke(smokeOpts{
+		bucket: *bucket, region: *region, runID: *runID, ttl: *ttl,
+		deadline: time.Duration(*deadlineMin) * time.Minute,
+	})
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: calque analyze <script.py> [...]   |   calque run [--n N] [--region R] [--dry-run] <script.py>")
+	fmt.Fprintln(os.Stderr, "usage:")
+	fmt.Fprintln(os.Stderr, "  calque analyze <script.py> [...]")
+	fmt.Fprintln(os.Stderr, "  calque run [--n N] [--region R] [--dry-run] <script.py>")
+	fmt.Fprintln(os.Stderr, "  calque smoke --bucket B --run-id ID [--region R] [--ttl 30m] --i-understand-this-spends-money")
 }
 
 // pyastDir locates the helper relative to the repo. We resolve it from this
