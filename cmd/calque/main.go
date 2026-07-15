@@ -15,12 +15,16 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/spore-host/calque/internal/gate"
 	"github.com/spore-host/calque/internal/gpu"
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/parse"
 	"github.com/spore-host/calque/internal/target"
 )
+
+// bedrockRegion defines "the catalog" for the gate's live fetch (spike default).
+const bedrockRegion = "us-east-1"
 
 func main() {
 	if len(os.Args) < 3 {
@@ -62,15 +66,34 @@ func analyze(scripts []string) error {
 
 	rep := &leak.Report{}
 	corpus := gpu.Counts{}
-	var apps []ir.App
 	stub := target.StubRecommender{}
+
+	// The Bedrock gate runs BEFORE recommend (§11). Fetch the live catalog once,
+	// up front, and share it across the corpus. If the catalog is unreachable we
+	// degrade to the gpu/leak passes rather than failing the whole analysis.
+	var cat gate.Catalog
+	if lc, err := gate.NewLiveCatalog(ctx, bedrockRegion); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: Bedrock catalog unavailable (%v); skipping gate\n", err)
+	} else {
+		cat = lc
+	}
+	var gateResults []gate.Result
 
 	for _, s := range scripts {
 		app, err := parse.Parse(ctx, s, rep, runner, runnerArgs...)
 		if err != nil {
 			return fmt.Errorf("%s: %w", s, err)
 		}
-		apps = append(apps, app)
+
+		// Gate first: is this work that should route AWAY from calque?
+		if cat != nil {
+			grs, err := gate.Evaluate(ctx, app, cat, rep)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warn: gate failed for %s: %v\n", s, err)
+			} else {
+				gateResults = append(gateResults, grs...)
+			}
+		}
 
 		log := gpu.RewriteApp(app, rep)
 		c := log.Counts()
@@ -94,6 +117,30 @@ func analyze(scripts []string) error {
 		}
 	}
 
+	if cat != nil {
+		gate.Sort(gateResults)
+		fmt.Println("\n--- Bedrock eligibility gate (§11) ---")
+		for _, r := range gateResults {
+			switch {
+			case r.ModelRef == "":
+				fmt.Printf("  %s: identity hidden (no repo id; %s shape) — cannot claim Bedrock match\n",
+					short(r.Script), r.Shape)
+			case r.Eligible:
+				fmt.Printf("  %s: EXACT %s + inference -> SUGGEST BEDROCK (%s), don't rent a GPU\n",
+					short(r.Script), r.ModelRef, r.MatchID)
+			case r.Tier == gate.TierNear:
+				fmt.Printf("  %s: NEAR %s ~ %s [differs: %v] — offer, no quality claim\n",
+					short(r.Script), r.ModelRef, r.MatchID, r.DiffAxes)
+			default:
+				fmt.Printf("  %s: %s (%s shape) — no catalog match; legitimately calque's job\n",
+					short(r.Script), r.ModelRef, r.Shape)
+			}
+		}
+		fmt.Println("\n--- Bedrock census (§11/§16.4) ---")
+		cb, _ := json.MarshalIndent(gate.Summarize(gateResults), "", "  ")
+		fmt.Println(string(cb))
+	}
+
 	fmt.Println("\n--- corpus census (gpu guard, §7/§16.4) ---")
 	b, _ := json.MarshalIndent(corpus, "", "  ")
 	fmt.Println(string(b))
@@ -102,3 +149,5 @@ func analyze(scripts []string) error {
 	rep.Summary(os.Stdout)
 	return nil
 }
+
+func short(p string) string { return filepath.Base(p) }
