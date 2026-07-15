@@ -19,7 +19,7 @@ import "github.com/spore-host/calque/internal/ir"
 //   - Region:   lagotto/acquisition fills this on landing.
 type Target struct {
 	Card     string // e.g. "RTX PRO 6000"
-	Instance string // truffle fills this: e.g. "g7e.xlarge"
+	Instance string // truffle fills this: e.g. "g7e.2xlarge"
 	Region   string // acquisition fills this on landing
 }
 

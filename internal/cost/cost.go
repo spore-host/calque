@@ -11,7 +11,7 @@ import (
 // can reproduce.
 type Measured struct {
 	CardAskedFor    string  // e.g. "H100" — drives R_m (the asymmetry, §9)
-	InstanceUsed    string  // e.g. "g7e.xlarge" — drives R_a
+	InstanceUsed    string  // e.g. "g7e.2xlarge" — drives R_a
 	SecPerItem      float64 // mean warm per-item compute seconds
 	Occupancy       float64 // mean GPU utilization fraction [0,1] across the run
 	SampleItems     int     // how many items the measurement is based on

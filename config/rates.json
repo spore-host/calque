@@ -30,19 +30,20 @@
   },
 
   "aws": {
-    "_source": "AWS Pricing API (get-products, AmazonEC2) for g6/g6e; g7e is a CITED CONSTANT (see below).",
+    "_source": "AWS Pricing API (get-products, AmazonEC2), us-west-2, Linux/Shared/Used, 2026-07-15.",
     "_fetched": "2026-07-15",
     "_region": "us-west-2",
+    "_note": "NOTE: the smallest g7e size is g7e.2xlarge (there is NO g7e.xlarge — the family starts at 2xlarge). g7e IS in the Pricing API and priced live.",
     "on_demand_per_hour_usd": {
+      "g7e.2xlarge": {
+        "rate": 3.36312,
+        "source": "live: aws pricing get-products, us-west-2, Linux/Shared/Used, 2026-07-15 (8 vCPU, 64 GiB, 1 GPU)",
+        "measured": true
+      },
       "g6e.xlarge": {
         "rate": 1.861,
         "source": "live: aws pricing get-products, us-west-2, Linux/Shared/Used, 2026-07-15",
         "measured": true
-      },
-      "g7e.xlarge": {
-        "rate": 2.24,
-        "source": "CITED CONSTANT — g7e is offered by EC2 but NOT yet in the AWS Pricing API (get-products returns 0 entries for g7e.* as of 2026-07-15; g6e returns 50). Placeholder estimate pending list price; MUST be replaced with the real rate before K is quoted as authoritative. This is why the AWS side of K carries a measured|proxy flag.",
-        "measured": false
       }
     },
     "buydown": {
@@ -54,9 +55,9 @@
     }
   },
 
-  "_instance_gpu_count_doc": "GPUs per instance size, so a per-GPU Modal rate compares to a whole-instance AWS rate correctly. Single-node xlarge = 1 GPU for the spike.",
+  "_instance_gpu_count_doc": "GPUs per instance size, so a per-GPU Modal rate compares to a whole-instance AWS rate correctly. Single-node g7e.2xlarge = 1 GPU for the spike.",
   "instance_gpu_count": {
-    "g7e.xlarge": 1,
+    "g7e.2xlarge": 1,
     "g6e.xlarge": 1
   }
 }
