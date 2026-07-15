@@ -76,6 +76,22 @@ func smoke(o smokeOpts) (err error) {
 		WorkerDir: "/opt/calque", Region: o.region, HostMode: true,
 	}
 
+	inst := o.instance
+	if inst == "" {
+		inst = "g7e.2xlarge"
+	}
+
+	// Price ONCE via truffle up front (this is also R_a for the cost model). Passing
+	// it into the launcher makes spawn skip its own per-attempt Pricing-API lookup —
+	// otherwise a long capacity wait fires hundreds of redundant price calls.
+	var pricePerHr float64
+	if pricer, perr := plan.NewTrufflePricer(ctx); perr == nil {
+		if rate, rerr := pricer.OnDemandPrice(ctx, inst, o.region); rerr == nil {
+			pricePerHr = rate
+			fmt.Printf("      priced %s @ %s = $%.4f/hr (truffle; passed to spawn to skip re-lookup)\n", inst, o.region, rate)
+		}
+	}
+
 	// 3. acquire via the Acquirer over spawn.Provision.
 	spawnClient, err := spawnaws.NewClientWithRegion(ctx, o.region)
 	if err != nil {
@@ -83,17 +99,13 @@ func smoke(o smokeOpts) (err error) {
 	}
 	launcher := &plan.SpawnLauncher{
 		Client: spawnClient, RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
-		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami,
+		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami, PricePerHour: pricePerHr,
 	}
 	acq := &plan.Acquirer{
 		Launcher: launcher, Report: rep, Deadline: o.deadline,
 		OnProgress: func(attempt int, code string, waited time.Duration) {
 			fmt.Printf("      ...waiting for capacity (attempt %d, %s, %s)\n", attempt, code, waited.Round(time.Second))
 		},
-	}
-	inst := o.instance
-	if inst == "" {
-		inst = "g7e.2xlarge"
 	}
 	tgt := &target.Target{Card: target.DefaultCard, Instance: inst}
 	fmt.Printf("[4/7] acquiring %s in %s (block-and-wait)...\n", tgt.Instance, o.region)

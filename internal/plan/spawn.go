@@ -26,8 +26,13 @@ type SpawnLauncher struct {
 	// AMI pins the machine image. Empty lets spawn auto-select, but spawn's
 	// GetRecommendedAMI resolves a GPU AL2023 SSM parameter that AWS does not
 	// publish (ParameterNotFound) and misdetects g6e/g7/g7e as non-GPU — so for
-	// GPU instances we pin a Deep Learning AMI explicitly. See spawn issue.
+	// GPU instances we pin a Deep Learning AMI explicitly. See spawn#356.
 	AMI string
+	// PricePerHour, if >0, is passed to spawn so it SKIPS its own per-launch
+	// Pricing-API lookup. calque already gets R_a via truffle, so priming this
+	// avoids ~1 redundant Pricing API call PER retry attempt during a capacity
+	// wait (observed: hundreds over a long snipe).
+	PricePerHour float64
 }
 
 // Provision launches one instance of instanceType in region and returns the
@@ -55,6 +60,7 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region stri
 		OnComplete:      onComplete,
 		Username:        s.Username,
 		JobArrayCommand: s.RunCmd,
+		PricePerHour:    s.PricePerHour, // >0 => spawn skips its per-launch price lookup
 	}
 	res, err := launcher.Provision(ctx, s.Client, cfg, launcher.Options{})
 	if err != nil {
