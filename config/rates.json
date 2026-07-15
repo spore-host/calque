@@ -1,0 +1,62 @@
+{
+  "_doc": "Dated, cited, swappable rate table for the crossover-K cost model (spec §9). A skeptic must be able to audit every number here. Neither Modal nor (yet) AWS-for-g7e exposes a programmatic price for these, so they are constants with provenance. Update the date + source when you refresh them.",
+  "_asymmetry": "K compares R_m for the card the script ASKED FOR against R_a for the card we SUBSTITUTED TO (decision #5). Do not collapse both to one card's rate.",
+
+  "modal": {
+    "_source": "https://modal.com/pricing",
+    "_fetched": "2026-07-15",
+    "_api": "none — Modal publishes no programmatic pricing API; these are transcribed from the pricing page (per-second toggle).",
+    "_note": "Base rates. Modal applies multipliers the model must account for: region-pinned = 1.5–1.75x base; non-preemptible (guaranteed, no eviction) = 3x base. Batch inference is typically preemptible-tolerant, so base is the fair default; the model exposes the multiplier so a skeptic can see the guaranteed-capacity comparison too.",
+    "per_second_usd": {
+      "B300": 0.001972,
+      "B200": 0.001736,
+      "H200": 0.001261,
+      "H100": 0.001097,
+      "RTX PRO 6000": 0.000842,
+      "A100-80GB": 0.000694,
+      "A100-40GB": 0.000583,
+      "A100": 0.000694,
+      "L40S": 0.000542,
+      "A10G": 0.000306,
+      "A10": 0.000306,
+      "L4": 0.000222,
+      "T4": 0.000164
+    },
+    "multipliers": {
+      "region_pinned_low": 1.5,
+      "region_pinned_high": 1.75,
+      "non_preemptible": 3.0
+    }
+  },
+
+  "aws": {
+    "_source": "AWS Pricing API (get-products, AmazonEC2) for g6/g6e; g7e is a CITED CONSTANT (see below).",
+    "_fetched": "2026-07-15",
+    "_region": "us-west-2",
+    "on_demand_per_hour_usd": {
+      "g6e.xlarge": {
+        "rate": 1.861,
+        "source": "live: aws pricing get-products, us-west-2, Linux/Shared/Used, 2026-07-15",
+        "measured": true
+      },
+      "g7e.xlarge": {
+        "rate": 2.24,
+        "source": "CITED CONSTANT — g7e is offered by EC2 but NOT yet in the AWS Pricing API (get-products returns 0 entries for g7e.* as of 2026-07-15; g6e returns 50). Placeholder estimate pending list price; MUST be replaced with the real rate before K is quoted as authoritative. This is why the AWS side of K carries a measured|proxy flag.",
+        "measured": false
+      }
+    },
+    "buydown": {
+      "_note": "Lower rungs Modal structurally cannot offer (spec §9). STATIC CONSTANTS for the spike — flagged as such, not measured.",
+      "savings_plan_1yr_fraction": 0.72,
+      "savings_plan_3yr_fraction": 0.55,
+      "spot_fraction": 0.40,
+      "measured": false
+    }
+  },
+
+  "_instance_gpu_count_doc": "GPUs per instance size, so a per-GPU Modal rate compares to a whole-instance AWS rate correctly. Single-node xlarge = 1 GPU for the spike.",
+  "instance_gpu_count": {
+    "g7e.xlarge": 1,
+    "g6e.xlarge": 1
+  }
+}
