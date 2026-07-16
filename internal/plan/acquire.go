@@ -34,9 +34,18 @@ func (a Acquired) TimeToAcquire() time.Duration { return a.AcquiredAt.Sub(a.Requ
 // in spawn#351: spawn OWNS RunInstances (there is no pre-acquired-instance
 // bring-up). The real implementation wraps spawn.launcher.Provision; a fake drives
 // tests offline. Returns a *LaunchOutcome or an error whose code we classify.
-// az selects a specific Availability Zone; "" lets EC2 choose.
+// az selects a specific Availability Zone ("" lets EC2 choose); subnet is the
+// subnet to launch into for that AZ ("" lets spawn/EC2 pick a default).
 type Launcher interface {
-	Provision(ctx context.Context, instanceType, region, az string) (LaunchOutcome, error)
+	Provision(ctx context.Context, instanceType, region, az, subnet string) (LaunchOutcome, error)
+}
+
+// Placement is one (AZ, subnet) the Acquirer will try in its sweep. Passing the
+// subnet explicitly avoids the InvalidInput that occurs when an AZ has no default
+// subnet (observed: us-west-2d for g7e).
+type Placement struct {
+	AZ     string
+	Subnet string
 }
 
 // LaunchOutcome mirrors the fields calque needs from spawn's *aws.LaunchResult.
@@ -63,12 +72,12 @@ type Acquirer struct {
 	OnProgress   Progress
 	PollInterval time.Duration // backoff between capacity retries (default 15s)
 	Deadline     time.Duration // give up after this (default 30m); 0 => default
-	// AZs to sweep within the region before backing off, in preference order.
-	// On a capacity failure the Acquirer tries the next AZ immediately (AZ breadth
-	// within a region is free — mirrors lagotto's launchAcrossAZs). Empty => a
-	// single attempt letting EC2 choose the AZ. Only after the whole sweep returns
-	// capacity failures does the Acquirer sleep and retry the sweep.
-	AZs []string
+	// Placements to sweep within the region before backing off, in preference
+	// order. On a capacity failure the Acquirer tries the next placement immediately
+	// (AZ breadth within a region is free — mirrors lagotto's launchAcrossAZs).
+	// Empty => a single attempt letting EC2 choose. Only after the whole sweep
+	// returns capacity failures does the Acquirer sleep and retry the sweep.
+	Placements []Placement
 	// now is injectable so tests don't sleep in real time.
 	now   func() time.Time
 	sleep func(context.Context, time.Duration) error
@@ -94,12 +103,12 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 		deadline = 30 * time.Minute
 	}
 
-	// AZ sweep list: each round tries every AZ (in order) before backing off.
-	// Empty => one attempt per round letting EC2 choose ("" AZ). AZ breadth within
-	// a region is free — mirrors lagotto's launchAcrossAZs (spawner.go:167).
-	azs := a.AZs
-	if len(azs) == 0 {
-		azs = []string{""}
+	// Sweep list: each round tries every placement (in order) before backing off.
+	// Empty => one attempt per round letting EC2 choose. AZ breadth within a region
+	// is free — mirrors lagotto's launchAcrossAZs (spawner.go:167).
+	places := a.Placements
+	if len(places) == 0 {
+		places = []Placement{{}}
 	}
 
 	start := now()
@@ -109,11 +118,12 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 	const maxUnknown = 3 // tolerate a few transient/unknown blips, then fail fast
 	for {
 		var lastCode string
-		// One round = a full sweep across AZs. A capacity failure in one AZ falls
-		// through to the next AZ immediately (no sleep); only a fully-failed sweep sleeps.
-		for _, az := range azs {
+		// One round = a full sweep across placements. A capacity failure in one AZ
+		// falls through to the next immediately (no sleep); only a fully-failed
+		// sweep sleeps.
+		for _, pl := range places {
 			attempt++
-			out, err := a.Launcher.Provision(ctx, t.Instance, region, az)
+			out, err := a.Launcher.Provision(ctx, t.Instance, region, pl.AZ, pl.Subnet)
 			if err == nil {
 				acq := Acquired{
 					InstanceID: out.InstanceID, Region: out.Region, AvailabilityZone: out.AvailabilityZone,
@@ -123,7 +133,7 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 					acq.Region = region // spawn#351: LaunchResult has no Region; carry ours
 				}
 				if acq.AvailabilityZone == "" {
-					acq.AvailabilityZone = az
+					acq.AvailabilityZone = pl.AZ
 				}
 				t.Region = acq.Region
 				// Free ground truth: time-to-acquire per (card, region, AZ) (§5).
@@ -160,9 +170,9 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 			if a.Report != nil {
 				a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
 					"gave up acquiring %s in %s after %s (%d attempts across %d AZ(s)); last code %q",
-					t.Instance, region, deadline, attempt, len(azs), lastCode)
+					t.Instance, region, deadline, attempt, len(places), lastCode)
 			}
-			return Acquired{}, fmt.Errorf("acquire %s/%s: no capacity after %s (%d attempts, %d AZ(s))", t.Instance, region, deadline, attempt, len(azs))
+			return Acquired{}, fmt.Errorf("acquire %s/%s: no capacity after %s (%d attempts, %d AZ(s))", t.Instance, region, deadline, attempt, len(places))
 		}
 		if err := sleep(ctx, poll); err != nil {
 			return Acquired{}, err

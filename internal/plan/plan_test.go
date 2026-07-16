@@ -28,7 +28,7 @@ type scriptedLauncher struct {
 	calls int
 }
 
-func (s *scriptedLauncher) Provision(_ context.Context, instanceType, region, az string) (LaunchOutcome, error) {
+func (s *scriptedLauncher) Provision(_ context.Context, instanceType, region, az, subnet string) (LaunchOutcome, error) {
 	i := s.calls
 	s.calls++
 	if i < len(s.errs) {
@@ -144,7 +144,7 @@ type azTrackingLauncher struct {
 	seen   []string // AZs tried, in order
 }
 
-func (l *azTrackingLauncher) Provision(_ context.Context, instanceType, region, az string) (LaunchOutcome, error) {
+func (l *azTrackingLauncher) Provision(_ context.Context, instanceType, region, az, subnet string) (LaunchOutcome, error) {
 	l.seen = append(l.seen, az)
 	if az == l.landOn {
 		return LaunchOutcome{InstanceID: "i-az", AvailabilityZone: az, State: "pending"}, nil
@@ -160,8 +160,11 @@ func TestAcquireSweepsAZs(t *testing.T) {
 	sleeps := 0
 	acq := &Acquirer{
 		Launcher: l,
-		AZs:      []string{"us-west-2a", "us-west-2b", "us-west-2c", "us-west-2d"},
-		sleep:    func(_ context.Context, _ time.Duration) error { sleeps++; return nil },
+		Placements: []Placement{
+			{AZ: "us-west-2a", Subnet: "subnet-a"}, {AZ: "us-west-2b", Subnet: "subnet-b"},
+			{AZ: "us-west-2c", Subnet: "subnet-c"}, {AZ: "us-west-2d", Subnet: "subnet-d"},
+		},
+		sleep: func(_ context.Context, _ time.Duration) error { sleeps++; return nil },
 	}
 	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g6.2xlarge"}
 	got, err := acq.Acquire(context.Background(), tgt, "us-west-2")

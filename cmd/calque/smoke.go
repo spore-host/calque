@@ -93,15 +93,19 @@ func smoke(o smokeOpts) (err error) {
 		}
 	}
 
-	// Discover the AZs that offer this instance in the region, so the Acquirer can
-	// sweep them (try each on a capacity failure before backing off — AZ breadth is
-	// free, mirroring lagotto's launchAcrossAZs). Falls back to EC2-chooses on error.
-	var azs []string
-	if ec2Client := ec2.NewFromConfig(cfg); true {
-		if found, aerr := calexec.AZsForInstance(ctx, ec2Client, inst); aerr == nil && len(found) > 0 {
-			azs = found
-			fmt.Printf("      AZ sweep: %v (offering %s)\n", azs, inst)
+	// Discover the (AZ, default-subnet) pairs that offer this instance, so the
+	// Acquirer can sweep them (try each on a capacity failure before backing off —
+	// AZ breadth is free, mirroring lagotto's launchAcrossAZs). Passing the subnet
+	// avoids InvalidInput in AZs without a default subnet. Falls back to
+	// EC2-chooses on error.
+	var places []plan.Placement
+	if found, aerr := calexec.AZsForInstance(ctx, ec2.NewFromConfig(cfg), inst); aerr == nil && len(found) > 0 {
+		azList := make([]string, 0, len(found))
+		for _, f := range found {
+			places = append(places, plan.Placement{AZ: f.AZ, Subnet: f.Subnet})
+			azList = append(azList, f.AZ)
 		}
+		fmt.Printf("      AZ sweep: %v (offering %s, w/ default subnet)\n", azList, inst)
 	}
 
 	// 3. acquire via the Acquirer over spawn.Provision.
@@ -114,7 +118,7 @@ func smoke(o smokeOpts) (err error) {
 		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami, PricePerHour: pricePerHr,
 	}
 	acq := &plan.Acquirer{
-		Launcher: launcher, Report: rep, Deadline: o.deadline, AZs: azs,
+		Launcher: launcher, Report: rep, Deadline: o.deadline, Placements: places,
 		OnProgress: func(attempt int, code string, waited time.Duration) {
 			fmt.Printf("      ...swept %d attempt(s), still no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 		},
