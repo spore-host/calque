@@ -37,6 +37,7 @@ type RunLayout struct {
 	ManifestKey  string
 	ResultPrefix string
 	SummaryKey   string
+	LogKey       string // bootstrap log, uploaded on instance exit (observability)
 }
 
 func NewLayout(bucket, runID string) RunLayout {
@@ -47,6 +48,7 @@ func NewLayout(bucket, runID string) RunLayout {
 		ManifestKey:  base + "/manifest.json",
 		ResultPrefix: base + "/results",
 		SummaryKey:   base + "/summary.json",
+		LogKey:       base + "/bootstrap.log",
 	}
 }
 

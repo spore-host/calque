@@ -71,10 +71,10 @@ func smoke(o smokeOpts) (err error) {
 	}
 	fmt.Printf("[3/7] wrote manifest (1 item, host-mode body) to s3://%s/%s\n", layout.Bucket, layout.ManifestKey)
 
-	// 2. build the host-mode bootstrap command.
+	// 2. build the host-mode bootstrap command (with S3 log capture for post-mortem).
 	boot := calexec.BootstrapConfig{
 		Bucket: o.bucket, ArtifactPrefix: layout.ArtifactPfx, ManifestKey: layout.ManifestKey,
-		WorkerDir: "/opt/calque", Region: o.region, HostMode: true,
+		WorkerDir: "/opt/calque", Region: o.region, HostMode: true, LogKey: layout.LogKey,
 	}
 
 	inst := o.instance

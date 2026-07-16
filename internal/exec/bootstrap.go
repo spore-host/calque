@@ -19,6 +19,7 @@ type BootstrapConfig struct {
 	ManifestKey    string // s3 key of the work manifest
 	WorkerDir      string // in-container dir for artifacts, e.g. "/opt/calque"
 	Region         string
+	LogKey         string // s3 key to upload the bootstrap log to on exit (observability)
 	// HostMode runs warmd directly on the instance host (no docker) — used by the
 	// acquire-only smoke test to isolate acquisition + instance-role S3 + collect +
 	// terminate from the docker/GPU/model layer. Real inference uses docker mode.
@@ -41,6 +42,18 @@ func (b BootstrapConfig) Command() string {
 	manifest := fmt.Sprintf("s3://%s/%s", b.Bucket, b.ManifestKey)
 
 	lines := []string{
+		"#!/bin/bash",
+		// Observability: capture EVERYTHING to a log and upload it to S3 on exit —
+		// success OR failure — so we can post-mortem even after the instance is
+		// terminated (the bootstrap output otherwise dies with the instance).
+		"exec > /tmp/calque-bootstrap.log 2>&1",
+	}
+	if b.LogKey != "" {
+		lines = append(lines,
+			fmt.Sprintf("trap 'aws s3 cp /tmp/calque-bootstrap.log s3://%s/%s || true' EXIT", b.Bucket, b.LogKey),
+		)
+	}
+	lines = append(lines,
 		"set -euxo pipefail",
 		// Host prep: ensure aws cli is present (DL AMIs have it).
 		"command -v aws >/dev/null || (apt-get update && apt-get install -y awscli)",
@@ -48,7 +61,7 @@ func (b BootstrapConfig) Command() string {
 		// Pull tiny worker artifacts from S3 (warmd binary + python scripts).
 		fmt.Sprintf("aws s3 cp --recursive %s/ %s/", art, wd),
 		fmt.Sprintf("chmod +x %s/warmd", wd),
-	}
+	)
 
 	if b.HostMode {
 		// Smoke test: run warmd directly on the host — no docker, no GPU, no model.
