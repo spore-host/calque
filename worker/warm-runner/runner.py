@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import time
 import traceback
@@ -112,9 +113,21 @@ class _Namespace:
     pass
 
 
+# The protocol channel. warmd frames responses as newline-JSON on our stdout —
+# but the verbatim payload (vLLM, transformers, tqdm, ...) ALSO prints to stdout
+# ("INFO ... Initializing an LLM engine"), which corrupts the frame: warmd sees
+# 'I' and fails to decode JSON, restart-loops, and never loads the model (observed
+# on a real g6 run — spec §6's "the socket protocol draws blood" edge). Fix: grab
+# the real stdout fd ONCE as the private protocol channel, then point sys.stdout at
+# stderr so any library print goes to stderr and can never pollute the protocol.
+_PROTO = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8")
+sys.stdout.flush()
+os.dup2(sys.stderr.fileno(), sys.stdout.fileno())  # library stdout -> stderr
+
+
 def _emit(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()  # flush every line so spored sees results as they land
+    _PROTO.write(json.dumps(obj) + "\n")
+    _PROTO.flush()  # flush every line so warmd sees responses as they land
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -89,6 +89,41 @@ func TestWarmOnceAndOrdered(t *testing.T) {
 	}
 }
 
+// TestStdoutPollutionDoesNotCorruptProtocol is a regression for a real bug found
+// on a live g6 GPU run: vLLM prints INFO logs to stdout ("INFO ... Initializing
+// an LLM engine"), which corrupted the newline-JSON protocol frame — warmd saw
+// 'I', failed to decode, and restart-looped forever without ever loading the
+// model. runner.py now redirects library stdout to stderr; the protocol channel
+// is a private dup of the original fd. Bodies that print to stdout must NOT break
+// framing.
+func TestStdoutPollutionDoesNotCorruptProtocol(t *testing.T) {
+	sink := newMemSink()
+	sup := &Supervisor{
+		Python: python(t),
+		Script: runnerScript(t),
+		Sink:   sink,
+		Config: Config{
+			// @enter and @method both spew to stdout the way vLLM/transformers do.
+			EnterBody:  "import sys\nprint('INFO 07-16 loading model shards...')\nsys.stdout.write('WARNING raw write to stdout\\n')\nself.n = 0",
+			MethodBody: "print('INFO generating for', payload)\nself.n += 1\nreturn {'ok': payload, 'n': self.n}",
+			MethodArg:  "payload",
+		},
+	}
+	failed, err := sup.Run(context.Background(), items("x", "y"))
+	if err != nil {
+		t.Fatalf("Run: %v (protocol corrupted by stdout prints?)", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %v, want none", failed)
+	}
+	if sup.EnterCount != 1 {
+		t.Errorf("EnterCount = %d, want 1 (stdout pollution caused a restart loop?)", sup.EnterCount)
+	}
+	if len(sink.results) != 2 {
+		t.Errorf("results = %d, want 2 (framing broke on library stdout)", len(sink.results))
+	}
+}
+
 // TestCrashRestartReDrive is the riskiest behavior (§6): the runner dies mid-drain
 // and the supervisor must restart it (reload @enter) and re-drive the unfinished
 // items, with NO lost or duplicated results.
