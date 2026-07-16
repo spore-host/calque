@@ -28,6 +28,10 @@ type SpawnLauncher struct {
 	// publish (ParameterNotFound) and misdetects g6e/g7/g7e as non-GPU — so for
 	// GPU instances we pin a Deep Learning AMI explicitly. See spawn#356.
 	AMI string
+	// IMDSv2HopLimit sets the instance metadata hop limit. Set to 2 when warmd
+	// runs inside a docker container so it can reach instance-role creds via IMDS
+	// (containers are one hop away; spawn's default of 1 blocks them).
+	IMDSv2HopLimit int
 	// PricePerHour, if >0, is passed to spawn so it SKIPS its own per-launch
 	// Pricing-API lookup. calque already gets R_a via truffle, so priming this
 	// avoids ~1 redundant Pricing API call PER retry attempt during a capacity
@@ -62,7 +66,10 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region, az,
 		OnComplete:       onComplete,
 		Username:         s.Username,
 		JobArrayCommand:  s.RunCmd,
-		PricePerHour:     s.PricePerHour, // >0 => spawn skips its per-launch price lookup
+		PricePerHour:     s.PricePerHour,   // >0 => spawn skips its per-launch price lookup
+		IMDSv2HopLimit:   s.IMDSv2HopLimit, // 2 for containers: warmd runs INSIDE docker and
+		//                                     needs instance-role creds via IMDS, which is one
+		//                                     network hop away — the default hop limit of 1 blocks it.
 	}
 	res, err := launcher.Provision(ctx, s.Client, cfg, launcher.Options{})
 	if err != nil {

@@ -20,6 +20,7 @@ type BootstrapConfig struct {
 	WorkerDir      string // in-container dir for artifacts, e.g. "/opt/calque"
 	Region         string
 	LogKey         string // s3 key to upload the bootstrap log to on exit (observability)
+	ModelEnv       string // HF repo id passed to the container as CALQUE_MODEL (docker mode)
 	// HostMode runs warmd directly on the instance host (no docker) — used by the
 	// acquire-only smoke test to isolate acquisition + instance-role S3 + collect +
 	// terminate from the docker/GPU/model layer. Real inference uses docker mode.
@@ -74,19 +75,28 @@ func (b BootstrapConfig) Command() string {
 		return strings.Join(lines, "\n")
 	}
 
+	dockerRun := []string{
+		"docker run --rm --gpus all",
+		fmt.Sprintf("-e AWS_REGION=%s", b.Region),
+		// HF cache on the host (mounted) so a re-run doesn't re-download weights.
+		"-e HF_HOME=/root/.cache/huggingface -v /root/.cache/huggingface:/root/.cache/huggingface",
+		fmt.Sprintf("-v %s:%s", wd, wd),
+	}
+	if b.ModelEnv != "" {
+		// @enter reads CALQUE_MODEL to pick which HF model vLLM loads.
+		dockerRun = append(dockerRun, fmt.Sprintf("-e CALQUE_MODEL=%s", b.ModelEnv))
+	}
+	dockerRun = append(dockerRun,
+		"--entrypoint "+wd+"/warmd",
+		b.BaseImage,
+		"run --manifest "+manifest,
+	)
 	lines = append(lines,
 		// Pull the base inference image (fast from within AWS).
 		fmt.Sprintf("docker pull %s", b.BaseImage),
 		// Run the worker: GPU on, artifacts mounted, AWS creds via instance role
 		// (passed through by the metadata service — no keys on the command line).
-		strings.Join([]string{
-			"docker run --rm --gpus all",
-			fmt.Sprintf("-e AWS_REGION=%s", b.Region),
-			fmt.Sprintf("-v %s:%s", wd, wd),
-			"--entrypoint " + wd + "/warmd",
-			b.BaseImage,
-			"run --manifest " + manifest,
-		}, " "),
+		strings.Join(dockerRun, " "),
 	)
 	return strings.Join(lines, "\n")
 }

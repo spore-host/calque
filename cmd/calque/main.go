@@ -56,6 +56,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "real":
+		if err := realCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -102,6 +107,36 @@ func smokeCmd(args []string) error {
 	return smoke(smokeOpts{
 		bucket: *bucket, region: *region, runID: *runID, ttl: *ttl,
 		deadline: time.Duration(*deadlineMin) * time.Minute, instance: *instance, ami: *ami,
+	})
+}
+
+// realCmd runs a REAL GPU inference run — the measured-K vehicle. Gated behind
+// --i-understand-this-spends-money (launches a billable GPU instance).
+func realCmd(args []string) error {
+	fs := flag.NewFlagSet("real", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "S3 bucket (required)")
+	region := fs.String("region", "us-east-1", "AWS region")
+	runID := fs.String("run-id", "", "unique run id (required)")
+	instance := fs.String("instance", "g6.2xlarge", "GPU instance type")
+	ami := fs.String("ami", "", "pinned AMI (required for GPU; spawn auto-select is broken)")
+	model := fs.String("model", "Qwen/Qwen2.5-1.5B-Instruct", "HF model repo id (must NOT be on Bedrock)")
+	n := fs.Int("n", 1, "number of prompts (N=1 validates inference; N~100 for amortized K)")
+	ttl := fs.String("ttl", "40m", "instance TTL hard cap")
+	deadlineMin := fs.Int("deadline-min", 40, "give up acquiring/waiting after N minutes")
+	rates := fs.String("rates", "config/rates.json", "rate table path")
+	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *bucket == "" || *runID == "" || *ami == "" {
+		return fmt.Errorf("usage: calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] --i-understand-this-spends-money")
+	}
+	if !*confirm {
+		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money")
+	}
+	return realRun(realOpts{
+		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
+		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
 	})
 }
 
