@@ -18,16 +18,25 @@ import (
 // Manifest mirrors cmd/warmd.Manifest (the work order warmd reads from S3). Kept
 // here too so the control plane can WRITE it without importing package main.
 type Manifest struct {
-	EnterBody    string      `json:"enter_body"`
-	MethodBody   string      `json:"method_body"`
-	MethodArg    string      `json:"method_arg"`
-	Items        []warm.Item `json:"items"`
-	Bucket       string      `json:"bucket"`
-	ResultPrefix string      `json:"result_prefix"`
-	SummaryKey   string      `json:"summary_key"`
-	PythonBin    string      `json:"python_bin"`
-	RunnerPath   string      `json:"runner_path"`
-	Occupancy    string      `json:"occupancy_path"`
+	EnterBody    string           `json:"enter_body"`
+	MethodBody   string           `json:"method_body"`
+	MethodArg    string           `json:"method_arg"`
+	Items        []warm.Item      `json:"items"`
+	Bucket       string           `json:"bucket"`
+	ResultPrefix string           `json:"result_prefix"`
+	SummaryKey   string           `json:"summary_key"`
+	PythonBin    string           `json:"python_bin"`
+	RunnerPath   string           `json:"runner_path"`
+	Occupancy    string           `json:"occupancy_path"`
+	VolumeSync   []VolumeSyncSpec `json:"volume_sync,omitempty"` // staged before @enter (§3/§15)
+}
+
+// VolumeSyncSpec tells warmd to `aws s3 sync <URI> <MountPath>` before @enter, so
+// the payload finds its Volume weights at the mount path. Delta-sync => a warm
+// cache is a near-noop (weight-cache reuse, §15).
+type VolumeSyncSpec struct {
+	URI       string `json:"uri"`        // s3://bucket/volumes/<name>
+	MountPath string `json:"mount_path"` // e.g. /weights
 }
 
 // RunLayout is the S3 key layout for one run, derived from a runID.
@@ -77,12 +86,14 @@ func UploadArtifacts(ctx context.Context, c *s3.Client, l RunLayout, warmdBin, r
 	return nil
 }
 
-// WriteManifest builds and uploads the work manifest for a run.
-func WriteManifest(ctx context.Context, c *s3.Client, l RunLayout, enterBody, methodBody, methodArg, workerDir string, items []warm.Item) error {
+// WriteManifest builds and uploads the work manifest for a run. Optional
+// volumeSync entries are staged (aws s3 sync) by warmd before @enter (§3/§15).
+func WriteManifest(ctx context.Context, c *s3.Client, l RunLayout, enterBody, methodBody, methodArg, workerDir string, items []warm.Item, volumeSync ...VolumeSyncSpec) error {
 	man := Manifest{
 		EnterBody: enterBody, MethodBody: methodBody, MethodArg: methodArg,
 		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: "python3", RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
+		VolumeSync: volumeSync,
 	}
 	body, err := json.Marshal(man)
 	if err != nil {

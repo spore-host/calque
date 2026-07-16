@@ -84,6 +84,14 @@ func ResolveVolumes(app ir.App, rep *leak.Report) []VolumeMount {
 	return out
 }
 
+// SyncSpecs converts resolved mounts into the exec.VolumeSyncSpec form the
+// manifest carries (URI + mount path), so warmd stages them before @enter.
+// Defined in the exec package to avoid an import cycle; plan returns the raw
+// (uri, mountPath) pairs and the caller builds the specs.
+func (v VolumeMount) SyncPair(bucket string) (uri, mountPath string) {
+	return v.URI(bucket), v.MountPath
+}
+
 // SyncCommands returns the shell lines to stage each volume from S3 to its mount
 // path before @enter. It uses `aws s3 sync` (not cp): sync only transfers changed
 // objects, so a warm cache is a near-no-op — that's the weight-cache reuse

@@ -32,16 +32,17 @@ import (
 
 // Manifest is the work order the control plane writes to S3; warmd reads it.
 type Manifest struct {
-	EnterBody    string      `json:"enter_body"`
-	MethodBody   string      `json:"method_body"`
-	MethodArg    string      `json:"method_arg"`
-	Items        []warm.Item `json:"items"`
-	Bucket       string      `json:"bucket"`
-	ResultPrefix string      `json:"result_prefix"`
-	SummaryKey   string      `json:"summary_key"`
-	PythonBin    string      `json:"python_bin"`     // interpreter in the image
-	RunnerPath   string      `json:"runner_path"`    // path to runner.py in the image
-	Occupancy    string      `json:"occupancy_path"` // path to occupancy.py in the image
+	EnterBody    string                   `json:"enter_body"`
+	MethodBody   string                   `json:"method_body"`
+	MethodArg    string                   `json:"method_arg"`
+	Items        []warm.Item              `json:"items"`
+	Bucket       string                   `json:"bucket"`
+	ResultPrefix string                   `json:"result_prefix"`
+	SummaryKey   string                   `json:"summary_key"`
+	PythonBin    string                   `json:"python_bin"`            // interpreter in the image
+	RunnerPath   string                   `json:"runner_path"`           // path to runner.py in the image
+	Occupancy    string                   `json:"occupancy_path"`        // path to occupancy.py in the image
+	VolumeSync   []calexec.VolumeSyncSpec `json:"volume_sync,omitempty"` // staged (aws s3 sync) before @enter (§3/§15)
 }
 
 // Summary is what warmd writes back so the control plane's measure step can fold
@@ -88,6 +89,16 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 	var man Manifest
 	if err := getJSON(ctx, s3c, bucket, key, &man); err != nil {
 		return fmt.Errorf("read manifest: %w", err)
+	}
+
+	// Stage Volume weights BEFORE @enter (§3/§15): aws s3 sync each volume's S3
+	// prefix to its mount path. sync is delta-only, so a warm cache is a near-noop
+	// (weight-cache reuse). Fail loudly — @enter will fault if weights are missing.
+	for _, v := range man.VolumeSync {
+		fmt.Fprintf(os.Stderr, "staging volume %s -> %s\n", v.URI, v.MountPath)
+		if out, serr := exec.CommandContext(ctx, "aws", "s3", "sync", "--no-progress", v.URI, v.MountPath).CombinedOutput(); serr != nil {
+			return fmt.Errorf("volume sync %s -> %s: %w (%s)", v.URI, v.MountPath, serr, out)
+		}
 	}
 
 	// Start the occupancy sampler sidecar (tach hook, §8). Best-effort: if it
