@@ -151,6 +151,13 @@ func WaitForSummary(ctx context.Context, c *s3.Client, l RunLayout, timeout, pol
 	}
 }
 
+// TryGetSummary fetches an S3 object, returning (body, true) on 200 or
+// (nil, false) if it isn't there yet / on any error. Exported for the session
+// runner to poll for prep logs, rung summaries, and test logs.
+func TryGetSummary(ctx context.Context, c *s3.Client, bucket, key string) ([]byte, bool) {
+	return tryGet(ctx, c, bucket, key)
+}
+
 // tryGet fetches an S3 object, returning (body, true) on 200 or (nil, false) on
 // any error (including 404 — the object isn't there yet).
 func tryGet(ctx context.Context, c *s3.Client, bucket, key string) ([]byte, bool) {

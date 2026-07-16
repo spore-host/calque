@@ -61,6 +61,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "session":
+		if err := sessionCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -138,6 +143,76 @@ func realCmd(args []string) error {
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
 	})
+}
+
+// sessionCmd runs the acquire-once / hold / run-many session — the efficient way
+// to run the ramp: pay the (hard, slow) g7e acquisition once, hold the instance,
+// run every rung on it via SSM. Gated behind --i-understand-this-spends-money.
+func sessionCmd(args []string) error {
+	fs := flag.NewFlagSet("session", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "S3 bucket (required)")
+	region := fs.String("region", "us-east-1", "AWS region")
+	runID := fs.String("run-id", "", "unique session id (required)")
+	instance := fs.String("instance", "g7e.2xlarge", "GPU instance type to hold")
+	ami := fs.String("ami", "", "pinned AMI (required for GPU)")
+	model := fs.String("model", "Qwen/Qwen2.5-1.5B-Instruct", "HF model repo id (must NOT be on Bedrock)")
+	rungsCSV := fs.String("rungs", "1,100,1000", "comma-separated N-ramp to run on the held instance")
+	ttl := fs.String("ttl", "3h", "instance TTL hard cap (held across the whole ramp)")
+	acquireMin := fs.Int("acquire-deadline-min", 180, "patient acquisition window in minutes ($0 until it lands)")
+	rates := fs.String("rates", "config/rates.json", "rate table path")
+	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance held for hours")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *bucket == "" || *runID == "" || *ami == "" {
+		return fmt.Errorf("usage: calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] [--rungs 1,100,1000] --i-understand-this-spends-money")
+	}
+	if !*confirm {
+		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money (holds a billable GPU for up to the TTL)")
+	}
+	rungs, err := parseRungs(*rungsCSV)
+	if err != nil {
+		return err
+	}
+	return runSession(sessionOpts{
+		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
+		model: *model, rungs: rungs, ttl: *ttl,
+		acquireDeadline: time.Duration(*acquireMin) * time.Minute, ratesFP: *rates,
+	})
+}
+
+func parseRungs(csv string) ([]int, error) {
+	var out []int
+	for _, part := range splitComma(csv) {
+		var n int
+		if _, err := fmt.Sscanf(part, "%d", &n); err != nil || n <= 0 {
+			return nil, fmt.Errorf("bad rung %q", part)
+		}
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no rungs")
+	}
+	return out, nil
+}
+
+func splitComma(s string) []string {
+	var out []string
+	cur := ""
+	for _, r := range s {
+		if r == ',' {
+			if cur != "" {
+				out = append(out, cur)
+			}
+			cur = ""
+		} else if r != ' ' {
+			cur += string(r)
+		}
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	return out
 }
 
 func usage() {
