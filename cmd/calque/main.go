@@ -25,6 +25,7 @@ import (
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/parse"
+	"github.com/spore-host/calque/internal/plan"
 	"github.com/spore-host/calque/internal/target"
 )
 
@@ -303,6 +304,12 @@ func analyze(scripts []string) error {
 			}
 			fmt.Printf("  gpu[%s]: %s requested=%q%s (%s)\n",
 				sub.Owner, sub.Disposition, sub.Requested.Raw, line, sub.Reason)
+		}
+		// Volume -> S3 prefix mapping (§3): named Volumes become stable S3 prefixes,
+		// synced to the mount path before @enter. Stable-by-name => cache reuse (§15).
+		for _, m := range plan.ResolveVolumes(app, rep) {
+			fmt.Printf("  volume: %q -> %s (mount %s, delta-sync => warm-cache reuse)\n",
+				m.Name, m.S3Prefix, m.MountPath)
 		}
 	}
 
