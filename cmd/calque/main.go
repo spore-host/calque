@@ -138,6 +138,17 @@ func analyze(scripts []string) error {
 	} else {
 		cat = lc
 	}
+
+	// Authoritative HF->Bedrock mapping (hf-bedrock-map): curated + AWS-EULA-verified,
+	// preferred over the signature heuristic. Best-effort — the gate degrades to
+	// signature-only if it's unreachable.
+	var hfMap *gate.HFBedrockMap
+	if hm, err := gate.FetchHFBedrockMap(ctx, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: hf-bedrock-map unavailable (%v); gate falls back to signature heuristic\n", err)
+	} else {
+		hfMap = hm
+		fmt.Printf("hf-bedrock-map: loaded (generated %s)\n", hm.GeneratedAt)
+	}
 	var gateResults []gate.Result
 
 	for _, s := range scripts {
@@ -148,7 +159,7 @@ func analyze(scripts []string) error {
 
 		// Gate first: is this work that should route AWAY from calque?
 		if cat != nil {
-			grs, err := gate.Evaluate(ctx, app, cat, rep)
+			grs, err := gate.EvaluateWith(ctx, app, cat, hfMap, rep)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: gate failed for %s: %v\n", s, err)
 			} else {
@@ -187,11 +198,17 @@ func analyze(scripts []string) error {
 				fmt.Printf("  %s: identity hidden (no repo id; %s shape) — cannot claim Bedrock match\n",
 					short(r.Script), r.Shape)
 			case r.Eligible:
-				fmt.Printf("  %s: EXACT %s + inference -> SUGGEST BEDROCK (%s), don't rent a GPU\n",
-					short(r.Script), r.ModelRef, r.MatchID)
+				fmt.Printf("  %s: EXACT %s + inference -> SUGGEST BEDROCK (%s) [%s], don't rent a GPU\n",
+					short(r.Script), r.ModelRef, r.MatchID, r.Source)
+				if r.Evidence != "" {
+					fmt.Printf("        evidence: %s\n", r.Evidence)
+				}
+				if len(r.Regions) > 0 {
+					fmt.Printf("        Bedrock regions: %v\n", r.Regions)
+				}
 			case r.Tier == gate.TierNear:
-				fmt.Printf("  %s: NEAR %s ~ %s [differs: %v] — offer, no quality claim\n",
-					short(r.Script), r.ModelRef, r.MatchID, r.DiffAxes)
+				fmt.Printf("  %s: NEAR %s ~ %s [%s; differs: %v] — offer, no quality claim\n",
+					short(r.Script), r.ModelRef, r.MatchID, r.Source, r.DiffAxes)
 			default:
 				fmt.Printf("  %s: %s (%s shape) — no catalog match; legitimately calque's job\n",
 					short(r.Script), r.ModelRef, r.Shape)

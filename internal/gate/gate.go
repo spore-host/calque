@@ -59,6 +59,9 @@ type Result struct {
 	MatchID  string   // catalog modelId of the best match, if any
 	DiffAxes []string // for near matches: labeled axes of difference (no quality claim)
 	Eligible bool     // exact identity AND inference shape -> auto-suggest Bedrock, stop
+	Source   string   // "hf-bedrock-map" (authoritative) | "signature-heuristic" | ""
+	Evidence string   // hf-bedrock-map evidence string, when that source matched
+	Regions  []string // Bedrock regions serving the model (from hf-bedrock-map)
 }
 
 // trainingSignals in a body/enter indicate NOT plain inference (check #2).
@@ -103,10 +106,19 @@ func detectShape(bodies ...string) Shape {
 	}
 }
 
-// Evaluate runs the gate over an app. It fetches the catalog once and evaluates
-// each GPU-bearing unit (class or function). Emits leaks for the honest gaps
-// (identity behind a mount, unknown shape). Returns one Result per unit.
+// Evaluate runs the gate using only the live Bedrock catalog + the signature
+// heuristic. See EvaluateWith to add the authoritative hf-bedrock-map source.
 func Evaluate(ctx context.Context, app ir.App, cat Catalog, rep *leak.Report) ([]Result, error) {
+	return EvaluateWith(ctx, app, cat, nil, rep)
+}
+
+// EvaluateWith runs the gate over an app (§11). It consults, in order:
+//  1. hf-bedrock-map (authoritative, curated + AWS-EULA-verified) if provided;
+//  2. the signature heuristic against the live Bedrock catalog as a fallback.
+//
+// Emits leaks for the honest gaps (identity behind a mount, unknown shape).
+// hfMap may be nil (falls back to signature-only).
+func EvaluateWith(ctx context.Context, app ir.App, cat Catalog, hfMap *HFBedrockMap, rep *leak.Report) ([]Result, error) {
 	entries, err := cat.Models(ctx)
 	if err != nil {
 		return nil, err
@@ -138,16 +150,40 @@ func Evaluate(ctx context.Context, app ir.App, cat Catalog, rep *leak.Report) ([
 			return
 		}
 
-		scriptSig := NormalizeHF(ref)
 		best := TierNone
 		var bestDiffs []string
 		var bestID string
-		for _, cs := range catSigs {
-			tier, diffs := Compare(scriptSig, cs.sig)
-			if tierRank(tier) > tierRank(best) {
-				best, bestDiffs, bestID = tier, diffs, cs.entry.ModelID
-				if best == TierExact {
-					break
+
+		// (1) Authoritative source first: hf-bedrock-map. A confirmed/validated hit
+		// is stronger evidence than a signature match (AWS-EULA-linked or HF-
+		// existence-validated), and carries the real bedrockModelId + evidence.
+		if hfMap != nil {
+			if hm := hfMap.Lookup(ref); hm.Found {
+				best = hm.Tier()
+				bestID = hm.BedrockModelID
+				res.Source = "hf-bedrock-map"
+				res.Evidence = hm.Evidence
+				res.Regions = hm.Regions
+				if best == TierNear {
+					bestDiffs = []string{"ambiguous: " + hm.Evidence}
+				}
+			}
+		}
+
+		// (2) Fallback: signature heuristic against the live catalog, only if the
+		// authoritative source didn't already produce an exact hit.
+		if best != TierExact {
+			scriptSig := NormalizeHF(ref)
+			for _, cs := range catSigs {
+				tier, diffs := Compare(scriptSig, cs.sig)
+				if tierRank(tier) > tierRank(best) {
+					best, bestDiffs, bestID = tier, diffs, cs.entry.ModelID
+					if res.Source == "" {
+						res.Source = "signature-heuristic"
+					}
+					if best == TierExact {
+						break
+					}
 				}
 			}
 		}
