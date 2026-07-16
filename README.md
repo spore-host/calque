@@ -31,14 +31,29 @@ Spike, in active build. Tracking lives on GitHub (Issues / Projects / milestones
 - **warm worker** (`warmd` + `runner.py`, §6) — `@enter` once, crash-restart re-drive, partial-failure.
 - **cost + crossover K** (§9) — rate asymmetry (`R_m` for card asked-for vs `R_a` for card substituted-to),
   willing to say *stay on Modal*, `measured | proxy` flag.
-- **plan** (§5) — truffle resolve+price, `Acquirer` over `spawn.Provision` with capacity-aware retry.
+- **plan** (§5) — truffle resolve+price, `Acquirer` over `spawn.Provision` with capacity-aware
+  AZ-sweep retry.
 - **image / exec** — Dockerfile+digest cache; S3 sink/collector; on-instance `warmd` entrypoint.
-- **full pipeline** — `calque run --dry-run` runs every stage end-to-end locally.
+- **volumes** (§3/§15) — `Volume.from_name` → stable S3 prefix, delta-synced to the mount path
+  before `@enter` (warm-cache reuse; image/volume separation).
+- **full pipeline** — `calque run --dry-run` runs every stage locally; `calque session` acquires one
+  GPU and runs an N-ramp on it.
 
-**Real hardware:** the acquire-only smoke path is built and gated behind `--i-understand-this-spends-money`.
-First launches hit sustained real `InsufficientInstanceCapacity` on g7e/g6e/g6 in us-west-2 (spec §2
-predicted g7e is regionally thin) — the deadline guard gave up cleanly, **zero spend, no leaked instances**.
-A defensible measured K awaits GPU capacity + a real payload.
+**Real measured crossover K — achieved on a live GPU.** A real run (Qwen2.5-1.5B on an L4, all
+`[measured]`, no proxies) produced the headline number:
+
+- N=100: `@enter` ran **once** (102.7s load), **1.583s/item**, **59% measured occupancy** → **K ≈ 73 items**
+  on-demand (~18 with a Savings Plan); verdict at 100k = **CROSS**.
+- N=1: same load amortized over one item → 5% occupancy → **STAY ON MODAL**.
+
+The N=1↔N=100 contrast is the phase detector working: same code, same model, honest verdict at each
+scale (§9). Getting real inference end-to-end surfaced five genuine deployment findings, each caught
+fast and fixed: worker dir `/opt`→`/tmp`, docker needs `sudo`, IMDSv2 hop-limit 2 for container creds,
+200 GiB root volume for the vLLM image, and vLLM's stdout logs colliding with the warm-worker JSON
+protocol (the §6 "socket draws blood" edge — now isolated + regression-tested).
+
+**Corpus census (§16.4)** across the test scripts: Bedrock 1 exact-eligible / 1 self-hosted / 4
+identity-hidden; gpu guard 4 clean-swaps / 1 multi-GPU flag / 1 coupled flag / 1 no-gpu.
 
 ## Pipeline
 
