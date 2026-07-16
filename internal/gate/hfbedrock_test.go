@@ -2,87 +2,126 @@ package gate
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 )
 
-// A trimmed fixture mirroring the live mapping.json shape (per-entry regions,
-// confidence tiers). Kept offline so the test is hermetic.
-var hfFixture = []byte(`{
-  "generatedAt": "2026-07-16T07:27:40Z",
-  "regions": ["us-east-1","us-east-2","us-west-2"],
-  "counts": {"total": 4},
-  "entries": [
-    {"bedrockModelId":"meta.llama3-8b-instruct-v1:0","catalog":"foundation-model","provider":"Meta",
-     "hfId":"meta-llama/Meta-Llama-3-8B-Instruct","confidence":"confirmed",
-     "regions":["us-east-1","us-west-2"],"evidence":"curated override (verified)"},
-    {"bedrockModelId":"google.gemma-3-12b-it","catalog":"foundation-model","provider":"Google",
-     "hfId":"google/gemma-3-12b-it","confidence":"validated","regions":["us-west-2"],
-     "evidence":"hf-validated: base repo exists"},
-    {"bedrockModelId":"mistral.ministral-3-3b-instruct","catalog":"foundation-model","provider":"Mistral AI",
-     "confidence":"ambiguous","regions":["us-east-1"],
-     "evidence":"multiple HF variants, modelId can't disambiguate"},
-    {"bedrockModelId":"deepseek.r1-v1:0","catalog":"foundation-model","provider":"DeepSeek",
-     "hfId":"deepseek-ai/DeepSeek-R1","confidence":"confirmed","regions":["us-west-2"],
-     "evidence":"model card EULA link"}
-  ]
-}`)
+// hfServer stands up a fake reverse-lookup API mirroring the live v1 shape, so
+// the client is tested offline against real HTTP behavior (200 record / 404 miss).
+func hfServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/index.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"version":"v1","generatedAt":"2026-07-16T07:37:42Z","count":2}`))
+	})
+	mux.HandleFunc("/api/v1/hf/meta-llama/meta-llama-3-8b-instruct.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"hfId":"meta-llama/Meta-Llama-3-8B-Instruct","onBedrock":true,
+			"regions":["us-east-1","us-west-2"],
+			"bedrock":[{"modelId":"meta.llama3-8b-instruct-v1:0","catalog":"foundation-model","confidence":"confirmed","regions":["us-east-1","us-west-2"]}]}`))
+	})
+	mux.HandleFunc("/api/v1/hf/qwen/qwen3-32b.json", func(w http.ResponseWriter, r *http.Request) {
+		// two Bedrock paths — the confirmed FM should win over the marketplace one.
+		w.Write([]byte(`{"hfId":"Qwen/Qwen3-32B","onBedrock":true,"regions":["us-west-2"],
+			"bedrock":[
+			  {"modelId":"huggingface-reasoning-qwen3-32b","catalog":"marketplace","confidence":"validated","regions":["us-west-2"]},
+			  {"modelId":"qwen.qwen3-32b-v1:0","catalog":"foundation-model","confidence":"confirmed","regions":["us-west-2"]}]}`))
+	})
+	// everything else -> 404 (the API's definitive "not on Bedrock")
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	return httptest.NewServer(mux)
+}
 
-func TestParseAndLookup(t *testing.T) {
-	m, err := parseHFBedrockMap(hfFixture)
+func newTestClient(t *testing.T, srv *httptest.Server) *HFBedrockClient {
+	t.Helper()
+	c, err := NewHFBedrockClient(context.Background(), srv.URL+"/api/v1")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewHFBedrockClient: %v", err)
 	}
-	// ambiguous entry has no hfId -> not HF-keyable; the 3 with hfId are indexed.
-	if got := m.Lookup("meta-llama/Meta-Llama-3-8B-Instruct"); !got.Found || got.Tier() != TierExact {
-		t.Errorf("llama3 lookup = %+v, want found+exact", got)
+	return c
+}
+
+func TestClientLookup(t *testing.T) {
+	srv := hfServer(t)
+	defer srv.Close()
+	c := newTestClient(t, srv)
+	if c.Version != "v1" {
+		t.Errorf("version = %q, want v1", c.Version)
 	}
-	if got := m.Lookup("google/gemma-3-12b-it"); got.Tier() != TierExact {
-		t.Errorf("gemma (validated) should be exact, got %s", got.Confidence)
+
+	// confirmed FM -> exact, carries the bedrock id + regions.
+	got := c.Lookup(context.Background(), "meta-llama/Meta-Llama-3-8B-Instruct")
+	if !got.Found || got.Tier() != TierExact || got.BedrockModelID != "meta.llama3-8b-instruct-v1:0" {
+		t.Errorf("llama3 = %+v, want found/exact/meta.llama3-8b-instruct-v1:0", got)
 	}
-	// case-insensitive: a script may lower-case the repo id.
-	if got := m.Lookup("META-LLAMA/meta-llama-3-8b-INSTRUCT"); !got.Found {
+	if len(got.Regions) != 2 {
+		t.Errorf("regions = %v, want 2", got.Regions)
+	}
+
+	// case-insensitive URL building.
+	if g := c.Lookup(context.Background(), "META-LLAMA/Meta-Llama-3-8B-Instruct"); !g.Found {
 		t.Error("lookup should be case-insensitive")
 	}
-	// a model not on Bedrock -> not found.
-	if got := m.Lookup("BAAI/bge-large-en-v1.5"); got.Found {
-		t.Errorf("bge should not be found, got %+v", got)
+
+	// two paths -> the confirmed FM wins over the validated marketplace one.
+	q := c.Lookup(context.Background(), "Qwen/Qwen3-32B")
+	if q.BedrockModelID != "qwen.qwen3-32b-v1:0" || q.Confidence != "confirmed" {
+		t.Errorf("qwen best path = %+v, want the confirmed FM", q)
 	}
-	// regions carry through.
-	if got := m.Lookup("deepseek-ai/DeepSeek-R1"); len(got.Regions) == 0 || got.BedrockModelID != "deepseek.r1-v1:0" {
-		t.Errorf("deepseek lookup missing regions/id: %+v", got)
+
+	// 404 -> clean not-found.
+	if m := c.Lookup(context.Background(), "BAAI/bge-large-en-v1.5"); m.Found {
+		t.Errorf("bge should be a clean 404 miss, got %+v", m)
 	}
 }
 
-// TestEvaluateWithHFMap: the authoritative source drives eligibility, records the
-// evidence + source, and preserves exact-match discipline.
-func TestEvaluateWithHFMap(t *testing.T) {
-	m, _ := parseHFBedrockMap(hfFixture)
+func TestClientCaches(t *testing.T) {
+	srv := hfServer(t)
+	defer srv.Close()
+	hits := 0
+	// wrap to count network calls
+	wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/hf/") {
+			hits++
+		}
+		srv.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer wrapped.Close()
+	c := newTestClient(t, wrapped)
+	for i := 0; i < 3; i++ {
+		c.Lookup(context.Background(), "meta-llama/Meta-Llama-3-8B-Instruct")
+	}
+	if hits != 1 {
+		t.Errorf("expected 1 network hit for 3 identical lookups, got %d", hits)
+	}
+}
+
+// TestEvaluateWithHFClient: the client drives eligibility end-to-end via the gate.
+func TestEvaluateWithHFClient(t *testing.T) {
+	srv := hfServer(t)
+	defer srv.Close()
+	c := newTestClient(t, srv)
 	rep := &leak.Report{}
 	app := ir.App{
 		Script: "test.py",
 		Classes: []ir.Class{
-			{ // confirmed on Bedrock + inference -> eligible via hf-bedrock-map
-				Name: "Server", GPU: "H100", Line: 1,
+			{Name: "Server", GPU: "H100", Line: 1,
 				EnterBody: `self.llm = LLM(model="meta-llama/Meta-Llama-3-8B-Instruct")`,
-				Methods:   []ir.Function{{Name: "gen", Body: "return self.llm.generate(p)"}},
-			},
-			{ // a model NOT on Bedrock -> legitimately calque's job
-				Name: "Custom", GPU: "A100", Line: 10,
+				Methods:   []ir.Function{{Name: "gen", Body: "return self.llm.generate(p)"}}},
+			{Name: "Custom", GPU: "A100", Line: 10,
 				EnterBody: `self.m = AutoModel.from_pretrained("BAAI/bge-large-en-v1.5")`,
-				Methods:   []ir.Function{{Name: "embed", Body: "return self.m(x)"}},
-			},
+				Methods:   []ir.Function{{Name: "embed", Body: "return self.m(x)"}}},
 		},
 	}
-	// testCatalog (from gate_test.go) stands in for the live Bedrock catalog fallback.
-	results, err := EvaluateWith(context.Background(), app, testCatalog, m, rep)
+	results, err := EvaluateWith(context.Background(), app, testCatalog, c, rep)
 	if err != nil {
 		t.Fatal(err)
 	}
 	Sort(results)
-	// "BAAI/..." sorts before "meta-llama/..."
 	var server, custom Result
 	for _, r := range results {
 		switch r.ModelRef {
@@ -92,16 +131,10 @@ func TestEvaluateWithHFMap(t *testing.T) {
 			custom = r
 		}
 	}
-	if !server.Eligible || server.Tier != TierExact {
-		t.Errorf("server should be eligible+exact, got %+v", server)
-	}
-	if server.Source != "hf-bedrock-map" {
-		t.Errorf("server match should come from hf-bedrock-map, got %q", server.Source)
-	}
-	if server.MatchID != "meta.llama3-8b-instruct-v1:0" || server.Evidence == "" {
-		t.Errorf("server should carry bedrock id + evidence, got id=%q ev=%q", server.MatchID, server.Evidence)
+	if !server.Eligible || server.Source != "hf-bedrock-map" || server.MatchID != "meta.llama3-8b-instruct-v1:0" {
+		t.Errorf("server should be eligible via hf-bedrock-map, got %+v", server)
 	}
 	if custom.Eligible || custom.Tier != TierNone {
-		t.Errorf("custom (not on Bedrock) should be ineligible/none, got %+v", custom)
+		t.Errorf("custom (not on Bedrock) should be ineligible, got %+v", custom)
 	}
 }

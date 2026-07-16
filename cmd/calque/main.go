@@ -139,15 +139,15 @@ func analyze(scripts []string) error {
 		cat = lc
 	}
 
-	// Authoritative HF->Bedrock mapping (hf-bedrock-map): curated + AWS-EULA-verified,
-	// preferred over the signature heuristic. Best-effort — the gate degrades to
-	// signature-only if it's unreachable.
-	var hfMap *gate.HFBedrockMap
-	if hm, err := gate.FetchHFBedrockMap(ctx, ""); err != nil {
+	// Authoritative HF->Bedrock mapping (hf-bedrock-map v1 reverse-lookup API):
+	// curated + AWS-EULA-verified, preferred over the signature heuristic.
+	// Best-effort — the gate degrades to signature-only if it's unreachable.
+	var hfMap *gate.HFBedrockClient
+	if hm, err := gate.NewHFBedrockClient(ctx, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "warn: hf-bedrock-map unavailable (%v); gate falls back to signature heuristic\n", err)
 	} else {
 		hfMap = hm
-		fmt.Printf("hf-bedrock-map: loaded (generated %s)\n", hm.GeneratedAt)
+		fmt.Printf("hf-bedrock-map: API %s reachable (data generated %s)\n", hm.Version, hm.GeneratedAt)
 	}
 	var gateResults []gate.Result
 
@@ -159,7 +159,14 @@ func analyze(scripts []string) error {
 
 		// Gate first: is this work that should route AWAY from calque?
 		if cat != nil {
-			grs, err := gate.EvaluateWith(ctx, app, cat, hfMap, rep)
+			// Pass a true-nil interface when the client is nil, so the gate's
+			// hfMap != nil guard works (a typed-nil pointer in an interface is
+			// non-nil and would panic on Lookup).
+			var hf gate.HFLookup
+			if hfMap != nil {
+				hf = hfMap
+			}
+			grs, err := gate.EvaluateWith(ctx, app, cat, hf, rep)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: gate failed for %s: %v\n", s, err)
 			} else {

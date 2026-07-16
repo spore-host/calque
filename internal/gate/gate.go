@@ -112,13 +112,20 @@ func Evaluate(ctx context.Context, app ir.App, cat Catalog, rep *leak.Report) ([
 	return EvaluateWith(ctx, app, cat, nil, rep)
 }
 
+// HFLookup is the reverse-lookup surface the gate needs from hf-bedrock-map,
+// behind an interface so tests stub it offline (the real client hits the HTTP API)
+// and callers can pass a true-nil interface to disable it.
+type HFLookup interface {
+	Lookup(ctx context.Context, hfID string) HFMatch
+}
+
 // EvaluateWith runs the gate over an app (§11). It consults, in order:
 //  1. hf-bedrock-map (authoritative, curated + AWS-EULA-verified) if provided;
 //  2. the signature heuristic against the live Bedrock catalog as a fallback.
 //
 // Emits leaks for the honest gaps (identity behind a mount, unknown shape).
 // hfMap may be nil (falls back to signature-only).
-func EvaluateWith(ctx context.Context, app ir.App, cat Catalog, hfMap *HFBedrockMap, rep *leak.Report) ([]Result, error) {
+func EvaluateWith(ctx context.Context, app ir.App, cat Catalog, hfMap HFLookup, rep *leak.Report) ([]Result, error) {
 	entries, err := cat.Models(ctx)
 	if err != nil {
 		return nil, err
@@ -158,7 +165,7 @@ func EvaluateWith(ctx context.Context, app ir.App, cat Catalog, hfMap *HFBedrock
 		// is stronger evidence than a signature match (AWS-EULA-linked or HF-
 		// existence-validated), and carries the real bedrockModelId + evidence.
 		if hfMap != nil {
-			if hm := hfMap.Lookup(ref); hm.Found {
+			if hm := hfMap.Lookup(ctx, ref); hm.Found {
 				best = hm.Tier()
 				bestID = hm.BedrockModelID
 				res.Source = "hf-bedrock-map"
