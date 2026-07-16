@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -152,9 +153,14 @@ func realRun(o realOpts) (err error) {
 	summaryBytes, err := calexec.WaitForSummary(ctx, s3c, layout, o.deadline, 15*time.Second,
 		func(elapsed time.Duration) { fmt.Printf("      ...running (%s)\n", elapsed.Round(time.Second)) })
 	if err != nil {
-		// Pull the bootstrap log for post-mortem before returning.
+		// Fast-failure: the bootstrap exited without a summary — its log tells us why.
+		var bf *calexec.ErrBootstrapFailed
+		if errors.As(err, &bf) {
+			fmt.Fprintf(os.Stderr, "BOOTSTRAP FAILED (fast-detected) — log tail:\n%s\n", tail([]byte(bf.BootstrapLog), 2500))
+			return fmt.Errorf("bootstrap failed on the instance (see log above)")
+		}
 		if logBytes, lerr := getS3(ctx, s3c, o.bucket, layout.LogKey); lerr == nil {
-			fmt.Fprintf(os.Stderr, "--- bootstrap.log (tail) ---\n%s\n", tail(logBytes, 2000))
+			fmt.Fprintf(os.Stderr, "--- bootstrap.log (tail) ---\n%s\n", tail(logBytes, 2500))
 		}
 		return fmt.Errorf("wait for summary: %w", err)
 	}

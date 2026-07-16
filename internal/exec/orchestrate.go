@@ -94,25 +94,49 @@ func WriteManifest(ctx context.Context, c *s3.Client, l RunLayout, enterBody, me
 	return err
 }
 
-// WaitForSummary polls S3 for the run summary warmd writes on completion, up to
-// timeout. Returns the parsed summary bytes (caller decodes to its Summary type).
+// ErrBootstrapFailed means the instance's bootstrap script exited (uploading its
+// log) WITHOUT producing a summary — a fast-failure signal so we don't dead-wait
+// the full deadline for a summary that will never come. BootstrapLog carries the
+// uploaded log for post-mortem.
+type ErrBootstrapFailed struct{ BootstrapLog string }
+
+func (e *ErrBootstrapFailed) Error() string {
+	return "bootstrap exited without writing a summary (see bootstrap log)"
+}
+
+// WaitForSummary polls S3 for the run summary warmd writes on completion. It ALSO
+// watches for the bootstrap log: that uploads only on the bootstrap's EXIT
+// (success or failure), so if the log appears but no summary follows within a
+// short grace window, the bootstrap died — we fail fast with ErrBootstrapFailed
+// (carrying the log) instead of waiting out the whole timeout. Returns the summary
+// bytes on success.
 func WaitForSummary(ctx context.Context, c *s3.Client, l RunLayout, timeout, poll time.Duration, onWait func(elapsed time.Duration)) ([]byte, error) {
-	// Note: deadline is enforced by ctx if the caller sets one; we also self-bound.
 	deadlineHit := time.NewTimer(timeout)
 	defer deadlineHit.Stop()
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	startedTicks := 0
+	logSeenAt := -1 // tick index when the bootstrap log first appeared; -1 = not yet
+	// Grace ticks: after the log appears, how long to keep polling for a summary
+	// before declaring failure (warmd writes the summary just before the trap
+	// uploads the log, so a healthy run has both within a tick or two).
+	const graceTicks = 2
+
 	for {
-		out, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(l.Bucket), Key: aws.String(l.SummaryKey)})
-		if err == nil {
-			buf, rerr := io.ReadAll(out.Body)
-			out.Body.Close()
-			if rerr != nil {
-				return nil, rerr
-			}
-			return buf, nil
+		if buf, ok := tryGet(ctx, c, l.Bucket, l.SummaryKey); ok {
+			return buf, nil // summary landed -> success
 		}
+		// If the bootstrap log exists but the summary doesn't, the script exited
+		// without success. Give a short grace, then fail fast with the log.
+		if logSeenAt < 0 {
+			if _, ok := tryGet(ctx, c, l.Bucket, l.LogKey); ok {
+				logSeenAt = startedTicks
+			}
+		} else if startedTicks-logSeenAt >= graceTicks {
+			logBuf, _ := tryGet(ctx, c, l.Bucket, l.LogKey)
+			return nil, &ErrBootstrapFailed{BootstrapLog: string(logBuf)}
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -125,4 +149,19 @@ func WaitForSummary(ctx context.Context, c *s3.Client, l RunLayout, timeout, pol
 			}
 		}
 	}
+}
+
+// tryGet fetches an S3 object, returning (body, true) on 200 or (nil, false) on
+// any error (including 404 — the object isn't there yet).
+func tryGet(ctx context.Context, c *s3.Client, bucket, key string) ([]byte, bool) {
+	out, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	if err != nil {
+		return nil, false
+	}
+	defer out.Body.Close()
+	buf, rerr := io.ReadAll(out.Body)
+	if rerr != nil {
+		return nil, false
+	}
+	return buf, true
 }

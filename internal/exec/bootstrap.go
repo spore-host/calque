@@ -57,7 +57,7 @@ func (b BootstrapConfig) Command() string {
 	lines = append(lines,
 		"set -euxo pipefail",
 		// Host prep: ensure aws cli is present (DL AMIs have it).
-		"command -v aws >/dev/null || (apt-get update && apt-get install -y awscli)",
+		"command -v aws >/dev/null || (sudo apt-get update && sudo apt-get install -y awscli)",
 		fmt.Sprintf("mkdir -p %s", wd),
 		// Pull tiny worker artifacts from S3 (warmd binary + python scripts).
 		fmt.Sprintf("aws s3 cp --recursive %s/ %s/", art, wd),
@@ -75,8 +75,10 @@ func (b BootstrapConfig) Command() string {
 		return strings.Join(lines, "\n")
 	}
 
+	// docker needs root on the DL AMI (the login user isn't in the docker group —
+	// "permission denied ... docker.sock" otherwise). Run docker under sudo.
 	dockerRun := []string{
-		"docker run --rm --gpus all",
+		"sudo docker run --rm --gpus all",
 		fmt.Sprintf("-e AWS_REGION=%s", b.Region),
 		// HF cache on the host (mounted) so a re-run doesn't re-download weights.
 		"-e HF_HOME=/root/.cache/huggingface -v /root/.cache/huggingface:/root/.cache/huggingface",
@@ -92,8 +94,8 @@ func (b BootstrapConfig) Command() string {
 		"run --manifest "+manifest,
 	)
 	lines = append(lines,
-		// Pull the base inference image (fast from within AWS).
-		fmt.Sprintf("docker pull %s", b.BaseImage),
+		// Pull the base inference image (fast from within AWS). sudo: see above.
+		fmt.Sprintf("sudo docker pull %s", b.BaseImage),
 		// Run the worker: GPU on, artifacts mounted, AWS creds via instance role
 		// (passed through by the metadata service — no keys on the command line).
 		strings.Join(dockerRun, " "),
