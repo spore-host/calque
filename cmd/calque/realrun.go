@@ -119,7 +119,8 @@ func realRun(o realOpts) (err error) {
 	launcher := &plan.SpawnLauncher{
 		Client: spawnClient, RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
 		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami, PricePerHour: pricePerHr,
-		IMDSv2HopLimit: 2, // warmd runs INSIDE docker; needs IMDS creds one hop away
+		IMDSv2HopLimit: 2,   // warmd runs INSIDE docker; needs IMDS creds one hop away
+		RootVolumeGiB:  200, // vLLM image + weights blow past spawn's 20 GiB default
 	}
 	acq := &plan.Acquirer{
 		Launcher: launcher, Report: rep, Deadline: o.deadline, Placements: places,

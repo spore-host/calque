@@ -32,6 +32,10 @@ type SpawnLauncher struct {
 	// runs inside a docker container so it can reach instance-role creds via IMDS
 	// (containers are one hop away; spawn's default of 1 blocks them).
 	IMDSv2HopLimit int
+	// RootVolumeGiB overrides the root EBS volume size. spawn defaults to 20 GiB,
+	// far too small for the vLLM image (~15-20 GiB extracted) + model weights —
+	// "no space left on device" during docker pull. Set ~200 for a GPU inference run.
+	RootVolumeGiB int32
 	// PricePerHour, if >0, is passed to spawn so it SKIPS its own per-launch
 	// Pricing-API lookup. calque already gets R_a via truffle, so priming this
 	// avoids ~1 redundant Pricing API call PER retry attempt during a capacity
@@ -57,17 +61,18 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region, az,
 		ttl = "2h"
 	}
 	cfg := spawnaws.LaunchConfig{
-		InstanceType:     instanceType,
-		Region:           region,
-		AvailabilityZone: az,     // "" => EC2 chooses; set by the Acquirer's AZ sweep
-		SubnetID:         subnet, // default subnet for the AZ; avoids InvalidInput in AZs w/o one
-		AMI:              s.AMI,  // empty => spawn auto-selects (broken for GPU; pin for GPU)
-		TTL:              ttl,
-		OnComplete:       onComplete,
-		Username:         s.Username,
-		JobArrayCommand:  s.RunCmd,
-		PricePerHour:     s.PricePerHour,   // >0 => spawn skips its per-launch price lookup
-		IMDSv2HopLimit:   s.IMDSv2HopLimit, // 2 for containers: warmd runs INSIDE docker and
+		InstanceType:      instanceType,
+		Region:            region,
+		AvailabilityZone:  az,     // "" => EC2 chooses; set by the Acquirer's AZ sweep
+		SubnetID:          subnet, // default subnet for the AZ; avoids InvalidInput in AZs w/o one
+		AMI:               s.AMI,  // empty => spawn auto-selects (broken for GPU; pin for GPU)
+		TTL:               ttl,
+		OnComplete:        onComplete,
+		Username:          s.Username,
+		JobArrayCommand:   s.RunCmd,
+		RootVolumeSizeGiB: s.RootVolumeGiB,  // 0 => spawn default 20 GiB (too small for vLLM)
+		PricePerHour:      s.PricePerHour,   // >0 => spawn skips its per-launch price lookup
+		IMDSv2HopLimit:    s.IMDSv2HopLimit, // 2 for containers: warmd runs INSIDE docker and
 		//                                     needs instance-role creds via IMDS, which is one
 		//                                     network hop away — the default hop limit of 1 blocks it.
 	}
