@@ -37,6 +37,12 @@ type smokeOpts struct {
 // integration — spawn acquire + instance-role S3 + collect + terminate — before
 // any spend on real inference. Every step logs; termination is deferred so a
 // mid-run failure never leaks a running instance.
+// hostWorkerDir is where the host-mode smoke test lands warmd + scripts. It must
+// be writable by the instance's login user (spawn runs JobArrayCommand as that
+// user, not root) — /opt is root-owned, which failed with "Permission denied"
+// (diagnosed from the bootstrap.log of run smoke-use1-220821). /tmp always works.
+const hostWorkerDir = "/tmp/calque"
+
 func smoke(o smokeOpts) (err error) {
 	ctx := context.Background()
 	rep := &leak.Report{}
@@ -66,7 +72,7 @@ func smoke(o smokeOpts) (err error) {
 	items := []warm.Item{{Index: 0, Payload: "smoke"}}
 	// Trivial host-runnable body: no GPU, no model. Proves the plumbing only.
 	if err := calexec.WriteManifest(ctx, s3c, layout,
-		"self.ok = True", "return {'echo': item, 'host_smoke': True}", "item", "/opt/calque", items); err != nil {
+		"self.ok = True", "return {'echo': item, 'host_smoke': True}", "item", hostWorkerDir, items); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
 	fmt.Printf("[3/7] wrote manifest (1 item, host-mode body) to s3://%s/%s\n", layout.Bucket, layout.ManifestKey)
@@ -74,7 +80,7 @@ func smoke(o smokeOpts) (err error) {
 	// 2. build the host-mode bootstrap command (with S3 log capture for post-mortem).
 	boot := calexec.BootstrapConfig{
 		Bucket: o.bucket, ArtifactPrefix: layout.ArtifactPfx, ManifestKey: layout.ManifestKey,
-		WorkerDir: "/opt/calque", Region: o.region, HostMode: true, LogKey: layout.LogKey,
+		WorkerDir: hostWorkerDir, Region: o.region, HostMode: true, LogKey: layout.LogKey,
 	}
 
 	inst := o.instance
