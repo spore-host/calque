@@ -166,8 +166,10 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 		return fmt.Errorf("write manifest: %w", err)
 	}
 
-	// Drive the test over SSM on the HELD instance (image already pulled).
-	cmd := calexec.TestRunCommand("vllm/vllm-openai:latest", hostWorkerDir, o.region, o.bucket, layout.ManifestKey, o.model, layout.LogKey)
+	// Drive the test over SSM on the HELD instance (image already pulled). The
+	// host-side occupancy JSON (with true DCGM SM-activity) lands at occKey.
+	occKey := rungBase + "/occupancy-host.json"
+	cmd := calexec.TestRunCommand("vllm/vllm-openai:latest", hostWorkerDir, o.region, o.bucket, layout.ManifestKey, o.model, layout.LogKey, occKey)
 	fmt.Printf("[N=%d] running warmd-in-docker over SSM (model load once, %d items)...\n", n, n)
 	// SSM RunShellScript blocks until the command finishes or the timeout; give it
 	// room for model load (~2min) + N generations.
@@ -192,6 +194,15 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 		Occupancy    calexec.OccupancyRaw `json:"occupancy"`
 	}
 	_ = json.Unmarshal(summaryBytes, &summary)
+	// Prefer the HOST-sampled occupancy (has true DCGM SM-activity; dcgmi isn't in
+	// the container). Fall back to the container sampler's value if the host file
+	// is absent.
+	if hb, hok := calexec.TryGetSummary(ctx, s3c, o.bucket, occKey); hok {
+		var hostOcc calexec.OccupancyRaw
+		if json.Unmarshal(hb, &hostOcc) == nil && hostOcc.Measured {
+			summary.Occupancy = hostOcc
+		}
+	}
 	results, missing, _ := calexec.Collect(ctx, s3c, o.bucket, layout.ResultPrefix, n)
 	fmt.Printf("[N=%d] @enter x%d (%.1fs), %d/%d results (%d missing), occupancy %s\n",
 		n, summary.EnterCount, summary.EnterSeconds, len(results), n, len(missing), occStr(summary.Occupancy))

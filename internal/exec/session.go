@@ -51,7 +51,7 @@ func (p SessionPrep) PrepCommand(artifactPrefix string) string {
 // warmd-in-docker against a specific manifest. The instance is already prepped
 // (image pulled), so this is just the container run. Output goes to a per-run log
 // uploaded to S3. warmd writes results + summary to S3 as before.
-func TestRunCommand(baseImage, workerDir, region, bucket, manifestKey, modelEnv, logKey string) string {
+func TestRunCommand(baseImage, workerDir, region, bucket, manifestKey, modelEnv, logKey, occKey string) string {
 	wd := workerDir
 	if wd == "" {
 		wd = "/tmp/calque"
@@ -67,12 +67,30 @@ func TestRunCommand(baseImage, workerDir, region, bucket, manifestKey, modelEnv,
 		docker = append(docker, fmt.Sprintf("-e CALQUE_MODEL=%s", modelEnv))
 	}
 	docker = append(docker, "--entrypoint "+wd+"/warmd", baseImage, "run --manifest "+manifest)
+
 	lines := []string{
 		"#!/bin/bash",
-		fmt.Sprintf("exec > /tmp/calque-test.log 2>&1"),
+		"exec > /tmp/calque-test.log 2>&1",
 		fmt.Sprintf("trap 'aws s3 cp /tmp/calque-test.log s3://%s/%s || true' EXIT", bucket, logKey),
-		"set -euxo pipefail",
-		strings.Join(docker, " "),
+		"set -uxo pipefail", // not -e: we manage the sampler lifecycle around the run
+	}
+	if occKey != "" {
+		// Run the occupancy sampler ON THE HOST (not in the container): dcgmi lives
+		// on the host (the vLLM image lacks it), so host placement is what unlocks
+		// true DCGM SM-activity. Start it in the background, run the container, then
+		// SIGTERM the sampler and upload its JSON summary to S3.
+		lines = append(lines,
+			fmt.Sprintf("python3 %s/occupancy.py sample --interval 1.0 --out /tmp/calque-occ.jsonl > /tmp/calque-occ.json 2>/dev/null & OCC=$!", wd),
+		)
+		lines = append(lines, "set +e", strings.Join(docker, " "), "RC=$?", "set -e")
+		lines = append(lines,
+			"kill -TERM $OCC 2>/dev/null || true",
+			"wait $OCC 2>/dev/null || true",
+			fmt.Sprintf("aws s3 cp /tmp/calque-occ.json s3://%s/%s || true", bucket, occKey),
+			"exit $RC",
+		)
+	} else {
+		lines = append(lines, "set -e", strings.Join(docker, " "))
 	}
 	return strings.Join(lines, "\n")
 }
