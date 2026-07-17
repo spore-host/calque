@@ -49,6 +49,11 @@
         "rate": 0.9776,
         "source": "live: aws pricing get-products, us-east-1, Linux/Shared/Used, 2026-07-16 (8 vCPU, 32 GiB, 1 L4). The capacity-fallback instance the real N=1 run actually landed on.",
         "measured": true
+      },
+      "g6e.2xlarge": {
+        "rate": 2.24208,
+        "source": "live: aws pricing get-products, us-east-1, Linux/Shared/Used, 2026-07-17 (8 vCPU, 64 GiB, 1 L40S). Closer to the RTX PRO 6000 than L4; run when g7e is capacity-blocked.",
+        "measured": true
       }
     },
     "buydown": {
@@ -64,6 +69,7 @@
   "instance_gpu_count": {
     "g7e.2xlarge": 1,
     "g6e.xlarge": 1,
-    "g6.2xlarge": 1
+    "g6.2xlarge": 1,
+    "g6e.2xlarge": 1
   }
 }
