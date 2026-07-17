@@ -31,22 +31,29 @@ import time
 
 
 class Sampler:
+    """Samples GPU occupancy from MULTIPLE sources each tick so we can compare and
+    pick the most accurate (spec §8). nvidia-smi's utilization.gpu is coarse — it's
+    "% of time >=1 kernel ran" over the poll window, not real SM/compute occupancy,
+    and it understates a busy GPU (observed: dmon sm=100% while utilization.gpu read
+    low). DCGM's SM-activity (DCP field 1002) is the truer measure. We collect BOTH
+    (plus nvidia-smi dmon sm%) and report each series; `primary` prefers DCGM.
+    """
+
+    # metric key -> collector; each returns a per-tick fraction [0,1] or None.
     def __init__(self, interval: float, out_path: str | None) -> None:
         self.interval = interval
         self.out_path = out_path
-        self.samples: list[float] = []
-        self.source = "none"
+        # one list of per-tick fractions per metric
+        self.series: dict[str, list[float]] = {
+            "nvsmi_util": [],   # nvidia-smi utilization.gpu (coarse; the old default)
+            "nvsmi_sm": [],     # nvidia-smi dmon sm% (better: SM activity)
+            "dcgm_sm": [],      # dcgmi dmon SM active (DCP 1002; truest when present)
+        }
+        self.have = {"nvsmi": bool(shutil.which("nvidia-smi")), "dcgmi": bool(shutil.which("dcgmi"))}
         self._stop = False
 
-    def _read_nvidia_smi(self) -> list[float]:
-        # utilization.gpu is the % of time one or more kernels was executing.
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                text=True, timeout=5,
-            )
-        except (subprocess.SubprocessError, OSError):
-            return []
+    @staticmethod
+    def _mean_of_csv_percents(out: str) -> float | None:
         vals = []
         for line in out.strip().splitlines():
             line = line.strip()
@@ -55,57 +62,60 @@ class Sampler:
                     vals.append(float(line) / 100.0)
                 except ValueError:
                     pass
-        return vals
+        return sum(vals) / len(vals) if vals else None
 
-    def _read_dcgm(self) -> list[float]:
-        # dcgmi dmon field 203 = GPU utilization. Best-effort; many hosts lack it.
+    def _nvsmi_util(self) -> float | None:
         try:
             out = subprocess.check_output(
-                ["dcgmi", "dmon", "-e", "203", "-c", "1"], text=True, timeout=5
-            )
+                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                text=True, timeout=5)
         except (subprocess.SubprocessError, OSError):
-            return []
+            return None
+        return self._mean_of_csv_percents(out)
+
+    def _dmon_sm(self, tool: str) -> float | None:
+        # `<tool> dmon -c 1` prints a header (2 lines starting with '#') then one
+        # row per GPU. For nvidia-smi the 2nd column is sm%. Parse numeric rows and
+        # average the sm column across GPUs.
+        try:
+            args = [tool, "dmon", "-c", "1"] + (["-s", "u"] if tool == "nvidia-smi" else ["-e", "1002"])
+            out = subprocess.check_output(args, text=True, timeout=6)
+        except (subprocess.SubprocessError, OSError):
+            return None
         vals = []
         for line in out.strip().splitlines():
             parts = line.split()
-            if parts and parts[0].isdigit():
-                try:
-                    vals.append(float(parts[-1]) / 100.0)
-                except ValueError:
-                    pass
-        return vals
-
-    def _detect(self) -> None:
-        if shutil.which("dcgmi") and self._read_dcgm():
-            self.source = "dcgm"
-        elif shutil.which("nvidia-smi"):
-            self.source = "nvidia-smi"
-        else:
-            # No GPU tooling (e.g. a local CPU dry-run). We still run so the
-            # pipeline works end-to-end; occupancy is reported as unavailable and
-            # `measure` flags K's occupancy input as unmeasured.
-            self.source = "none"
+            if not parts or not parts[0].lstrip("-").isdigit():
+                continue  # skip '#' headers
+            # nvidia-smi dmon -s u: cols = gpu sm mem enc dec ... -> sm is index 1
+            # dcgmi dmon -e 1002:   cols = GPU <value>            -> value is last
+            try:
+                v = float(parts[1]) if tool == "nvidia-smi" else float(parts[-1])
+                vals.append(v / 100.0)
+            except (ValueError, IndexError):
+                pass
+        return sum(vals) / len(vals) if vals else None
 
     def _sample_once(self) -> None:
-        if self.source == "dcgm":
-            vals = self._read_dcgm()
-        elif self.source == "nvidia-smi":
-            vals = self._read_nvidia_smi()
-        else:
-            vals = []
-        if vals:
-            # Mean across GPUs on the box (single-node, usually 1 GPU for the spike).
-            self.samples.append(sum(vals) / len(vals))
+        if self.have["nvsmi"]:
+            u = self._nvsmi_util()
+            if u is not None:
+                self.series["nvsmi_util"].append(u)
+            sm = self._dmon_sm("nvidia-smi")
+            if sm is not None:
+                self.series["nvsmi_sm"].append(sm)
+        if self.have["dcgmi"]:
+            d = self._dmon_sm("dcgmi")
+            if d is not None:
+                self.series["dcgm_sm"].append(d)
 
     def run(self) -> dict:
-        self._detect()
         out_f = open(self.out_path, "w", encoding="utf-8") if self.out_path else None
-        # perf_counter can't be pinned in tests, but this process is on the
-        # instance during a real run; wall-clock here is the intent.
         while not self._stop:
             self._sample_once()
-            if out_f and self.samples:
-                out_f.write(json.dumps({"occ": self.samples[-1]}) + "\n")
+            if out_f:
+                last = {k: (v[-1] if v else None) for k, v in self.series.items()}
+                out_f.write(json.dumps(last) + "\n")
                 out_f.flush()
             time.sleep(self.interval)
         if out_f:
@@ -113,13 +123,28 @@ class Sampler:
         return self.summary()
 
     def summary(self) -> dict:
-        mean = sum(self.samples) / len(self.samples) if self.samples else None
+        def mean(xs: list[float]) -> float | None:
+            return sum(xs) / len(xs) if xs else None
+
+        means = {k: mean(v) for k, v in self.series.items()}
+        counts = {k: len(v) for k, v in self.series.items()}
+        # Primary occupancy: prefer DCGM SM-activity, then nvidia-smi dmon sm%, then
+        # the coarse utilization.gpu — most-accurate-available. This is what K uses.
+        primary_key = None
+        for k in ("dcgm_sm", "nvsmi_sm", "nvsmi_util"):
+            if means[k] is not None:
+                primary_key = k
+                break
+        primary = means[primary_key] if primary_key else None
         return {
-            "mean_occupancy": mean,          # fraction [0,1], or None if unmeasured
-            "samples": len(self.samples),
-            "source": self.source,           # dcgm | nvidia-smi | none
+            "mean_occupancy": primary,        # fraction [0,1] — K uses this (best available)
+            "occupancy_source": primary_key or "none",  # which metric fed mean_occupancy
+            "metrics": means,                 # ALL metrics, for comparison/audit
+            "metric_samples": counts,
+            "source": primary_key or "none",  # back-compat with the Go OccupancyRaw
+            "samples": counts.get(primary_key, 0) if primary_key else 0,
             "interval_s": self.interval,
-            "measured": mean is not None,    # feeds K's measured|proxy flag
+            "measured": primary is not None,  # feeds K's measured|proxy flag
         }
 
     def stop(self, *_):

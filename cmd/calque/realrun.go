@@ -238,10 +238,22 @@ func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.Occupanc
 }
 
 func occStr(o calexec.OccupancyRaw) string {
-	if o.Measured && o.MeanOccupancy != nil {
-		return fmt.Sprintf("%.0f%% (%s, %d samples)", *o.MeanOccupancy*100, o.Source, o.Samples)
+	if !o.Measured || o.MeanOccupancy == nil {
+		return fmt.Sprintf("unmeasured (%s)", o.Source)
 	}
-	return fmt.Sprintf("unmeasured (%s)", o.Source)
+	// Show the primary + every metric collected, so nvidia-smi's coarse
+	// utilization.gpu can be compared against DCGM SM-activity (§8, Scott's note).
+	s := fmt.Sprintf("%.0f%% [primary=%s]", *o.MeanOccupancy*100, o.OccupancySource)
+	if len(o.Metrics) > 0 {
+		parts := ""
+		for _, k := range []string{"dcgm_sm", "nvsmi_sm", "nvsmi_util"} {
+			if v, ok := o.Metrics[k]; ok && v != nil {
+				parts += fmt.Sprintf(" %s=%.0f%%", k, *v*100)
+			}
+		}
+		s += " {" + parts + " }"
+	}
+	return s
 }
 
 func getS3(ctx context.Context, c *s3.Client, bucket, key string) ([]byte, error) {
