@@ -99,8 +99,14 @@ func runSession(o sessionOpts) (err error) {
 	}
 	acq := &plan.Acquirer{
 		Launcher: launcher, Report: rep, Deadline: o.acquireDeadline, Placements: places,
-		OnProgress: func(attempt int, code string, waited time.Duration) {
-			fmt.Printf("      ...swept %d, no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
+		OnProgress: func(attempt int, code, detail string, waited time.Duration) {
+			// Print the full AWS message periodically so a changed error (capacity
+			// opening, or a non-capacity failure) is visible — not just the code.
+			if attempt%20 == 1 {
+				fmt.Printf("      ...swept %d, %s (%s): %s\n", attempt, code, waited.Round(time.Second), oneLine(detail))
+			} else {
+				fmt.Printf("      ...swept %d, no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
+			}
 		},
 	}
 	tgt := &target.Target{Card: target.DefaultCard, Instance: o.instance}

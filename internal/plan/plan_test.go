@@ -76,7 +76,7 @@ func TestAcquireRetriesThenLands(t *testing.T) {
 		}},
 		Report:       rep,
 		PollInterval: time.Millisecond,
-		OnProgress:   func(a int, code string, w time.Duration) { progress = append(progress, code) },
+		OnProgress:   func(a int, code, detail string, w time.Duration) { progress = append(progress, code) },
 		sleep:        noSleep,
 	}
 	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g7e.2xlarge"}

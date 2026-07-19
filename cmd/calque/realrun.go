@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -124,7 +125,7 @@ func realRun(o realOpts) (err error) {
 	}
 	acq := &plan.Acquirer{
 		Launcher: launcher, Report: rep, Deadline: o.deadline, Placements: places,
-		OnProgress: func(attempt int, code string, waited time.Duration) {
+		OnProgress: func(attempt int, code, detail string, waited time.Duration) {
 			fmt.Printf("      ...swept %d attempt(s), no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 		},
 	}
@@ -279,4 +280,14 @@ func tail(b []byte, n int) string {
 		return string(b)
 	}
 	return "..." + string(b[len(b)-n:])
+}
+
+// oneLine collapses a multi-line/verbose AWS error to a single trimmed log line.
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 220 {
+		s = s[:220] + "…"
+	}
+	return s
 }

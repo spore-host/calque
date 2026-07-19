@@ -125,7 +125,7 @@ func smoke(o smokeOpts) (err error) {
 	}
 	acq := &plan.Acquirer{
 		Launcher: launcher, Report: rep, Deadline: o.deadline, Placements: places,
-		OnProgress: func(attempt int, code string, waited time.Duration) {
+		OnProgress: func(attempt int, code, detail string, waited time.Duration) {
 			fmt.Printf("      ...swept %d attempt(s), still no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 		},
 	}

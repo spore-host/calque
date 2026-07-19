@@ -59,7 +59,10 @@ type LaunchOutcome struct {
 
 // Progress receives status updates for the live "waiting for capacity…" line
 // (§5: lagotto/acquisition exposes no push channel, so the Acquirer emits its own).
-type Progress func(attempt int, code string, waited time.Duration)
+// detail is the FULL verbatim error message from AWS (not just the code) — so a
+// changed error (capacity opening in an AZ, or a non-capacity failure the code
+// classifier would otherwise swallow) is visible in the log.
+type Progress func(attempt int, code, detail string, waited time.Duration)
 
 // Acquirer snipes a single resolved target: it calls Provision and, on a capacity
 // failure, retries with backoff until it lands or the deadline passes — the
@@ -117,7 +120,7 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 	unknownStreak := 0
 	const maxUnknown = 3 // tolerate a few transient/unknown blips, then fail fast
 	for {
-		var lastCode string
+		var lastCode, lastDetail string
 		// One round = a full sweep across placements. A capacity failure in one AZ
 		// falls through to the next immediately (no sleep); only a fully-failed
 		// sweep sleeps.
@@ -147,6 +150,7 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 
 			kind, code := classify(err)
 			lastCode = code
+			lastDetail = err.Error() // full verbatim AWS message, not just the code
 			if kind == failureTerminal {
 				return Acquired{}, fmt.Errorf("acquire %s/%s: terminal failure %q: %w", t.Instance, region, code, err)
 			}
@@ -164,7 +168,7 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 		// The whole AZ sweep returned capacity failures. Back off, unless the
 		// deadline has passed. This wait is what lagotto's warm pool hides on Modal.
 		if a.OnProgress != nil {
-			a.OnProgress(attempt, lastCode, now().Sub(start))
+			a.OnProgress(attempt, lastCode, lastDetail, now().Sub(start))
 		}
 		if now().After(giveUp) {
 			if a.Report != nil {
