@@ -97,13 +97,18 @@ func runSession(o sessionOpts) (err error) {
 		Username:   "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami, PricePerHour: pricePerHr,
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
 	}
+	round := 0
+	lastDetail := ""
 	acq := &plan.Acquirer{
 		Launcher: launcher, Report: rep, Deadline: o.acquireDeadline, Placements: places,
 		OnProgress: func(attempt int, code, detail string, waited time.Duration) {
-			// Print the full AWS message periodically so a changed error (capacity
-			// opening, or a non-capacity failure) is visible — not just the code.
-			if attempt%20 == 1 {
-				fmt.Printf("      ...swept %d, %s (%s): %s\n", attempt, code, waited.Round(time.Second), oneLine(detail))
+			// Print the full AWS message on the first round, whenever it CHANGES, and
+			// every 10th round — so a capacity opening (message names an AZ) or a
+			// non-capacity failure is visible, not just the bare code.
+			round++
+			if round == 1 || detail != lastDetail || round%10 == 0 {
+				fmt.Printf("      ...swept %d (%s, %s): %s\n", attempt, code, waited.Round(time.Second), oneLine(detail))
+				lastDetail = detail
 			} else {
 				fmt.Printf("      ...swept %d, no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 			}
