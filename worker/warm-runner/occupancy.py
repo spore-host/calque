@@ -74,9 +74,13 @@ class Sampler:
         return self._mean_of_csv_percents(out)
 
     def _dmon_sm(self, tool: str) -> float | None:
-        # `<tool> dmon -c 1` prints a header (2 lines starting with '#') then one
-        # row per GPU. For nvidia-smi the 2nd column is sm%. Parse numeric rows and
-        # average the sm column across GPUs.
+        # Two DIFFERENT output formats (verified on a live L40S host):
+        #   nvidia-smi dmon -s u : header lines start with '#'; data row starts with
+        #     a numeric GPU index, e.g. "    0   100    99 ..." -> sm% at index 1,
+        #     value is a PERCENT (0-100), divide by 100.
+        #   dcgmi dmon -e 1002   : header lines "#Entity.../ID..."; data row is
+        #     "GPU 0   0.816" -> starts with literal 'GPU', value is the LAST field
+        #     and is ALREADY A FRACTION (0-1), do NOT divide.
         try:
             args = [tool, "dmon", "-c", "1"] + (["-s", "u"] if tool == "nvidia-smi" else ["-e", "1002"])
             out = subprocess.check_output(args, text=True, timeout=6)
@@ -85,15 +89,22 @@ class Sampler:
         vals = []
         for line in out.strip().splitlines():
             parts = line.split()
-            if not parts or not parts[0].lstrip("-").isdigit():
-                continue  # skip '#' headers
-            # nvidia-smi dmon -s u: cols = gpu sm mem enc dec ... -> sm is index 1
-            # dcgmi dmon -e 1002:   cols = GPU <value>            -> value is last
-            try:
-                v = float(parts[1]) if tool == "nvidia-smi" else float(parts[-1])
-                vals.append(v / 100.0)
-            except (ValueError, IndexError):
-                pass
+            if not parts:
+                continue
+            if tool == "nvidia-smi":
+                if not parts[0].lstrip("-").isdigit():
+                    continue  # skip '#' headers; data rows start with the GPU index
+                try:
+                    vals.append(float(parts[1]) / 100.0)  # sm% -> fraction
+                except (ValueError, IndexError):
+                    pass
+            else:  # dcgmi: data rows start with "GPU"
+                if parts[0] != "GPU":
+                    continue  # skip "#Entity" / "ID" headers
+                try:
+                    vals.append(float(parts[-1]))  # SMACT already a fraction 0-1
+                except (ValueError, IndexError):
+                    pass
         return sum(vals) / len(vals) if vals else None
 
     def _sample_once(self) -> None:
