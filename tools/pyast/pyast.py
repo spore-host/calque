@@ -125,6 +125,22 @@ def _arg_names(node: ast.FunctionDef) -> list[str]:
     return names
 
 
+# Serve decorators (§F): long-lived request-driven entrypoints. Detected so the Go
+# side can gate/leak them (build is deferred — §16 success is batch+K), never
+# silently treated as batch. Matched by the trailing decorator name.
+_SERVE_DECOS = frozenset({"web_endpoint", "fastapi_endpoint", "asgi_app", "wsgi_app", "web_server"})
+
+
+def _entry_kind(decos: list[str]) -> str:
+    """Classify a function's execution shape from its decorators (§F). 'serve' for a
+    long-lived request-driven entrypoint, else '' (batch/plain)."""
+    for d in decos:
+        leaf = d.rsplit(".", 1)[-1]
+        if leaf in _SERVE_DECOS:
+            return "serve"
+    return ""
+
+
 def _describe_fn(src: str, node: ast.FunctionDef) -> dict[str, Any]:
     decos = []
     for d in node.decorator_list:
@@ -140,6 +156,7 @@ def _describe_fn(src: str, node: ast.FunctionDef) -> dict[str, Any]:
         "lineno": node.lineno,
         "args": _arg_names(node),
         "decorators": decos,
+        "entry_kind": _entry_kind([d["name"] for d in decos]),
         # PAYLOAD — verbatim, never interpreted:
         "body": _body_source(src, node),
     }
@@ -211,6 +228,7 @@ class Collector(ast.NodeVisitor):
         self.volumes: dict[str, Any] = {}       # varname -> {from_name: str, lineno}
         self.map_calls: list[dict[str, Any]] = []  # every `.map(` occurrence
         self.invoke_calls: list[dict[str, Any]] = []  # §C: starmap/for_each/remote/spawn/map.aio
+        self.volume_writes: list[dict[str, Any]] = []  # §E: volume.commit()/reload() call sites
         self.leaks: list[dict[str, Any]] = []      # helper-level "I saw this but can't model it"
 
     # ---- module-level assignments: App(), Image chains, Volume.from_name() ----
@@ -261,6 +279,14 @@ class Collector(ast.NodeVisitor):
                 self.invoke_calls.append(
                     {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno}
                 )
+            elif attr in ("commit", "reload"):
+                # §E: volume.commit()/reload() call sites. We record the target var
+                # + kind; the Go side correlates `target` against known Volume vars
+                # (so a random obj.commit() isn't mistaken for a volume write) and
+                # leaks a MID-RUN mutation as a semantic gap.
+                self.volume_writes.append(
+                    {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno}
+                )
         self.generic_visit(node)
 
     def _decos(self, node: ast.FunctionDef) -> list[str]:
@@ -268,9 +294,12 @@ class Collector(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         decos = self._decos(node)
+        leaves = {d.rsplit(".", 1)[-1] for d in decos}
         if any(d.endswith("local_entrypoint") for d in decos):
             self.entrypoint = _describe_fn(self.src, node)
-        elif any(d.endswith("function") for d in decos):
+        elif any(d.endswith("function") for d in decos) or (leaves & _SERVE_DECOS):
+            # A serve entrypoint (§F) may carry @app.function too, or only the serve
+            # decorator — collect it either way so its entry_kind reaches the IR.
             self.functions.append(_describe_fn(self.src, node))
         # methods handled inside ClassDef; free functions with neither decorator are ignored
         self.generic_visit(node)
@@ -327,6 +356,7 @@ def analyze(path: str) -> dict[str, Any]:
         "entrypoint": c.entrypoint,
         "map_calls": c.map_calls,
         "invoke_calls": c.invoke_calls,
+        "volume_writes": c.volume_writes,
         "helper_leaks": c.leaks,
     }
 

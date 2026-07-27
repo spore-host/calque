@@ -49,17 +49,29 @@ type Config struct {
 
 // Function is an @app.function (or, when embedded in a Class, an @method).
 type Function struct {
-	Name    string
-	GPU     string            // raw from source, e.g. "H100" or "A100:8" — guarded/rewritten in §7
-	Volumes map[string]string // mount path -> Modal volume name (from_name)
-	Timeout int               // seconds; 0 if unset
-	Config  Config            // portable decorator config (cpu/memory/retries/secrets/schedule/region)
-	IsMap   bool              // is this callable's .map() invoked anywhere in the script?
-	Invoke  InvokeKind        // how the callable is invoked (map/starmap/for_each/remote); §C
-	Body    string            // verbatim payload, shipped to the worker
-	ItemArg string            // first non-self parameter name — the per-item arg the warm runner binds
-	Line    int               // source line of the def, for leak attribution
+	Name      string
+	GPU       string            // raw from source, e.g. "H100" or "A100:8" — guarded/rewritten in §7
+	Volumes   map[string]string // mount path -> Modal volume name (from_name)
+	Timeout   int               // seconds; 0 if unset
+	Config    Config            // portable decorator config (cpu/memory/retries/secrets/schedule/region)
+	IsMap     bool              // is this callable's .map() invoked anywhere in the script?
+	Invoke    InvokeKind        // how the callable is invoked (map/starmap/for_each/remote); §C
+	EntryKind EntryKind         // execution shape: batch (default) or serve (§F)
+	Body      string            // verbatim payload, shipped to the worker
+	ItemArg   string            // first non-self parameter name — the per-item arg the warm runner binds
+	Line      int               // source line of the def, for leak attribution
 }
+
+// EntryKind is a callable's execution shape (§F). Serve entrypoints are long-lived
+// and request-driven — a fundamentally different shape from the batch .map the
+// spike measures; they are detected + gated/leaked, but the server is not built
+// (§16 success is batch+K).
+type EntryKind string
+
+const (
+	EntryBatch EntryKind = ""      // plain @function / @cls method — the batch shape
+	EntryServe EntryKind = "serve" // @web_endpoint/@asgi_app/@wsgi_app/@web_server
+)
 
 // InvokeKind is how a callable is invoked (spec §C). Modal's synchronous
 // (block-and-wait) idioms are all in the spike's scope; async (.spawn/.map.aio)

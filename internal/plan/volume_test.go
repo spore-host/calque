@@ -60,6 +60,18 @@ func TestSyncUsesSyncNotCp(t *testing.T) {
 	}
 }
 
+// TestCommitReversesSync (E1): CommitCommands writes the mount BACK to S3 — the
+// reverse direction of SyncCommands, so volume.commit() round-trips.
+func TestCommitReversesSync(t *testing.T) {
+	mounts := []VolumeMount{{Name: "w", S3Prefix: "volumes/w/", MountPath: "/weights"}}
+	lines := CommitCommands("b", mounts)
+	joined := strings.Join(lines, "\n")
+	// Reverse of sync: source is the mount, dest is the S3 URI.
+	if !strings.Contains(joined, "aws s3 sync --no-progress /weights s3://b/volumes/w") {
+		t.Errorf("commit must sync mount -> S3 (reverse of download), got:\n%s", joined)
+	}
+}
+
 // TestVolumeConflictLeaks: two different volumes at one mount path is a conflict
 // we surface, not guess through.
 func TestVolumeConflictLeaks(t *testing.T) {

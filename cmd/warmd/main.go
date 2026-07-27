@@ -39,10 +39,11 @@ type Manifest struct {
 	Bucket       string                   `json:"bucket"`
 	ResultPrefix string                   `json:"result_prefix"`
 	SummaryKey   string                   `json:"summary_key"`
-	PythonBin    string                   `json:"python_bin"`            // interpreter in the image
-	RunnerPath   string                   `json:"runner_path"`           // path to runner.py in the image
-	Occupancy    string                   `json:"occupancy_path"`        // path to occupancy.py in the image
-	VolumeSync   []calexec.VolumeSyncSpec `json:"volume_sync,omitempty"` // staged (aws s3 sync) before @enter (§3/§15)
+	PythonBin    string                   `json:"python_bin"`              // interpreter in the image
+	RunnerPath   string                   `json:"runner_path"`             // path to runner.py in the image
+	Occupancy    string                   `json:"occupancy_path"`          // path to occupancy.py in the image
+	VolumeSync   []calexec.VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged (aws s3 sync) before @enter (§3/§15)
+	VolumeCommit []calexec.VolumeSyncSpec `json:"volume_commit,omitempty"` // written back (mount -> S3) after @method drains (§E)
 }
 
 // Summary is what warmd writes back so the control plane's measure step can fold
@@ -121,6 +122,17 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 	}
 	failed, runErr := sup.Run(ctx, man.Items)
 	ended := time.Now()
+
+	// Commit volumes BACK to S3 after @method drains (§E, volume.commit()). This is
+	// the write-back half of the volume plumbing — runs before terminate so a
+	// mutated volume persists. Best-effort + logged: a commit failure is surfaced,
+	// not silently swallowed, but it does not fail the run's results.
+	for _, v := range man.VolumeCommit {
+		fmt.Fprintf(os.Stderr, "committing volume %s -> %s\n", v.MountPath, v.URI)
+		if out, cerr := exec.CommandContext(ctx, "aws", "s3", "sync", "--no-progress", v.MountPath, v.URI).CombinedOutput(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: volume commit %s -> %s failed: %v (%s)\n", v.MountPath, v.URI, cerr, out)
+		}
+	}
 
 	// Stop the sampler and capture its JSON summary (SIGTERM -> it prints + exits).
 	var occ calexec.OccupancyRaw

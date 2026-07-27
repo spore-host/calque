@@ -22,17 +22,26 @@ import (
 // ---- JSON contract emitted by tools/pyast/pyast.py ----
 
 type pyOut struct {
-	Script      string              `json:"script"`
-	AppName     string              `json:"app_name"`
-	Images      map[string]pyImage  `json:"images"`
-	Volumes     map[string]pyVolume `json:"volumes"`
-	Functions   []pyFunc            `json:"functions"`
-	Classes     []pyClass           `json:"classes"`
-	Entrypoint  *pyFunc             `json:"entrypoint"`
-	MapCalls    []pyMapCall         `json:"map_calls"`
-	InvokeCalls []pyInvokeCall      `json:"invoke_calls"`
-	HelperLeaks []map[string]any    `json:"helper_leaks"`
-	Error       string              `json:"error"`
+	Script       string              `json:"script"`
+	AppName      string              `json:"app_name"`
+	Images       map[string]pyImage  `json:"images"`
+	Volumes      map[string]pyVolume `json:"volumes"`
+	Functions    []pyFunc            `json:"functions"`
+	Classes      []pyClass           `json:"classes"`
+	Entrypoint   *pyFunc             `json:"entrypoint"`
+	MapCalls     []pyMapCall         `json:"map_calls"`
+	InvokeCalls  []pyInvokeCall      `json:"invoke_calls"`
+	VolumeWrites []pyVolumeWrite     `json:"volume_writes"`
+	HelperLeaks  []map[string]any    `json:"helper_leaks"`
+	Error        string              `json:"error"`
+}
+
+// pyVolumeWrite is a volume.commit()/reload() call site (§E). Target is the var the
+// method was called on; the Go side correlates it against known Volume vars.
+type pyVolumeWrite struct {
+	Target string `json:"target"`
+	Kind   string `json:"kind"` // "commit" | "reload"
+	Lineno int    `json:"lineno"`
 }
 
 type pyImage struct {
@@ -56,6 +65,7 @@ type pyFunc struct {
 	Lineno     int           `json:"lineno"`
 	Args       []string      `json:"args"`
 	Decorators []pyDecorator `json:"decorators"`
+	EntryKind  string        `json:"entry_kind"` // "serve" for a serve entrypoint, else "" (§F)
 	Body       string        `json:"body"`
 }
 
@@ -156,6 +166,29 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	if out.Entrypoint != nil {
 		fn := buildFn(*out.Entrypoint, script, rep, invokes)
 		app.Entrypoint = &fn
+	}
+
+	// E3: volume.commit()/reload() call sites. A volume that's WRITTEN (not just
+	// read) has persistence semantics; a MID-RUN commit (inside a method body,
+	// re-reading between items) is a semantic gap the spike can't reproduce — leak
+	// it rather than silently persist only at end-of-run.
+	knownVol := map[string]bool{}
+	for name := range out.Volumes {
+		knownVol[name] = true
+	}
+	for _, vw := range out.VolumeWrites {
+		if !knownVol[vw.Target] {
+			continue // some other object's .commit()/.reload(), not a Volume
+		}
+		if vw.Kind == "reload" {
+			rep.Addf(leak.PrimVolume, leak.KindSemanticGap, script, vw.Lineno,
+				"volume %q .reload() — mid-run re-read of a mutated volume is not reproduced; the spike syncs once before @enter and commits once after drain", vw.Target)
+		} else {
+			// commit(): honored as an END-OF-RUN write-back (E1/E2). Note it so the
+			// caller wires CommitCommands for this volume.
+			rep.Addf(leak.PrimVolume, leak.KindSemanticGap, script, vw.Lineno,
+				"volume %q .commit() — persisted as an END-OF-RUN write-back (§E); a mid-run commit visible to concurrent readers is not reproduced", vw.Target)
+		}
 	}
 	return app
 }
@@ -281,11 +314,12 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 
 func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.InvokeKind) ir.Function {
 	fn := ir.Function{
-		Name:    f.Name,
-		Body:    f.Body,
-		Line:    f.Lineno,
-		Invoke:  invokes[f.Name],
-		ItemArg: firstItemArg(f.Args),
+		Name:      f.Name,
+		Body:      f.Body,
+		Line:      f.Lineno,
+		Invoke:    invokes[f.Name],
+		EntryKind: ir.EntryKind(f.EntryKind), // "serve" or "" (§F)
+		ItemArg:   firstItemArg(f.Args),
 	}
 	fn.IsMap = fn.Invoke == ir.InvokeMap // back-compat: IsMap tracks the .map() idiom
 	// The function-config decorator is the one named "*.function" (or "*.method"

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/spore-host/calque/internal/gate"
+	"github.com/spore-host/calque/internal/ir"
 )
 
 // TestPrintOffersAndStop locks the G3 short-circuit contract: an exact offer means
@@ -20,3 +21,18 @@ func TestPrintOffersAndStop(t *testing.T) {
 		t.Error("an exact offer MUST stop the run before acquisition")
 	}
 }
+
+// TestServeAppDetection (F2): serveApp identifies a serve-shaped app so run() leaks
+// the deferred shape instead of hard-erroring.
+func TestServeAppDetection(t *testing.T) {
+	batch := irApp(ir.Function{Name: "gen", EntryKind: ir.EntryBatch})
+	if serveApp(batch) {
+		t.Error("a batch app must not be detected as serve")
+	}
+	serve := irApp(ir.Function{Name: "endpoint", EntryKind: ir.EntryServe})
+	if !serveApp(serve) {
+		t.Error("an app with a serve entry function must be detected as serve")
+	}
+}
+
+func irApp(fns ...ir.Function) ir.App { return ir.App{Functions: fns} }
