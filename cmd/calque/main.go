@@ -317,22 +317,16 @@ func analyze(scripts []string) error {
 		gate.Sort(gateResults)
 		fmt.Println("\n--- Bedrock eligibility gate (§11) ---")
 		for _, r := range gateResults {
+			// The offer surface (G2/G4) is the single source of truth for a
+			// route-away; render it when present, else explain why there's none.
+			if o := r.Offer(); o != nil {
+				fmt.Printf("  %s: %s", short(r.Script), o.Render())
+				continue
+			}
 			switch {
 			case r.ModelRef == "":
 				fmt.Printf("  %s: identity hidden (no repo id; %s shape) — cannot claim Bedrock match\n",
 					short(r.Script), r.Shape)
-			case r.Eligible:
-				fmt.Printf("  %s: EXACT %s + inference -> SUGGEST BEDROCK (%s) [%s], don't rent a GPU\n",
-					short(r.Script), r.ModelRef, r.MatchID, r.Source)
-				if r.Evidence != "" {
-					fmt.Printf("        evidence: %s\n", r.Evidence)
-				}
-				if len(r.Regions) > 0 {
-					fmt.Printf("        Bedrock regions: %v\n", r.Regions)
-				}
-			case r.Tier == gate.TierNear:
-				fmt.Printf("  %s: NEAR %s ~ %s [%s; differs: %v] — offer, no quality claim\n",
-					short(r.Script), r.ModelRef, r.MatchID, r.Source, r.DiffAxes)
 			default:
 				fmt.Printf("  %s: %s (%s shape) — no catalog match; legitimately calque's job\n",
 					short(r.Script), r.ModelRef, r.Shape)
