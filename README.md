@@ -7,6 +7,11 @@ AWS is where the same code *scales* — you own the rectangle and the economics 
 calque is the loan-translation between the two: the same script that ran over 10 items on Modal
 runs over 10,000,000 on AWS **without a logic rewrite** (only a mechanical `gpu=` substitution).
 
+**Current spike target:** batch inference using `.map()` and warm single-node GPU
+workers. Unsupported Modal idioms (serve, async futures, multi-GPU/coupled, some
+config kwargs) are detected and reported, never silently ignored — see the
+capability matrix below.
+
 > A *calque* is a structure-preserving translation between languages (English "flea market" ←
 > French *marché aux puces*). That is the job: translate Modal's idioms onto AWS term-by-term,
 > structure intact, so the author doesn't notice the translation.
