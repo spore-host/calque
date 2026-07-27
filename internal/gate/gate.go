@@ -62,6 +62,12 @@ type Result struct {
 	Source   string   // "hf-bedrock-map" (authoritative) | "signature-heuristic" | ""
 	Evidence string   // hf-bedrock-map evidence string, when that source matched
 	Regions  []string // Bedrock regions serving the model (from hf-bedrock-map)
+	// Catalog/Confidence carry the structured hf-bedrock-map route through to the
+	// offer surface (G1) — "foundation-model" | "marketplace" and
+	// confirmed|validated|ambiguous. Empty when the match came from the signature
+	// heuristic (which has no catalog/confidence notion).
+	Catalog    string
+	Confidence string
 }
 
 // trainingSignals in a body/enter indicate NOT plain inference (check #2).
@@ -171,6 +177,9 @@ func EvaluateWith(ctx context.Context, app ir.App, cat Catalog, hfMap HFLookup, 
 				res.Source = "hf-bedrock-map"
 				res.Evidence = hm.Evidence
 				res.Regions = hm.Regions
+				// Carry the structured route through for the offer surface (G1).
+				res.Catalog = hm.Catalog
+				res.Confidence = hm.Confidence
 				if best == TierNear {
 					bestDiffs = []string{"ambiguous: " + hm.Evidence}
 				}
@@ -250,6 +259,12 @@ type Census struct {
 	BedrockNear    int `json:"bedrock_near"`     // near match, offered with labeled diffs
 	SelfHostedOnly int `json:"self_hosted_only"` // no catalog match; legitimately calque's job
 	IdentityHidden int `json:"identity_hidden"`  // model ref obscured (behind a mount)
+	// OffersMade is the count of units that produced an actual route-away
+	// ReplacementOffer (G5): the cheapest corpus number for "how many jobs did we
+	// send to the API instead of a GPU." Equals BedrockExact — an eligible unit is
+	// exactly one that yields an offer — but named separately so the offer surface
+	// has a stable metric even if eligibility criteria evolve.
+	OffersMade int `json:"offers_made"`
 }
 
 func Summarize(results []Result) Census {
@@ -264,6 +279,9 @@ func Summarize(results []Result) Census {
 			c.BedrockNear++
 		default:
 			c.SelfHostedOnly++
+		}
+		if r.Offer() != nil {
+			c.OffersMade++
 		}
 	}
 	return c

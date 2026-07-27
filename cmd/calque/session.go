@@ -45,6 +45,12 @@ func runSession(o sessionOpts) (err error) {
 	rep := &leak.Report{}
 	fmt.Printf("=== calque SESSION (acquire-once, hold, run %v) model=%s instance=%s ===\n", o.rungs, o.model, o.instance)
 
+	// Route-away gate (§11, G3): refuse to hold a billable GPU for a model that's
+	// already an exact Bedrock API call, before the (slow, expensive) acquisition.
+	if printOffersAndStop(bedrockOffersForModel(ctx, o.model, rep)) {
+		return nil
+	}
+
 	warmdBin, err := buildWarmd(ctx)
 	if err != nil {
 		return fmt.Errorf("build warmd: %w", err)

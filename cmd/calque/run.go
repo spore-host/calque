@@ -53,6 +53,16 @@ func run(o runOpts) error {
 	}
 	fmt.Printf("warm unit: class %q, method %q, gpu asked-for %q\n", unit.class.Name, unit.method.Name, unit.class.GPU)
 
+	// 2a. route-away gate (§11, G3): before recommend/acquire, check whether this
+	// model is already an exact Bedrock API call. If so, renting a GPU is the wrong
+	// answer — emit the offer and stop. This is the credibility short-circuit; it
+	// runs on the runnable path, not just analyze.
+	if printOffersAndStop(bedrockOffers(ctx, app, rep)) {
+		fmt.Println("\n--- leak report (§10) ---")
+		rep.Summary(os.Stdout)
+		return nil
+	}
+
 	// 2. gpu guard (§7): the swap must be legal or we refuse.
 	glog := gpu.RewriteApp(app, rep)
 	askedCard := gpu.ParseSpec(unit.class.GPU).Card

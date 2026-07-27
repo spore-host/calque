@@ -60,6 +60,13 @@ func realRun(o realOpts) (err error) {
 	rep := &leak.Report{}
 	fmt.Printf("=== calque REAL GPU run (model=%s N=%d region=%s instance=%s) ===\n", o.model, o.n, o.region, o.instance)
 
+	// Route-away gate (§11, G3): refuse to rent a GPU for a model that's already an
+	// exact Bedrock API call. Enforces the "--model must NOT be on Bedrock" contract
+	// BEFORE any billable acquisition.
+	if printOffersAndStop(bedrockOffersForModel(ctx, o.model, rep)) {
+		return nil
+	}
+
 	warmdBin, err := buildWarmd(ctx)
 	if err != nil {
 		return fmt.Errorf("build warmd: %w", err)
