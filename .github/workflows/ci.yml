@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Go control plane: format gate, vet, and the full test suite. This job does NOT
+  # install uv, so the pyast contract test self-skips here — that path is covered
+  # (and REQUIRED to run) in the contract job below, so it's proven, not assumed.
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: gofmt (fail on unformatted)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+  # Python <-> Go parser contract. The parser tests skip when uv is absent (see
+  # internal/parse/parse_test.go); CI installs uv so they actually run, then asserts
+  # they were NOT skipped — a silent skip here would hide contract drift.
+  pyast-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: sync pyast deps
+        working-directory: tools/pyast
+        run: uv sync
+
+      - name: run parser contract tests (must not skip)
+        run: |
+          # Run only the parse package verbosely; capture output to detect skips.
+          go test -count=1 -v ./internal/parse/ | tee /tmp/parse.out
+          if grep -q -- '--- SKIP' /tmp/parse.out; then
+            echo "::error::a parser contract test SKIPPED with uv installed — the Go<->Python contract was not exercised"
+            exit 1
+          fi
