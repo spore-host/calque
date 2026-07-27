@@ -127,6 +127,7 @@ func realCmd(args []string) error {
 	ami := fs.String("ami", "", "pinned AMI (required for GPU; spawn auto-select is broken)")
 	model := fs.String("model", "Qwen/Qwen2.5-1.5B-Instruct", "HF model repo id (must NOT be on Bedrock)")
 	n := fs.Int("n", 1, "number of prompts (N=1 validates inference; N~100 for amortized K)")
+	shards := fs.Int("shards", 1, "fan out .map across N single-node instances acquired in parallel (§15 fleet; 1 => single instance)")
 	ttl := fs.String("ttl", "40m", "instance TTL hard cap")
 	deadlineMin := fs.Int("deadline-min", 40, "give up acquiring/waiting after N minutes")
 	rates := fs.String("rates", "config/rates.json", "rate table path")
@@ -135,15 +136,20 @@ func realCmd(args []string) error {
 		return err
 	}
 	if *bucket == "" || *runID == "" || *ami == "" {
-		return fmt.Errorf("usage: calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] --i-understand-this-spends-money")
+		return fmt.Errorf("usage: calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] --i-understand-this-spends-money")
 	}
 	if !*confirm {
 		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money")
 	}
-	return realRun(realOpts{
+	if *shards > *n {
+		return fmt.Errorf("--shards %d exceeds --n %d (a shard would be empty)", *shards, *n)
+	}
+	opts := realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
-	})
+	}
+	// shards>1 fans out across a fleet (§15); shards<=1 is the single-instance path.
+	return fleetRun(opts, *shards)
 }
 
 // sessionCmd runs the acquire-once / hold / run-many session — the efficient way
