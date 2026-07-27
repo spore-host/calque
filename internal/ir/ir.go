@@ -33,17 +33,46 @@ type ImageStep struct {
 	Args   []string // string args (packages/commands); non-literal args are dropped with a leak
 }
 
+// Config carries the PORTABLE decorator kwargs beyond gpu/volumes/timeout (§B):
+// resource sizing + reliability + placement config that Modal expresses on
+// @function/@cls and that has a defensible AWS analog. Autoscaling/warm-pool
+// kwargs (concurrency_limit, keep_warm, min/max_containers) are deliberately NOT
+// here — they belong behind the seam (§4) and are recognized+leaked (M10/S1).
+type Config struct {
+	CPU      float64  // cpu= cores requested (0 if unset)
+	MemoryMB int      // memory= in MB (0 if unset)
+	Retries  int      // retries= (re-drive cap; 0 if unset)
+	Secrets  []string // secret names referenced (recorded; not honored in the spike)
+	Schedule string   // schedule= (e.g. "0 * * * *"); recorded, not honored
+	Region   string   // region= placement hint; recorded, not honored
+}
+
 // Function is an @app.function (or, when embedded in a Class, an @method).
 type Function struct {
 	Name    string
 	GPU     string            // raw from source, e.g. "H100" or "A100:8" — guarded/rewritten in §7
 	Volumes map[string]string // mount path -> Modal volume name (from_name)
 	Timeout int               // seconds; 0 if unset
+	Config  Config            // portable decorator config (cpu/memory/retries/secrets/schedule/region)
 	IsMap   bool              // is this callable's .map() invoked anywhere in the script?
+	Invoke  InvokeKind        // how the callable is invoked (map/starmap/for_each/remote); §C
 	Body    string            // verbatim payload, shipped to the worker
 	ItemArg string            // first non-self parameter name — the per-item arg the warm runner binds
 	Line    int               // source line of the def, for leak attribution
 }
+
+// InvokeKind is how a callable is invoked (spec §C). Modal's synchronous
+// (block-and-wait) idioms are all in the spike's scope; async (.spawn/.map.aio)
+// is deferred (M10/S2) and never appears here.
+type InvokeKind string
+
+const (
+	InvokeNone    InvokeKind = ""         // not invoked via a recognized idiom
+	InvokeMap     InvokeKind = "map"      // .map(iterable) — items -> results
+	InvokeStarmap InvokeKind = "starmap"  // .starmap(iterable_of_tuples) — tuple-splat args
+	InvokeForEach InvokeKind = "for_each" // .for_each(iterable) — side effects, no result collect
+	InvokeRemote  InvokeKind = "remote"   // .remote(args) — single blocking call
+)
 
 // Class is an @app.cls: a warm, stateful unit whose @enter body runs once per
 // container and whose @method bodies process items against the loaded state.
@@ -52,6 +81,7 @@ type Class struct {
 	GPU       string
 	Volumes   map[string]string
 	Timeout   int
+	Config    Config     // portable decorator config (§B)
 	EnterBody string     // @modal.enter body — runs ONCE in the warm runner (§6)
 	Methods   []Function // @modal.method bodies
 	Line      int
