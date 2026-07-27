@@ -227,6 +227,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque analyze <script.py> [...]")
 	fmt.Fprintln(os.Stderr, "  calque run [--n N] [--region R] [--dry-run] <script.py>")
 	fmt.Fprintln(os.Stderr, "  calque smoke --bucket B --run-id ID [--region R] [--ttl 30m] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] [--rungs 1,100,1000] --i-understand-this-spends-money")
 }
 
 // pyastDir locates the helper relative to the repo. We resolve it from this

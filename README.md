@@ -23,11 +23,19 @@ calque is a **phase detector, not a sales funnel**: below K the honest verdict i
 ## Status
 
 Spike, in active build. Tracking lives on GitHub (Issues / Projects / milestones), not local files.
+**Phase 2 (Modal-idiom porting, milestones M5–M10) is merged.**
 
 **Built, tested, and verified (no spend):**
 - `parse → IR → seam` — pyast helper, six-primitive IR, `StubRecommender` (constant behind an interface).
-- **Bedrock gate** (§11) — live catalog, `exact`/`near`/`none` tiers, proven in both directions.
+- **Bedrock gate + route-away** (§11) — live catalog, `exact`/`near`/`none` tiers, proven in both
+  directions. A model that's already an exact Bedrock API call yields a structured `ReplacementOffer`
+  (Bedrock `modelId` + region invoke hint) and **short-circuits the runnable path *before* a GPU is
+  acquired** — renting a GPU for a served model is the wrong answer. Near matches surface as candidates
+  to verify, with the axes of difference and *no* quality claim (exact-match discipline).
 - **`gpu=` guard** (§7) — clean-swap vs multi-GPU/coupled flags, adversarial fixture.
+- **idiom pass-through** (§C) — image verbs (incl. `from_aws_ecr`); portable kwargs (`cpu=`/`memory=`
+  recorded-not-acted behind the seam, `retries=` wired to the warm supervisor); synchronous invocation
+  kinds `.map`/`.starmap`/`.for_each`/`.remote`; async `.spawn`/`.map.aio` recognized-and-leaked.
 - **warm worker** (`warmd` + `runner.py`, §6) — `@enter` once, crash-restart re-drive, partial-failure.
 - **cost + crossover K** (§9) — rate asymmetry (`R_m` for card asked-for vs `R_a` for card substituted-to),
   willing to say *stay on Modal*, `measured | proxy` flag.
@@ -35,9 +43,19 @@ Spike, in active build. Tracking lives on GitHub (Issues / Projects / milestones
   AZ-sweep retry.
 - **image / exec** — Dockerfile+digest cache; S3 sink/collector; on-instance `warmd` entrypoint.
 - **volumes** (§3/§15) — `Volume.from_name` → stable S3 prefix, delta-synced to the mount path
-  before `@enter` (warm-cache reuse; image/volume separation).
+  before `@enter` (warm-cache reuse; image/volume separation). `volume.commit()` persists as an
+  **end-of-run write-back** (reverse S3 sync after `@method` drains); mid-run `.reload()`/`.commit()`
+  is leaked as a semantic gap the spike doesn't reproduce.
+- **multi-instance `.map` fan-out** (§15) — shard N items across S single-node instances acquired **in
+  parallel**, drive each shard's `warmd` independently, collect the **union** back into one globally
+  ordered result set + one global `missing[]`, re-drive a dead shard once, fold a **fleet-level K** that
+  sums per-instance overheads. Embarrassingly parallel across independent boxes — *not* §1's forbidden
+  multi-node/gang scheduling. Core is unit-tested offline; `calque real --shards N` wires it.
+- **serve entrypoints** (§F) — `@web_endpoint`/`@asgi_app`/`@wsgi_app` are **detected and leaked** as a
+  deferred shape (the spike measures batch + K); a served *Bedrock* model still routes away. The
+  long-lived server is not built — see `docs/serve-architecture.md`.
 - **full pipeline** — `calque run --dry-run` runs every stage locally; `calque session` acquires one
-  GPU and runs an N-ramp on it.
+  GPU and runs an N-ramp on it; `calque real --shards N` fans out across a fleet.
 
 **Real measured crossover K — achieved on a live GPU.** A real run (Qwen2.5-1.5B on an L4, all
 `[measured]`, no proxies) produced the headline number:
@@ -60,15 +78,16 @@ identity-hidden; gpu guard 4 clean-swaps / 1 multi-GPU flag / 1 coupled flag / 1
 ```
 script.py
  └─ parse      decorators → IR         (shallow AST; bodies extracted verbatim)
-   └─ gate     Bedrock eligibility?    (static; if hit, recommend & stop)
+   └─ gate     Bedrock exact match?    (route away: print offer & stop BEFORE any GPU)
      └─ recommend  IR → Target         (STUB: constant behind Recommender interface)
        └─ plan   truffle: Card → candidate g7e instances (+ live price = R_a)
                  acquire: block-and-wait retry over spawn.Provision until landed
                  image:   .image DSL → Dockerfile → ECR (cache by digest)
-         └─ exec   spawn.Provision launches + brings up the instance
+         └─ exec   spawn.Provision launches + brings up the instance(s)
                    [worker] warmd supervises warm Python: @enter once, drain → S3
-           └─ collect   gather from S3, ordered by input index
-             └─ measure per-item cost + occupancy (tach hook)
+                   [--shards N] shard items → N instances in parallel → union collect
+           └─ collect   gather from S3, ordered by GLOBAL input index (+ global missing[])
+             └─ measure per-item cost + occupancy (tach hook); fleet K sums per-box overhead
                └─ report cost comparison + crossover K + leaks
 ```
 
@@ -83,10 +102,35 @@ The Go control plane understands **decorators** (configuration). It does **not**
 
 ```
 calque analyze <script.py> [...]                      # static passes (gate, gpu, leaks, census)
-calque run [--n N] [--dry-run] <script.py>            # full pipeline → crossover K
-calque smoke --bucket B --run-id ID \                 # acquire-only real-hardware smoke test
-      --i-understand-this-spends-money                #   (gated; launches a billable instance)
+calque run [--n N] [--region R] [--dry-run] <script.py>   # full pipeline → crossover K (dry-run default)
 ```
+
+The three commands below acquire billable GPU hardware and are gated behind an explicit
+`--i-understand-this-spends-money` flag — they refuse to launch without it:
+
+```
+calque smoke   --bucket B --run-id ID [--region R] [--ttl 30m] \
+      --i-understand-this-spends-money                          # acquire-only smoke test
+calque real    --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] \
+      [--model HF_REPO] [--n 1] [--shards 1] \                  # single instance, or --shards N to fan out
+      --i-understand-this-spends-money                          #   across a fleet (§15)
+calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] \
+      [--rungs 1,100,1000] \                                    # acquire once, hold, run every rung on it
+      --i-understand-this-spends-money
+```
+
+The route-away gate runs on `run`/`real`/`session` too: if the model (or `--model`) is already an exact
+Bedrock API call, calque prints the offer and stops **before** acquiring anything.
+
+## Design notes
+
+Decisions that shape what the spike *doesn't* do live in `docs/` as durable records:
+
+- [`docs/serve-architecture.md`](docs/serve-architecture.md) — why serve entrypoints are detected +
+  leaked but the long-lived server is not built (§16 success is batch + a measured K).
+- [`docs/behind-the-seam-register.md`](docs/behind-the-seam-register.md) — every §1/§4/§18 non-goal
+  with the attach point a future build would touch, so "won't-port" stays a documented decision, not a
+  silent gap.
 
 ## Layout
 
