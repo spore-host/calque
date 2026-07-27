@@ -111,6 +111,23 @@ func SyncCommands(bucket string, mounts []VolumeMount) []string {
 	return lines
 }
 
+// CommitCommands returns the shell lines to write each volume BACK from its mount
+// path to S3 AFTER @method drains (spec §E, Gap E). This is the reverse of
+// SyncCommands: Modal's volume.commit() persists in-container writes so a later run
+// (or a later reader) sees them. Without this, calque's volume plumbing was
+// download-only — a mutated volume was lost on terminate. Like the download side it
+// uses `aws s3 sync` (deltas only), so committing an unchanged volume is a near-no-op.
+func CommitCommands(bucket string, mounts []VolumeMount) []string {
+	var lines []string
+	for _, m := range mounts {
+		lines = append(lines,
+			// Reverse direction: mount -> S3. Only changed objects move.
+			fmt.Sprintf("aws s3 sync --no-progress %s %s", m.MountPath, m.URI(bucket)),
+		)
+	}
+	return lines
+}
+
 // sanitize makes a volume name safe as an S3 key segment (Modal names are already
 // tame, but be defensive).
 func sanitize(name string) string {

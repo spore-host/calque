@@ -28,7 +28,8 @@ type Manifest struct {
 	PythonBin    string           `json:"python_bin"`
 	RunnerPath   string           `json:"runner_path"`
 	Occupancy    string           `json:"occupancy_path"`
-	VolumeSync   []VolumeSyncSpec `json:"volume_sync,omitempty"` // staged before @enter (§3/§15)
+	VolumeSync   []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
+	VolumeCommit []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
 }
 
 // VolumeSyncSpec tells warmd to `aws s3 sync <URI> <MountPath>` before @enter, so
@@ -89,11 +90,18 @@ func UploadArtifacts(ctx context.Context, c *s3.Client, l RunLayout, warmdBin, r
 // WriteManifest builds and uploads the work manifest for a run. Optional
 // volumeSync entries are staged (aws s3 sync) by warmd before @enter (§3/§15).
 func WriteManifest(ctx context.Context, c *s3.Client, l RunLayout, enterBody, methodBody, methodArg, workerDir string, items []warm.Item, volumeSync ...VolumeSyncSpec) error {
+	return WriteManifestFull(ctx, c, l, enterBody, methodBody, methodArg, workerDir, items, volumeSync, nil)
+}
+
+// WriteManifestFull is WriteManifest plus volume COMMIT specs (§E): volumes warmd
+// syncs BACK to S3 after @method drains (Modal's volume.commit()). Kept as a
+// separate entry point so the common no-commit callers stay terse.
+func WriteManifestFull(ctx context.Context, c *s3.Client, l RunLayout, enterBody, methodBody, methodArg, workerDir string, items []warm.Item, volumeSync, volumeCommit []VolumeSyncSpec) error {
 	man := Manifest{
 		EnterBody: enterBody, MethodBody: methodBody, MethodArg: methodArg,
 		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: "python3", RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
-		VolumeSync: volumeSync,
+		VolumeSync: volumeSync, VolumeCommit: volumeCommit,
 	}
 	body, err := json.Marshal(man)
 	if err != nil {

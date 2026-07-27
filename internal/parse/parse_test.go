@@ -138,3 +138,49 @@ func TestParsePortableConfig(t *testing.T) {
 		t.Errorf("keep_warm= should be recognized+leaked as behind-the-seam; leaks=%+v", rep.Leaks)
 	}
 }
+
+// TestParseServeEntryKind (F1): serve decorators are detected and carried onto the
+// IR as EntryServe, so the run path can gate/leak them instead of crashing.
+func TestParseServeEntryKind(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/web_serve.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	serve := 0
+	for _, f := range app.Functions {
+		if f.EntryKind == ir.EntryServe {
+			serve++
+		}
+	}
+	if serve != 2 {
+		t.Errorf("serve entry functions = %d, want 2 (@web_endpoint + @asgi_app); funcs=%+v", serve, app.Functions)
+	}
+}
+
+// TestParseVolumeCommitLeaksWriteback (E3): volume.commit()/reload() on a known
+// Volume are detected and leaked (end-of-run write-back / mid-run reload gap).
+func TestParseVolumeCommitLeaksWriteback(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/volume_commit.py")
+
+	if _, err := Parse(context.Background(), script, rep, r, args...); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var sawCommit, sawReload bool
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, ".commit()") {
+			sawCommit = true
+		}
+		if strings.Contains(l.Detail, ".reload()") {
+			sawReload = true
+		}
+	}
+	if !sawCommit || !sawReload {
+		t.Errorf("volume write-back not leaked (commit=%v reload=%v); leaks=%+v", sawCommit, sawReload, rep.Leaks)
+	}
+}

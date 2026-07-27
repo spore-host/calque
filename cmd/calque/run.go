@@ -49,6 +49,22 @@ func run(o runOpts) error {
 	// pick the mapped warm unit (a @cls with @enter whose method is .map'd)
 	unit, ok := pickWarmUnit(app)
 	if !ok {
+		// F2: a serve-shaped app (long-lived, request-driven) has no batch .map warm
+		// unit. Don't crash — emit a semantic-gap leak explaining the deferred shape,
+		// and (below) still let the Bedrock gate route a served model away.
+		if serveApp(app) {
+			rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, app.Script, 0,
+				"serve shape: long-lived request-driven entrypoint(s), not batch .map — execution shape deferred (§F/§16; the spike measures batch+K). A served Bedrock model still routes away below.")
+			if printOffersAndStop(bedrockOffers(ctx, app, rep)) {
+				fmt.Println("\n--- leak report (§10) ---")
+				rep.Summary(os.Stdout)
+				return nil
+			}
+			fmt.Println("serve entrypoint(s) detected; batch execution not applicable — see leak report.")
+			fmt.Println("\n--- leak report (§10) ---")
+			rep.Summary(os.Stdout)
+			return nil
+		}
 		return fmt.Errorf("no mapped @cls+@enter warm unit found in %s (spike targets map_batch shape)", o.script)
 	}
 	fmt.Printf("warm unit: class %q, method %q, gpu asked-for %q\n", unit.class.Name, unit.method.Name, unit.class.GPU)
@@ -169,6 +185,20 @@ func pickWarmUnit(app ir.App) (warmUnit, bool) {
 		}
 	}
 	return warmUnit{}, false
+}
+
+// serveApp reports whether the app has any serve-shaped entrypoint (§F). Serve is
+// detected and gated/leaked, but the long-lived server is not built in the spike.
+func serveApp(app ir.App) bool {
+	for _, f := range app.Functions {
+		if f.EntryKind == ir.EntryServe {
+			return true
+		}
+	}
+	if app.Entrypoint != nil && app.Entrypoint.EntryKind == ir.EntryServe {
+		return true
+	}
+	return false
 }
 
 func swapLegal(glog *gpu.Log, owner string) bool {
