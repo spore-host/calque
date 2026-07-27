@@ -79,6 +79,18 @@ func run(o runOpts) error {
 	}
 	fmt.Printf("recommend+resolve: card=%q -> instance=%q\n", tgt.Card, tgt.Instance)
 
+	// B3: honor the portable config we can, record+leak what belongs behind the
+	// seam. cpu=/memory= are SIZING decisions — the real right-sizing brain lives
+	// behind the seam (§4), so we keep the pick dumb and only NOTE the request
+	// rather than acting on it. retries= is a genuine reliability knob and is wired
+	// into the warm supervisor's re-drive cap below.
+	cfg := unit.class.Config
+	if cfg.CPU != 0 || cfg.MemoryMB != 0 {
+		rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, app.Script, unit.class.Line,
+			"%s: cpu=%.0f memory=%dMB requested — recorded, but instance sizing is behind the seam (§4); the pick stays dumb (%s)",
+			unit.class.Name, cfg.CPU, cfg.MemoryMB, tgt.Instance)
+	}
+
 	// 4b. image: .image DSL -> Dockerfile -> digest (build/push deferred to real run).
 	df, err := image.Render(image.Spec{Image: app.Image, WorkerDir: "/opt/calque"}, app.Script, rep)
 	if err != nil {
@@ -205,6 +217,9 @@ func dryRunWarm(ctx context.Context, unit warmUnit, n int, m *measure.Measuremen
 		Sink:   sink,
 		Leak:   leakAdapter{rep},
 		Config: warm.Config{EnterBody: enterBody, MethodBody: methodBody, MethodArg: arg},
+		// B3: retries= (portable config) caps the warm supervisor's crash re-drive.
+		// 0 leaves warmd's sane default.
+		MaxRestarts: unit.class.Config.Retries,
 	}
 	items := make([]warm.Item, sample)
 	for i := range items {

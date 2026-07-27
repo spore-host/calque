@@ -210,6 +210,7 @@ class Collector(ast.NodeVisitor):
         self.images: dict[str, Any] = {}       # varname -> image chain
         self.volumes: dict[str, Any] = {}       # varname -> {from_name: str, lineno}
         self.map_calls: list[dict[str, Any]] = []  # every `.map(` occurrence
+        self.invoke_calls: list[dict[str, Any]] = []  # §C: starmap/for_each/remote/spawn/map.aio
         self.leaks: list[dict[str, Any]] = []      # helper-level "I saw this but can't model it"
 
     # ---- module-level assignments: App(), Image chains, Volume.from_name() ----
@@ -238,12 +239,28 @@ class Collector(ast.NodeVisitor):
                     self.volumes[t.id] = {"from_name": name, "lineno": node.lineno}
         self.generic_visit(node)
 
-    # ---- record every .map() call site (spec §13: "where .map() is called") ----
+    # ---- record invocation idioms (spec §13 map; §C starmap/for_each/remote;
+    # async spawn/.map.aio recognized so the census stays honest, leaked as
+    # deferred on the Go side) ----
+    _SYNC_IDIOMS = frozenset({"map", "starmap", "for_each", "remote"})
+
     def visit_Call(self, node: ast.Call) -> None:
-        if isinstance(node.func, ast.Attribute) and node.func.attr == "map":
-            self.map_calls.append(
-                {"target": ".".join(_attr_chain(node.func)[:-1]), "lineno": node.lineno}
-            )
+        if isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            # `.map.aio(...)` / `.starmap.aio(...)`: async variant — func is X.<idiom>.aio,
+            # so the idiom is the PENULTIMATE attribute and this is an async future.
+            if attr == "aio" and isinstance(node.func.value, ast.Attribute) and node.func.value.attr in ("map", "starmap"):
+                target = ".".join(_attr_chain(node.func.value)[:-1])
+                self.invoke_calls.append({"target": target, "kind": "map.aio", "lineno": node.lineno})
+            elif attr == "map":
+                target = ".".join(_attr_chain(node.func)[:-1])
+                # keep the legacy map_calls channel AND the unified invoke_calls one
+                self.map_calls.append({"target": target, "lineno": node.lineno})
+                self.invoke_calls.append({"target": target, "kind": "map", "lineno": node.lineno})
+            elif attr in self._SYNC_IDIOMS or attr == "spawn":
+                self.invoke_calls.append(
+                    {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno}
+                )
         self.generic_visit(node)
 
     def _decos(self, node: ast.FunctionDef) -> list[str]:
@@ -309,6 +326,7 @@ def analyze(path: str) -> dict[str, Any]:
         "classes": c.classes,
         "entrypoint": c.entrypoint,
         "map_calls": c.map_calls,
+        "invoke_calls": c.invoke_calls,
         "helper_leaks": c.leaks,
     }
 

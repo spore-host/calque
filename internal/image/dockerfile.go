@@ -56,7 +56,7 @@ func Render(spec Spec, script string, rep *leak.Report) (string, error) {
 
 	for _, step := range img.Steps {
 		switch step.Method {
-		case "debian_slim", "from_registry", "from_dockerfile", "micromamba":
+		case "debian_slim", "from_registry", "from_dockerfile", "from_aws_ecr", "micromamba":
 			// base constructors — already handled by resolveBase
 		case "pip_install", "uv_pip_install":
 			if len(step.Args) > 0 {
@@ -68,6 +68,26 @@ func Render(spec Spec, script string, rep *leak.Report) (string, error) {
 				}
 				fmt.Fprintf(&b, "RUN %s %s\n", installer, quoteJoin(step.Args))
 			}
+		case "pip_install_from_requirements":
+			// .pip_install_from_requirements("requirements.txt") — the file must be in
+			// the build context (a local-path dependency; see A3's staging note). We
+			// emit the COPY+install and leak the context requirement so a missing file
+			// fails loudly, not silently.
+			if len(step.Args) > 0 {
+				req := step.Args[0]
+				fmt.Fprintf(&b, "COPY %s /tmp/requirements.txt\n", req)
+				b.WriteString("RUN pip3 install --no-cache-dir -r /tmp/requirements.txt\n")
+				leakLocalContext(rep, script, step.Method, req)
+			}
+		case "poetry_install_from_file":
+			// .poetry_install_from_file("pyproject.toml") — copy the project files and
+			// let poetry resolve. Local-path dependency (A3).
+			if len(step.Args) > 0 {
+				pyproject := step.Args[0]
+				fmt.Fprintf(&b, "COPY %s /tmp/pyproject.toml\n", pyproject)
+				b.WriteString("RUN pip3 install --no-cache-dir poetry && cd /tmp && poetry install --no-root\n")
+				leakLocalContext(rep, script, step.Method, pyproject)
+			}
 		case "apt_install":
 			if len(step.Args) > 0 {
 				fmt.Fprintf(&b, "RUN apt-get update && apt-get install -y --no-install-recommends %s && rm -rf /var/lib/apt/lists/*\n", quoteJoin(step.Args))
@@ -75,6 +95,11 @@ func Render(spec Spec, script string, rep *leak.Report) (string, error) {
 		case "run_commands":
 			for _, cmd := range step.Args {
 				fmt.Fprintf(&b, "RUN %s\n", cmd)
+			}
+		case "dockerfile_commands":
+			// Raw Dockerfile lines the user supplied — pass through verbatim, in order.
+			for _, line := range step.Args {
+				fmt.Fprintf(&b, "%s\n", line)
 			}
 		case "env":
 			// env(...) args come through as "KEY=VALUE" strings if literal
@@ -85,6 +110,27 @@ func Render(spec Spec, script string, rep *leak.Report) (string, error) {
 			if len(step.Args) == 1 {
 				fmt.Fprintf(&b, "WORKDIR %s\n", step.Args[0])
 			}
+		case "entrypoint":
+			// .entrypoint([...]) sets the container ENTRYPOINT (exec form).
+			if len(step.Args) > 0 {
+				fmt.Fprintf(&b, "ENTRYPOINT [%s]\n", jsonArrayJoin(step.Args))
+			}
+		case "add_local_dir", "add_local_file", "copy_local_dir", "copy_local_file", "add_local_python_source":
+			// A3: these reference LOCAL paths that must be staged into the build
+			// context. We render a COPY (src -> dst) but the src is only valid if the
+			// caller stages it; we can't stage from here, so we leak the requirement
+			// rather than emit a COPY that silently fails to build.
+			src, dst := localCopyArgs(step.Method, step.Args)
+			fmt.Fprintf(&b, "COPY %s %s\n", src, dst)
+			rep.Addf(leak.PrimImage, leak.KindSemanticGap, script, 0,
+				"image DSL .%s(%s): local path must be staged into the build context; calque does not stage it — the COPY will fail unless %q is present at build time",
+				step.Method, quoteJoin(step.Args), src)
+		case "run_function":
+			// .run_function(fn) runs a Python callable at BUILD time — a fundamentally
+			// different execution than a shell RUN (it needs the function + its imports
+			// staged and invoked). We can't reproduce that here; leak it, don't fake it.
+			rep.Addf(leak.PrimImage, leak.KindSemanticGap, script, 0,
+				"image DSL .run_function(...) executes a Python callable at build time; not reproduced (needs the function + deps staged and invoked in the build)")
 		default:
 			// A DSL verb we don't model. Comment it AND leak it — silent drop would
 			// change the runtime environment invisibly (§10).
@@ -118,14 +164,59 @@ func resolveBase(img ir.Image, script string, rep *leak.Report) (string, error) 
 		return b, nil
 	}
 	// from_registry("nvcr.io/...") names its own base in the first step's args.
+	// from_aws_ecr("<acct>.dkr.ecr.<region>.amazonaws.com/repo:tag") likewise names
+	// a private ECR image as the base — treat its first arg as the FROM ref.
 	for _, s := range img.Steps {
-		if s.Method == "from_registry" && len(s.Args) > 0 {
+		if (s.Method == "from_registry" || s.Method == "from_aws_ecr") && len(s.Args) > 0 {
+			if s.Method == "from_aws_ecr" {
+				// The instance role must be able to pull from this ECR repo; note it so
+				// a pull-permission failure isn't mistaken for a calque bug (§10).
+				rep.Addf(leak.PrimImage, leak.KindIntegrationEdge, script, 0,
+					"image base from_aws_ecr(%q): the acquired instance role needs ecr:GetDownloadUrlForLayer / BatchGetImage on this repo to pull", s.Args[0])
+			}
 			return s.Args[0], nil
 		}
 	}
 	rep.Addf(leak.PrimImage, leak.KindUnhandledCase, script, 0,
 		"unknown image base %q; defaulting to CUDA runtime base", img.Base)
 	return baseImages["debian_slim"], nil
+}
+
+// localCopyArgs maps an add_local_*/copy_local_* step's args to (src, dst). Modal's
+// add_local_dir(local, remote) / add_local_file(local, remote) take two positional
+// paths; add_local_python_source(module) takes one (the destination defaults to the
+// image's site-packages). We default a missing dst so the emitted COPY is well-formed.
+func localCopyArgs(method string, args []string) (src, dst string) {
+	switch len(args) {
+	case 0:
+		return ".", "/"
+	case 1:
+		if method == "add_local_python_source" {
+			return args[0], "/root/" + args[0] // module name -> importable path
+		}
+		return args[0], "/" + args[0]
+	default:
+		return args[0], args[1]
+	}
+}
+
+// leakLocalContext records that a step depends on a file that must be present in
+// the build context (A3): a requirements.txt / pyproject.toml calque does not
+// stage. The COPY is emitted so intent is preserved, but the build fails loudly if
+// the file is absent — better than silently dropping the dependency install.
+func leakLocalContext(rep *leak.Report, script, method, path string) {
+	rep.Addf(leak.PrimImage, leak.KindSemanticGap, script, 0,
+		"image DSL .%s(%q): %q must be in the build context; calque does not stage it", method, path, path)
+}
+
+// jsonArrayJoin renders args as a JSON string array body for ENTRYPOINT exec form:
+// ["a","b"] -> `"a", "b"`.
+func jsonArrayJoin(args []string) string {
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = fmt.Sprintf("%q", a)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // Digest is a stable content hash of the Dockerfile text, used as the ECR tag so

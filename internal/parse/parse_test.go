@@ -4,8 +4,10 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 )
 
@@ -94,5 +96,45 @@ func TestParseVolumeCacheHasFunctionAndClass(t *testing.T) {
 	}
 	if len(app.Classes) != 1 || app.Classes[0].GPU != "L4" {
 		t.Errorf("class = %+v, want one with gpu L4", app.Classes)
+	}
+}
+
+// TestParsePortableConfig exercises the M6 B/C pass-through: portable kwargs land
+// in ir.Config, autoscaling kwargs are recognized-and-leaked (not silently
+// dropped), and the sync invocation idioms are classified beyond plain .map.
+func TestParsePortableConfig(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/portable_config.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	byName := map[string]int{}
+	for i, f := range app.Functions {
+		byName[f.Name] = i
+	}
+	tr := app.Functions[byName["transform"]]
+	if tr.Config.CPU != 4 || tr.Config.MemoryMB != 8192 || tr.Config.Retries != 3 || tr.Config.Region != "us-west-2" {
+		t.Errorf("transform.Config = %+v, want cpu4/mem8192/retries3/us-west-2", tr.Config)
+	}
+	// Invocation idioms: transform is both .map and .for_each -> map wins (precedence).
+	if tr.Invoke != ir.InvokeMap {
+		t.Errorf("transform.Invoke = %q, want map (map beats for_each)", tr.Invoke)
+	}
+	cb := app.Functions[byName["combine"]]
+	if cb.Invoke != ir.InvokeStarmap {
+		t.Errorf("combine.Invoke = %q, want starmap (starmap beats remote)", cb.Invoke)
+	}
+	// keep_warm= must be recognized and leaked as behind-the-seam, not dropped.
+	foundAutoscale := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "keep_warm") && strings.Contains(l.Detail, "behind the seam") {
+			foundAutoscale = true
+		}
+	}
+	if !foundAutoscale {
+		t.Errorf("keep_warm= should be recognized+leaked as behind-the-seam; leaks=%+v", rep.Leaks)
 	}
 }
