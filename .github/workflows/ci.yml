@@ -58,7 +58,7 @@ jobs:
           check-latest: true
 
       - name: install uv
-        uses: astral-sh/setup-uv@v9
+        uses: astral-sh/setup-uv@v9.0.0  # no floating v9 major tag is published; pin exact
 
       - name: sync pyast deps
         working-directory: tools/pyast
