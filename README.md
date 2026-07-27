@@ -20,10 +20,84 @@ runs over 10,000,000 on AWS **without a logic rewrite** (only a mechanical `gpu=
 
 calque is a **phase detector, not a sales funnel**: below K the honest verdict is "stay on Modal."
 
+## Quick start (zero spend)
+
+Everything here runs locally and **launches no AWS GPU** — no credentials required.
+
+**Prerequisites:** Go 1.26 (matches `go.mod`), Python 3, and [`uv`](https://docs.astral.sh/uv/).
+AWS credentials are needed only for real (billable) runs, not for anything below.
+
+```
+git clone https://github.com/spore-host/calque && cd calque
+go build -o calque ./cmd/calque      # control plane
+(cd tools/pyast && uv sync)          # Python AST helper deps
+```
+
+**Analyze a Modal script** (static passes — GPU-swap legality, Bedrock gate, leaks):
+
+```
+./calque analyze examples/map_batch_inference.py
+```
+
+```
+  gpu[Batcher]: clean_swap requested="H100" -> RTX PRO 6000 (single-card, no coupling signal; memory-bound B=1 substitution is legal)
+  volume: "weights" -> volumes/weights/ (mount /weights, delta-sync => warm-cache reuse)
+...
+--- leak report (§10) ---
+LEAKS: 1 emitted across 1 primitives
+```
+
+**Produce a crossover K** (full pipeline, dry-run — the default):
+
+```
+./calque run --n 100 --dry-run examples/map_batch_inference.py
+```
+
+```
+[DRY-RUN] not launching a billable instance; driving warm worker locally on a synthetic sample
+--- crossover K (§9) ---
+Verdict:    you are running 100.  100 >= K(0) -> CROSS. Code is unchanged; here's the bill.
+
+*** DRY-RUN K IS NOT DEFENSIBLE ***
+Per-item seconds and occupancy are SYNTHETIC (stand-in body, no GPU). A K that
+survives a hostile read requires the real payload on an acquired RTX PRO 6000 (§16.1).
+```
+
+That's the whole idea in two commands: a mechanical `gpu=` swap, then an honest K —
+stamped **not defensible** here precisely because no real GPU ran. See
+[`examples/`](examples/) for four annotated journeys (analyze, dry-run K, Bedrock
+route-away, and an unsupported-workload refusal), each with real output.
+
+> **Notes.** `analyze`/`run` reach two best-effort network sources (the Bedrock
+> catalog and the `hf-bedrock-map` API); offline they print a `warn:` line and fall
+> back — a networkless run is not a failure. The binary finds the Python helper
+> relative to the repo; to run a copied/`go install`ed binary out of tree, set
+> `CALQUE_PYAST_DIR` to the `tools/pyast` path.
+
 ## Status
 
 Spike, in active build. Tracking lives on GitHub (Issues / Projects / milestones), not local files.
 **Phase 2 (Modal-idiom porting, milestones M5–M10) is merged.**
+
+Verification is layered — offline (unit-tested, no spend), live (run on a real
+acquired GPU), and at scale (the rung that only bites at volume). The matrix reads
+them apart:
+
+| Capability | Offline tested | Live verified | Scale verified |
+|---|---|---|---|
+| Parse → IR, leak reporting | ✅ | n/a | ✅ corpus census |
+| `gpu=` swap guard (§7) | ✅ | ✅ | ✅ corpus |
+| Bedrock gate + route-away (§11) | ✅ | ✅ (live catalog) | n/a |
+| Idiom pass-through (§C) | ✅ | n/a | n/a |
+| Single-instance warm run (§6) | ✅ | ✅ (L4, Qwen2.5-1.5B) | ✅ N=100 |
+| Cost + crossover K (§9) | ✅ | ✅ (all `[measured]`) | ✅ N=100 |
+| Volume sync + commit write-back (§3/§15) | ✅ | ✅ (sync) | — |
+| Multi-instance fan-out / fleet K (§15) | ✅ | ⏳ pending capacity | ⏳ pending N=100k ([#18](https://github.com/spore-host/calque/issues/18)) |
+| Serve entrypoints (§F) | detect + leak only | ❌ not built | ❌ |
+
+✅ done · ⏳ blocked/pending · ❌ deliberately not built (see `docs/behind-the-seam-register.md`).
+
+The per-capability detail follows; nothing is removed, only sequenced under the matrix.
 
 **Built, tested, and verified (no spend):**
 - `parse → IR → seam` — pyast helper, six-primitive IR, `StubRecommender` (constant behind an interface).
