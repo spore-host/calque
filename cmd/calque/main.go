@@ -167,12 +167,15 @@ func sessionCmd(args []string) error {
 	ttl := fs.String("ttl", "3h", "instance TTL hard cap (held across the whole ramp)")
 	acquireMin := fs.Int("acquire-deadline-min", 180, "patient acquisition window in minutes ($0 until it lands)")
 	rates := fs.String("rates", "config/rates.json", "rate table path")
+	spot := fs.Bool("spot", false, "acquire on the Spot market (different capacity pool than on-demand; interruptible; K is then a SPOT rate)")
+	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
+	prepMin := fs.Int("prep-timeout-min", 30, "minutes to wait for the one-time docker image pull before giving up")
 	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance held for hours")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *bucket == "" || *runID == "" || *ami == "" {
-		return fmt.Errorf("usage: calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] [--rungs 1,100,1000] --i-understand-this-spends-money")
+		return fmt.Errorf("usage: calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] [--rungs 1,100,1000] [--spot] --i-understand-this-spends-money")
 	}
 	if !*confirm {
 		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money (holds a billable GPU for up to the TTL)")
@@ -185,6 +188,8 @@ func sessionCmd(args []string) error {
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, rungs: rungs, ttl: *ttl,
 		acquireDeadline: time.Duration(*acquireMin) * time.Minute, ratesFP: *rates,
+		spot: *spot, spotMaxPrice: *spotMaxPrice,
+		prepTimeout: time.Duration(*prepMin) * time.Minute,
 	})
 }
 

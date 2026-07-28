@@ -15,12 +15,25 @@ type SessionPrep struct {
 	Bucket    string
 	WorkerDir string
 	Region    string
-	LogKey    string // one-time prep log
+	LogKey    string // one-time prep log (streamed periodically + on exit)
+	DoneKey   string // success marker, written ONLY after the pull completes (see below)
 }
 
 // PrepCommand is the JobArrayCommand for the held instance: sync warmd+scripts,
 // pull the vLLM image, and exit 0. spored keeps the box alive after (bounded by
 // TTL + idle timeout). Runs under the login user; docker needs sudo (DL AMI).
+//
+// Completion signalling (fixes the prep-visibility bug, #18): the OLD design
+// uploaded the log via `trap ... EXIT` and the waiter polled for that log — but the
+// script only exits when `docker pull` returns, so a slow pull meant the log never
+// appeared before the waiter's timeout, yielding a bare "prep did not complete"
+// with ZERO diagnostics. Now:
+//   - a background HEARTBEAT streams the growing log to S3 every 20s, so a slow or
+//     hung pull is observable in near-real-time (not only on exit);
+//   - a distinct DoneKey marker is written ONLY after the pull succeeds — the
+//     waiter keys success off that marker, decoupling "done" from "script exited".
+//
+// The EXIT trap still flushes the final log (success or failure) for the tail.
 func (p SessionPrep) PrepCommand(artifactPrefix string) string {
 	wd := p.WorkerDir
 	if wd == "" {
@@ -32,7 +45,13 @@ func (p SessionPrep) PrepCommand(artifactPrefix string) string {
 		"exec > /tmp/calque-prep.log 2>&1",
 	}
 	if p.LogKey != "" {
-		lines = append(lines, fmt.Sprintf("trap 'aws s3 cp /tmp/calque-prep.log s3://%s/%s || true' EXIT", p.Bucket, p.LogKey))
+		up := fmt.Sprintf("aws s3 cp /tmp/calque-prep.log s3://%s/%s || true", p.Bucket, p.LogKey)
+		// Heartbeat: stream the growing log to S3 every 20s so a slow pull is visible
+		// while it's still running — not only on exit. Best-effort.
+		lines = append(lines, fmt.Sprintf("( while true; do sleep 20; %s; done ) & HEARTBEAT=$!", up))
+		// One EXIT trap: stop the heartbeat and flush the final log (captures the
+		// failure tail too). A single trap per signal — bash keeps only the last.
+		lines = append(lines, fmt.Sprintf("trap 'kill $HEARTBEAT 2>/dev/null || true; %s' EXIT", up))
 	}
 	lines = append(lines,
 		"set -euxo pipefail",
@@ -44,6 +63,13 @@ func (p SessionPrep) PrepCommand(artifactPrefix string) string {
 		fmt.Sprintf("sudo docker pull %s", p.BaseImage),
 		"echo CALQUE_PREP_DONE",
 	)
+	if p.DoneKey != "" {
+		// Success marker: written only if we got here (pull succeeded). Under
+		// `set -e`, any earlier failure exits before this line, so the marker's
+		// mere existence is a reliable success signal — independent of when/whether
+		// the log upload lands.
+		lines = append(lines, fmt.Sprintf("echo CALQUE_PREP_DONE | aws s3 cp - s3://%s/%s", p.Bucket, p.DoneKey))
+	}
 	return strings.Join(lines, "\n")
 }
 
