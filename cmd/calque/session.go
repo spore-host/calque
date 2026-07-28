@@ -33,6 +33,9 @@ type sessionOpts struct {
 	ttl             string
 	acquireDeadline time.Duration
 	ratesFP         string
+	spot            bool          // acquire on the Spot market (different capacity pool than on-demand)
+	spotMaxPrice    string        // $/hr bid cap; "" => spawn caps at on-demand price
+	prepTimeout     time.Duration // how long to wait for the one-time image pull; 0 => 30m default
 }
 
 // runSession acquires ONE GPU instance (patiently — acquisition is the expensive,
@@ -86,7 +89,7 @@ func runSession(o sessionOpts) (err error) {
 	// instance stays alive (bounded by TTL) so we can drive tests onto it via SSM.
 	prep := calexec.SessionPrep{
 		BaseImage: "vllm/vllm-openai:latest", Bucket: o.bucket, WorkerDir: hostWorkerDir,
-		Region: o.region, LogKey: sessBase + "/prep.log",
+		Region: o.region, LogKey: sessBase + "/prep.log", DoneKey: sessBase + "/prep.done",
 	}
 
 	// AZ sweep (offered ∩ default-subnet).
@@ -102,6 +105,20 @@ func runSession(o sessionOpts) (err error) {
 		OnComplete: "", // do NOT terminate on command completion — we hold the box
 		Username:   "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami, PricePerHour: pricePerHr,
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
+		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
+	}
+	if o.spot {
+		// Honesty (§9/§10): a spot ramp measures K against a SPOT R_a, and the box
+		// can be reclaimed mid-ramp. Say so loudly and leak it, so the resulting K
+		// is never read as the on-demand headline number.
+		bidCap := o.spotMaxPrice
+		if bidCap == "" {
+			bidCap = "on-demand price"
+		}
+		fmt.Printf("[spot] acquiring on the SPOT market (max bid %s). NOTE: interruptible mid-ramp; "+
+			"any K measured here is against a SPOT rate, NOT the on-demand headline K.\n", bidCap)
+		rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "session", 0,
+			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
 	}
 	round := 0
 	lastDetail := ""
@@ -145,7 +162,11 @@ func runSession(o sessionOpts) (err error) {
 	if err := spawnClient.WaitForSSMOnline(ctx, acquired.Region, acquired.InstanceID, 10*time.Minute); err != nil {
 		return fmt.Errorf("SSM never came online: %w", err)
 	}
-	if err := waitForPrep(ctx, s3c, o.bucket, prep.LogKey, 20*time.Minute); err != nil {
+	prepTimeout := o.prepTimeout
+	if prepTimeout <= 0 {
+		prepTimeout = 30 * time.Minute // cold vLLM image pull can exceed the old 20m
+	}
+	if err := waitForPrep(ctx, s3c, o.bucket, prep.DoneKey, prep.LogKey, prepTimeout); err != nil {
 		return fmt.Errorf("prep (image pull) failed: %w", err)
 	}
 	fmt.Printf("[prep] image pulled; instance ready. Running ramp %v.\n", o.rungs)
@@ -244,28 +265,37 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 	return nil
 }
 
-// waitForPrep polls for the prep log (uploaded on prep-script exit) and checks it
-// signals success.
-func waitForPrep(ctx context.Context, s3c *s3.Client, bucket, logKey string, timeout time.Duration) error {
-	deadline := time.Now
-	_ = deadline
+// waitForPrep waits for prep to finish by polling the DONE MARKER (doneKey), which
+// the prep script writes only after `docker pull` succeeds — decoupled from script
+// exit. On each tick it also fetches the heartbeat-streamed log so a slow/hung pull
+// is observable, and on timeout it returns the log tail as the diagnostic (the old
+// design returned a bare "did not complete" with nothing, because the log couldn't
+// arrive until the pull it was waiting on had already finished — #18).
+func waitForPrep(ctx context.Context, s3c *s3.Client, bucket, doneKey, logKey string, timeout time.Duration) error {
 	tick := time.NewTicker(15 * time.Second)
 	defer tick.Stop()
 	end := time.After(timeout)
 	for {
-		if b, ok := calexec.TryGetSummary(ctx, s3c, bucket, logKey); ok {
-			if containsStr(b, "CALQUE_PREP_DONE") {
-				return nil
-			}
-			return fmt.Errorf("prep exited without success; log tail:\n%s", tail(b, 1500))
+		// Success is the marker's existence — independent of the log upload.
+		if _, ok := calexec.TryGetSummary(ctx, s3c, bucket, doneKey); ok {
+			return nil
+		}
+		// A prep that exited WITHOUT the marker (pull failed) shows CALQUE_PREP_DONE
+		// absent but the log present with an error — surface that immediately.
+		if b, ok := calexec.TryGetSummary(ctx, s3c, bucket, logKey); ok && containsStr(b, "CALQUE_PREP_DONE") {
+			// Log says done but marker not yet visible (S3 eventual consistency): loop.
+			_ = b
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-end:
-			return fmt.Errorf("prep did not complete within %s", timeout)
+			if b, ok := calexec.TryGetSummary(ctx, s3c, bucket, logKey); ok {
+				return fmt.Errorf("prep did not complete within %s; log tail:\n%s", timeout, tail(b, 2000))
+			}
+			return fmt.Errorf("prep did not complete within %s (no log streamed — SSM/prep may not have started)", timeout)
 		case <-tick.C:
-			fmt.Printf("      ...prep running (docker pull)\n")
+			fmt.Printf("      ...prep running (docker pull; streaming log to s3://%s/%s)\n", bucket, logKey)
 		}
 	}
 }

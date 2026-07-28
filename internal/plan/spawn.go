@@ -41,6 +41,18 @@ type SpawnLauncher struct {
 	// avoids ~1 redundant Pricing API call PER retry attempt during a capacity
 	// wait (observed: hundreds over a long snipe).
 	PricePerHour float64
+	// Spot, if true, launches on the Spot market (spawn LaunchConfig.Spot). Spot
+	// draws from a DIFFERENT capacity pool than on-demand — observed 2026-07-27:
+	// g7e on-demand was exhausted region-wide (us-west-2, us-east-1) while g7e
+	// spot landed instantly in us-east-1/eu-central-1/eu-west-2. Two honesty
+	// consequences the caller must surface: (1) a spot box can be reclaimed
+	// mid-run (interruption), and (2) the measured K's R_a is then a SPOT rate,
+	// not on-demand — a different economic question than the headline K.
+	Spot bool
+	// SpotMaxPrice caps the bid in $/hr (spawn LaunchConfig.SpotMaxPrice). Empty
+	// means "on-demand price as the cap" (spawn's default) — so a fill failure is
+	// capacity, never "bid too low".
+	SpotMaxPrice string
 }
 
 // Provision launches one instance of instanceType in region and returns the
@@ -75,6 +87,8 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region, az,
 		IMDSv2HopLimit:    s.IMDSv2HopLimit, // 2 for containers: warmd runs INSIDE docker and
 		//                                     needs instance-role creds via IMDS, which is one
 		//                                     network hop away — the default hop limit of 1 blocks it.
+		Spot:         s.Spot,         // Spot market: different capacity pool than on-demand
+		SpotMaxPrice: s.SpotMaxPrice, // "" => spawn caps at on-demand price
 	}
 	res, err := launcher.Provision(ctx, s.Client, cfg, launcher.Options{})
 	if err != nil {
