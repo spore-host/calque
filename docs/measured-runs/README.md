@@ -11,8 +11,9 @@ claim is auditable after the ephemeral run is gone.
 
 | Run | Rung | Card / instance | Verdict | Status |
 |---|---|---|---|---|
+| [`2026-07-28-qwen-g7e-spot-ramp.md`](2026-07-28-qwen-g7e-spot-ramp.md) | 1/100/1000 | **RTX PRO 6000** / g7e.2xlarge (spot) | STAY ON MODAL (0.4%→12%→45% occ) | ✅ complete (measured) |
 | [`2026-07-16-qwen-l4-n1.md`](2026-07-16-qwen-l4-n1.md) | N=1 | L4 / g6.2xlarge | STAY ON MODAL | ✅ complete (from git) |
-| [`TEMPLATE-qwen-l4-n100.md`](TEMPLATE-qwen-l4-n100.md) | N≈100 | L4 / g6.2xlarge | CROSS (K≈73) | ⚠️ **template — needs raw output** |
+| [`TEMPLATE-qwen-l4-n100.md`](TEMPLATE-qwen-l4-n100.md) | N≈100 | L4 / g6.2xlarge | CROSS (K≈73) | ⚠️ template — an **on-demand** N≈100 K is still unmeasured (the g7e run above is spot-rate) |
 
 ## Adding a run
 
