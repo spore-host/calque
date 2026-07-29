@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	calexec "github.com/spore-host/calque/internal/exec"
@@ -77,15 +76,21 @@ func main() {
 }
 
 func runOnInstance(ctx context.Context, manifestURI string) error {
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		return err
-	}
-	s3c := s3.NewFromConfig(cfg)
-
 	bucket, key, err := parseS3URI(manifestURI)
 	if err != nil {
 		return err
+	}
+
+	// Build the S3 client for the BUCKET's region, not AWS_REGION (the compute
+	// region). warmd runs on the GPU instance, whose region is wherever capacity
+	// was — which may differ from the artifact bucket's region (e.g. eu-central-1
+	// spot compute + us-east-1 bucket). Using AWS_REGION here read the manifest
+	// with the wrong endpoint -> 301 PermanentRedirect. The default AWS_REGION
+	// seeds the bucket-region lookup. Mirrors the control-plane fix.
+	hintRegion := os.Getenv("AWS_REGION")
+	s3c, err := calexec.NewS3ClientForBucket(ctx, bucket, hintRegion)
+	if err != nil {
+		return fmt.Errorf("s3 client for bucket %q: %w", bucket, err)
 	}
 	var man Manifest
 	if err := getJSON(ctx, s3c, bucket, key, &man); err != nil {
