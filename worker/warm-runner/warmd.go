@@ -145,6 +145,13 @@ type Supervisor struct {
 	// On a clean run with no crashes this is 1 — the warm-once invariant made
 	// observable, so the amortization claim is checkable, not asserted.
 	EnterCount int
+
+	// Concurrency is how many items to keep in flight at once (§ occupancy). 1 (or
+	// 0) is the original strictly-serial send-one/recv-one path. >1 pipelines: up to
+	// C items are sent before blocking, and results come back OUT OF ORDER keyed by
+	// index — which is what gives vLLM overlapping work to batch and raises GPU
+	// occupancy. Ordered COLLECTION is unaffected (the sink keys by index).
+	Concurrency int
 }
 
 // Run drains items in index order, writing each successful result to the sink. It
@@ -189,38 +196,12 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 
 		// Drain. If the runner dies mid-drain, unsettled items simply get picked up
 		// on the next loop iteration (a fresh warm runner) — re-drive is implicit.
-		crashed := false
-		for _, it := range pending {
-			if err := rn.send(map[string]any{"kind": "item", "index": it.Index, "payload": it.Payload}); err != nil {
-				crashed = true
-			} else {
-				var msg outMsg
-				if msg, err = rn.recv(); err != nil {
-					crashed = true
-					s.leak("integration_edge", fmt.Sprintf("runner died mid-item at index %d: %v", it.Index, err))
-				} else {
-					switch msg.Kind {
-					case "result":
-						res := Result{Index: it.Index, Result: msg.Result, Seconds: msg.Seconds}
-						if err := s.Sink.Put(ctx, res); err != nil {
-							rn.close()
-							return unsettled(items, settled), fmt.Errorf("sink put index %d: %w", it.Index, err)
-						}
-						done[it.Index] = true
-					case "error":
-						// Per-item payload error is a partial failure, NOT a crash: the
-						// runner is still warm. Record and move on — never reload the
-						// model for one bad item (that would destroy the economics).
-						failed[it.Index] = true
-						s.leak("unhandled_case", fmt.Sprintf("item %d failed in payload: %s", it.Index, msg.Error))
-					default:
-						s.leak("integration_edge", fmt.Sprintf("unexpected runner msg kind %q at index %d", msg.Kind, it.Index))
-					}
-				}
-			}
-			if crashed {
-				break
-			}
+		// C=1 uses the strictly-serial send-one/recv-one drain; C>1 pipelines up to
+		// C items in flight and matches OUT-OF-ORDER results by their echoed index.
+		crashed, sinkErr := s.drain(ctx, rn, pending, done, failed)
+		if sinkErr != nil {
+			rn.close()
+			return unsettled(items, settled), sinkErr
 		}
 
 		if crashed {
@@ -248,10 +229,106 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 	return out, nil
 }
 
+// drain runs one warm runner over `pending`, recording settled items into done/
+// failed. It returns (crashed, sinkErr): crashed=true means the runner died and
+// the caller should restart + re-drive the still-unsettled items; sinkErr is a
+// fatal sink failure (aborts the whole Run). C=1 => serial; C>1 => pipelined.
+func (s *Supervisor) drain(ctx context.Context, rn *runner, pending []Item, done, failed map[int]bool) (bool, error) {
+	if s.Concurrency > 1 {
+		return s.drainConcurrent(ctx, rn, pending, done, failed)
+	}
+	return s.drainSerial(ctx, rn, pending, done, failed)
+}
+
+// drainSerial is the original strictly-serial drain: send one item, block for its
+// result, repeat. Preserved verbatim so C=1 behavior (and its tests) are unchanged.
+func (s *Supervisor) drainSerial(ctx context.Context, rn *runner, pending []Item, done, failed map[int]bool) (bool, error) {
+	for _, it := range pending {
+		if err := rn.send(map[string]any{"kind": "item", "index": it.Index, "payload": it.Payload}); err != nil {
+			return true, nil // crashed
+		}
+		msg, err := rn.recv()
+		if err != nil {
+			s.leak("integration_edge", fmt.Sprintf("runner died mid-item at index %d: %v", it.Index, err))
+			return true, nil // crashed
+		}
+		if sinkErr := s.settle(ctx, msg, it.Index, done, failed); sinkErr != nil {
+			return false, sinkErr
+		}
+	}
+	return false, nil
+}
+
+// drainConcurrent pipelines up to Concurrency items in flight. It sends items as
+// slots free up and reads results as they arrive — OUT OF ORDER — matching each to
+// its work item by the index echoed in the message. On a mid-flight crash, every
+// item that hasn't landed in the sink is simply left unsettled: the caller's
+// re-drive loop picks up ALL of them on a fresh runner (so N in-flight at crash is
+// safe, unlike a design that assumed ≤1). Backpressure caps memory + honors the
+// runner's pool size: we never have more than C outstanding.
+func (s *Supervisor) drainConcurrent(ctx context.Context, rn *runner, pending []Item, done, failed map[int]bool) (bool, error) {
+	c := s.Concurrency
+	next := 0     // index into pending of the next item to send
+	inFlight := 0 // items sent but not yet settled
+	for next < len(pending) || inFlight > 0 {
+		// Fill the pipeline up to C in flight.
+		for inFlight < c && next < len(pending) {
+			it := pending[next]
+			if err := rn.send(map[string]any{"kind": "item", "index": it.Index, "payload": it.Payload}); err != nil {
+				return true, nil // crashed while sending
+			}
+			inFlight++
+			next++
+		}
+		// Read one completed result (any index). A recv error is a crash: the
+		// inFlight items are left unsettled and re-driven on the next runner.
+		msg, err := rn.recv()
+		if err != nil {
+			s.leak("integration_edge", fmt.Sprintf("runner died with %d items in flight: %v", inFlight, err))
+			return true, nil // crashed
+		}
+		if msg.Index == nil {
+			s.leak("integration_edge", fmt.Sprintf("runner msg %q without an index under concurrency", msg.Kind))
+			continue
+		}
+		if sinkErr := s.settle(ctx, msg, *msg.Index, done, failed); sinkErr != nil {
+			return false, sinkErr
+		}
+		inFlight--
+	}
+	return false, nil
+}
+
+// settle records one runner message (result or error) for the given index. A
+// "result" lands in the sink and marks done; an "error" is a per-item partial
+// failure (the runner stays warm — never reload for one bad item). Returns a
+// non-nil error only on a fatal sink failure.
+func (s *Supervisor) settle(ctx context.Context, msg outMsg, index int, done, failed map[int]bool) error {
+	switch msg.Kind {
+	case "result":
+		res := Result{Index: index, Result: msg.Result, Seconds: msg.Seconds}
+		if err := s.Sink.Put(ctx, res); err != nil {
+			return fmt.Errorf("sink put index %d: %w", index, err)
+		}
+		done[index] = true
+	case "error":
+		failed[index] = true
+		s.leak("unhandled_case", fmt.Sprintf("item %d failed in payload: %s", index, msg.Error))
+	default:
+		s.leak("integration_edge", fmt.Sprintf("unexpected runner msg kind %q at index %d", msg.Kind, index))
+	}
+	return nil
+}
+
 func (s *Supervisor) warmUp(rn *runner) error {
+	conc := s.Concurrency
+	if conc < 1 {
+		conc = 1
+	}
 	if err := rn.send(map[string]any{
 		"kind": "config", "enter_body": s.Config.EnterBody,
 		"method_body": s.Config.MethodBody, "method_arg": s.Config.MethodArg,
+		"concurrency": conc,
 	}); err != nil {
 		return err
 	}

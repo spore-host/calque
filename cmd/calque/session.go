@@ -36,6 +36,7 @@ type sessionOpts struct {
 	spot            bool          // acquire on the Spot market (different capacity pool than on-demand)
 	spotMaxPrice    string        // $/hr bid cap; "" => spawn caps at on-demand price
 	prepTimeout     time.Duration // how long to wait for the one-time image pull; 0 => 30m default
+	concurrency     int           // items warmd keeps in flight per rung; 0/1 => serial (occupancy knob)
 }
 
 // runSession acquires ONE GPU instance (patiently — acquisition is the expensive,
@@ -200,6 +201,7 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 		Bucket: o.bucket, ArtifactPfx: sessBase + "/artifacts",
 		ManifestKey: rungBase + "/manifest.json", ResultPrefix: rungBase + "/results",
 		SummaryKey: rungBase + "/summary.json", LogKey: rungBase + "/test.log",
+		Concurrency: o.concurrency,
 	}
 	items := make([]warm.Item, n)
 	for i := range items {

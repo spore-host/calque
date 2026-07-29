@@ -43,6 +43,7 @@ type Manifest struct {
 	Occupancy    string                   `json:"occupancy_path"`          // path to occupancy.py in the image
 	VolumeSync   []calexec.VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged (aws s3 sync) before @enter (§3/§15)
 	VolumeCommit []calexec.VolumeSyncSpec `json:"volume_commit,omitempty"` // written back (mount -> S3) after @method drains (§E)
+	Concurrency  int                      `json:"concurrency,omitempty"`   // items in flight at once; 0/1 => serial (raises GPU occupancy)
 }
 
 // Summary is what warmd writes back so the control plane's measure step can fold
@@ -119,11 +120,12 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 	started := time.Now()
 	sink := &calexec.S3Sink{Client: s3c, Bucket: man.Bucket, Prefix: man.ResultPrefix}
 	sup := &warm.Supervisor{
-		Python: pyOr(man.PythonBin),
-		Script: man.RunnerPath,
-		Sink:   sink,
-		Leak:   stderrLeaker{},
-		Config: warm.Config{EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg},
+		Python:      pyOr(man.PythonBin),
+		Script:      man.RunnerPath,
+		Sink:        sink,
+		Leak:        stderrLeaker{},
+		Config:      warm.Config{EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg},
+		Concurrency: man.Concurrency,
 	}
 	failed, runErr := sup.Run(ctx, man.Items)
 	ended := time.Now()

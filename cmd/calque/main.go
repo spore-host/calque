@@ -170,6 +170,7 @@ func sessionCmd(args []string) error {
 	spot := fs.Bool("spot", false, "acquire on the Spot market (different capacity pool than on-demand; interruptible; K is then a SPOT rate)")
 	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
 	prepMin := fs.Int("prep-timeout-min", 30, "minutes to wait for the one-time docker image pull before giving up")
+	concurrency := fs.Int("concurrency", 1, "items to keep in flight per rung (>1 raises GPU occupancy via vLLM batching; 1 = serial)")
 	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance held for hours")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -190,6 +191,7 @@ func sessionCmd(args []string) error {
 		acquireDeadline: time.Duration(*acquireMin) * time.Minute, ratesFP: *rates,
 		spot: *spot, spotMaxPrice: *spotMaxPrice,
 		prepTimeout: time.Duration(*prepMin) * time.Minute,
+		concurrency: *concurrency,
 	})
 }
 
