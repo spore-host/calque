@@ -77,7 +77,10 @@ func realRun(o realOpts) (err error) {
 	if err != nil {
 		return err
 	}
-	s3c := s3.NewFromConfig(cfg)
+	s3c, err := calexec.NewS3ClientForBucket(ctx, o.bucket, o.region)
+	if err != nil {
+		return fmt.Errorf("s3 client for bucket %q: %w", o.bucket, err)
+	}
 	layout := calexec.NewLayout(o.bucket, o.runID)
 
 	if err := calexec.UploadArtifacts(ctx, s3c, layout, warmdBin, "worker/warm-runner/runner.py", "worker/warm-runner/occupancy.py"); err != nil {
