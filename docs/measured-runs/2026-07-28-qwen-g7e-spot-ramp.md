@@ -59,6 +59,25 @@ Crossover:  none in range — at 45% occupancy AWS's per-item cost never undercu
 Verdict:    STAY ON MODAL.
 ```
 
+## Reproduction — 2026-07-29 (cross-region: eu-central-1 compute, us-east-1 bucket)
+
+Reproduced the next day on a different spot region (us-east-1 on-demand *and* spot
+were tight; eu-central-1 had spot capacity). Run `g7e-spot-euc1-20260729c`,
+instance `i-04802d44ace0a2d91`, acquired in 4s. This run also **validated the
+cross-region S3 fix** (commits `3fadcfe` + `64172a3`): compute in eu-central-1,
+artifacts/results in the us-east-1 bucket the IAM role grants.
+
+| Rung | @enter (s) | per-item (s) | occupancy DCGM | results | vs 07-28 |
+|---|---|---|---|---|---|
+| N=1    | 212.7 | 0.405 | 0% | 1/1, 0 missing | 0.404 ✓ |
+| N=100  | 177.1 | 0.362 | 12% | 100/100, 0 missing | 0.358 ✓ |
+| N=1000 | 177.7 | 0.365 | 39% | 1000/1000, 0 missing | 0.359 ✓ |
+
+Per-item and occupancy reproduce within noise; verdict STAY ON MODAL at every rung.
+(Two cross-region bugs were fixed to get here: the first attempt that day 301'd on
+the control-plane artifact upload, the second on warmd's manifest read. This third
+run is the clean one.)
+
 ## Caveats
 
 - **Spot rate, interruptible** — see the banner above. An on-demand K needs on-demand
