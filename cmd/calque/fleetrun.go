@@ -55,7 +55,10 @@ func fleetRun(o realOpts, shards int) (err error) {
 	if err != nil {
 		return err
 	}
-	s3c := s3.NewFromConfig(cfg)
+	s3c, err := calexec.NewS3ClientForBucket(ctx, o.bucket, o.region)
+	if err != nil {
+		return fmt.Errorf("s3 client for bucket %q: %w", o.bucket, err)
+	}
 	spawnClient, err := spawnaws.NewClientWithRegion(ctx, o.region)
 	if err != nil {
 		return fmt.Errorf("spawn client: %w", err)

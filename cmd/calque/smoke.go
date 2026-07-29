@@ -10,7 +10,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 
 	calexec "github.com/spore-host/calque/internal/exec"
@@ -60,7 +59,10 @@ func smoke(o smokeOpts) (err error) {
 	if err != nil {
 		return err
 	}
-	s3c := s3.NewFromConfig(cfg)
+	s3c, err := calexec.NewS3ClientForBucket(ctx, o.bucket, o.region)
+	if err != nil {
+		return fmt.Errorf("s3 client for bucket %q: %w", o.bucket, err)
+	}
 	layout := calexec.NewLayout(o.bucket, o.runID)
 
 	// 1. upload artifacts + a trivial manifest (1 item, host-runnable body).

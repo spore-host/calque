@@ -12,10 +12,44 @@ import (
 	"sort"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
+
+// NewS3ClientForBucket builds an S3 client pinned to the BUCKET's own region,
+// which may differ from the compute region. calque decouples the two: you can run
+// GPUs where capacity exists (e.g. eu-central-1 spot) while artifacts/results live
+// in an IAM-allowed bucket elsewhere (e.g. us-east-1). Pinning the S3 client to the
+// compute --region instead caused a 301 PermanentRedirect on a cross-region bucket
+// (observed 2026-07-29, eu-central-1 compute + us-east-1 bucket). We resolve the
+// bucket's region via GetBucketRegion (hintRegion seeds the lookup) and build the
+// client there; on failure we fall back to a client in hintRegion so same-region
+// runs are unaffected.
+func NewS3ClientForBucket(ctx context.Context, bucket, hintRegion string) (*s3.Client, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(hintRegion))
+	if err != nil {
+		return nil, err
+	}
+	hint := s3.NewFromConfig(cfg)
+	bucketRegion, err := manager.GetBucketRegion(ctx, hint, bucket)
+	if err != nil || bucketRegion == "" {
+		// Can't resolve (permissions/transient): fall back to the hint-region client.
+		// A genuinely cross-region bucket will still 301, but same-region — the common
+		// case — works, and we've not made anything worse than before.
+		return hint, nil //nolint:nilerr // best-effort: hint client is a valid fallback
+	}
+	if bucketRegion == hintRegion {
+		return hint, nil
+	}
+	rcfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(bucketRegion))
+	if err != nil {
+		return nil, err
+	}
+	return s3.NewFromConfig(rcfg), nil
+}
 
 // S3Sink writes each warm-runner result to S3 keyed by input index, so results
 // can be collected in order regardless of completion order (spec §6: "keyed by
