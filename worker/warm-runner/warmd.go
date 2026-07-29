@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 )
 
 // Config is the warm unit's verbatim bodies (from the parser) plus its item arg.
@@ -75,13 +76,24 @@ type runner struct {
 
 // wire protocol messages (must mirror runner.py)
 type outMsg struct {
-	Kind         string  `json:"kind"`
-	EnterSeconds float64 `json:"enter_seconds"`
-	Index        *int    `json:"index"`
-	Seconds      float64 `json:"seconds"`
-	Result       any     `json:"result"`
-	Error        string  `json:"error"`
-	Traceback    string  `json:"traceback"`
+	Kind         string     `json:"kind"`
+	EnterSeconds float64    `json:"enter_seconds"`
+	Index        *int       `json:"index"`
+	Seconds      float64    `json:"seconds"`
+	Result       any        `json:"result"`
+	Error        string     `json:"error"`
+	Traceback    string     `json:"traceback"`
+	Results      []batchRes `json:"results"` // set on a "batch_result" message
+}
+
+// batchRes is one item's outcome inside a "batch_result" (micro-batching). Index
+// echoes the item; Error non-empty means that item failed (partial failure) while
+// its batch-mates may have succeeded.
+type batchRes struct {
+	Index   *int    `json:"index"`
+	Result  any     `json:"result"`
+	Seconds float64 `json:"seconds"`
+	Error   string  `json:"error"`
 }
 
 func startRunner(ctx context.Context, python string, script string) (*runner, error) {
@@ -149,9 +161,25 @@ type Supervisor struct {
 	// Concurrency is how many items to keep in flight at once (§ occupancy). 1 (or
 	// 0) is the original strictly-serial send-one/recv-one path. >1 pipelines: up to
 	// C items are sent before blocking, and results come back OUT OF ORDER keyed by
-	// index — which is what gives vLLM overlapping work to batch and raises GPU
-	// occupancy. Ordered COLLECTION is unaffected (the sink keys by index).
+	// index. This raises occupancy ONLY for thread-safe per-item bodies; for vLLM's
+	// offline engine (not thread-safe) it's guarded off in Run — use BatchSize there.
 	Concurrency int
+
+	// BatchSize micro-batches items: warmd sends B item payloads in ONE "batch"
+	// message; runner.py calls the @method body once with a LIST of B payloads and
+	// returns B results (keyed to the batch's indices). This is how vLLM actually
+	// batches — a single .generate([p1..pB]) fills the GPU — so it's the real
+	// occupancy lever for offline vLLM. 0/1 => one item per call (unchanged).
+	BatchSize int
+}
+
+// bodyIsVLLMOffline reports whether a @method body looks like it calls vLLM's
+// offline engine (self.llm.generate(...) style). Heuristic, deliberately narrow:
+// it gates only the concurrency-hang guard, so a false negative just means the old
+// (possibly hanging) behavior and a false positive means a safe serial fallback.
+func bodyIsVLLMOffline(body string) bool {
+	return strings.Contains(body, ".generate(") &&
+		(strings.Contains(body, "llm") || strings.Contains(body, "LLM"))
 }
 
 // Run drains items in index order, writing each successful result to the sink. It
@@ -162,6 +190,20 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 	maxRestarts := s.MaxRestarts
 	if maxRestarts == 0 {
 		maxRestarts = 5
+	}
+	// Concurrency guard (#68): threads calling vLLM's OFFLINE LLM.generate() on one
+	// shared engine race its step loop and hang — the engine isn't thread-safe; it
+	// batches via a LIST passed to a single .generate() call, not concurrent calls.
+	// So for a vLLM-offline body we REFUSE C>1 and fall back to serial with a loud
+	// leak, rather than deadlock. (The supervisor's concurrency itself is correct and
+	// stays available for genuinely thread-safe per-item bodies.) Real vLLM occupancy
+	// needs micro-batching — see BatchSize / the batch path.
+	if s.Concurrency > 1 && s.BatchSize <= 1 && bodyIsVLLMOffline(s.Config.MethodBody) {
+		s.leak("unhandled_case", fmt.Sprintf(
+			"concurrency=%d requested but the @method calls vLLM's offline LLM.generate(), which is NOT thread-safe "+
+				"(concurrent calls hang the engine); falling back to SERIAL. vLLM batches via a list in ONE call — "+
+				"use --batch-size to micro-batch instead of --concurrency.", s.Concurrency))
+		s.Concurrency = 1
 	}
 	done := make(map[int]bool, len(items)) // written to sink
 	failed := make(map[int]bool)           // permanent per-item payload failures
@@ -234,10 +276,67 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 // the caller should restart + re-drive the still-unsettled items; sinkErr is a
 // fatal sink failure (aborts the whole Run). C=1 => serial; C>1 => pipelined.
 func (s *Supervisor) drain(ctx context.Context, rn *runner, pending []Item, done, failed map[int]bool) (bool, error) {
+	if s.BatchSize > 1 {
+		return s.drainBatched(ctx, rn, pending, done, failed)
+	}
 	if s.Concurrency > 1 {
 		return s.drainConcurrent(ctx, rn, pending, done, failed)
 	}
 	return s.drainSerial(ctx, rn, pending, done, failed)
+}
+
+// drainBatched sends B payloads per "batch" message and expects a "batch_result"
+// carrying B (index,result) pairs — the real vLLM occupancy lever: one
+// .generate([p1..pB]) call fills the GPU. A crash leaves the in-flight batch's
+// items unsettled for re-drive. Per-item failures inside a batch come back tagged
+// so a single bad item is a partial failure, not a whole-batch loss.
+func (s *Supervisor) drainBatched(ctx context.Context, rn *runner, pending []Item, done, failed map[int]bool) (bool, error) {
+	b := s.BatchSize
+	for start := 0; start < len(pending); start += b {
+		end := start + b
+		if end > len(pending) {
+			end = len(pending)
+		}
+		batch := pending[start:end]
+		idxs := make([]int, len(batch))
+		payloads := make([]any, len(batch))
+		for i, it := range batch {
+			idxs[i] = it.Index
+			payloads[i] = it.Payload
+		}
+		if err := rn.send(map[string]any{"kind": "batch", "indices": idxs, "payloads": payloads}); err != nil {
+			return true, nil // crashed
+		}
+		msg, err := rn.recv()
+		if err != nil {
+			s.leak("integration_edge", fmt.Sprintf("runner died mid-batch (%d items): %v", len(batch), err))
+			return true, nil // crashed
+		}
+		if msg.Kind != "batch_result" {
+			// An unexpected top-level message (e.g. a fatal error) — treat as crash so
+			// the whole batch re-drives on a fresh runner.
+			s.leak("integration_edge", fmt.Sprintf("expected batch_result, got %q", msg.Kind))
+			return true, nil
+		}
+		// Settle each item in the batch by its own index + per-item status.
+		for _, r := range msg.Results {
+			if r.Index == nil {
+				s.leak("integration_edge", "batch_result item without an index")
+				continue
+			}
+			if r.Error != "" {
+				failed[*r.Index] = true
+				s.leak("unhandled_case", fmt.Sprintf("item %d failed in payload: %s", *r.Index, r.Error))
+				continue
+			}
+			res := Result{Index: *r.Index, Result: r.Result, Seconds: r.Seconds}
+			if err := s.Sink.Put(ctx, res); err != nil {
+				return false, fmt.Errorf("sink put index %d: %w", *r.Index, err)
+			}
+			done[*r.Index] = true
+		}
+	}
+	return false, nil
 }
 
 // drainSerial is the original strictly-serial drain: send one item, block for its

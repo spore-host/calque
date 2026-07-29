@@ -49,6 +49,14 @@ self.params = SamplingParams(temperature=0.7, max_tokens=128)`
 
 	realMethodBody = `out = self.llm.generate([prompt], self.params)
 return out[0].outputs[0].text`
+
+	// realBatchMethodBody is the micro-batch shape (#68): `prompts` is the LIST of
+	// payloads, passed to a SINGLE vLLM .generate(list) call — which is how vLLM
+	// actually batches and fills the GPU (raising occupancy). It returns a LIST of
+	// texts aligned 1:1 to inputs, as the batch protocol requires. Used only when
+	// --batch-size > 1; the single-item body above stays the default.
+	realBatchMethodBody = `outs = self.llm.generate(prompts, self.params)
+return [o.outputs[0].text for o in outs]`
 )
 
 // realRun acquires a GPU, runs real vLLM inference over N prompts under the warm

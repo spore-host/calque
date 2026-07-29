@@ -31,6 +31,7 @@ type Manifest struct {
 	VolumeSync   []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
 	VolumeCommit []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
 	Concurrency  int              `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
+	BatchSize    int              `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
 }
 
 // VolumeSyncSpec tells warmd to `aws s3 sync <URI> <MountPath>` before @enter, so
@@ -50,6 +51,7 @@ type RunLayout struct {
 	SummaryKey   string
 	LogKey       string // bootstrap log, uploaded on instance exit (observability)
 	Concurrency  int    // items warmd keeps in flight; 0/1 => serial (occupancy knob)
+	BatchSize    int    // items per micro-batch (real vLLM occupancy lever); 0/1 => per-item
 }
 
 func NewLayout(bucket, runID string) RunLayout {
@@ -103,7 +105,7 @@ func WriteManifestFull(ctx context.Context, c *s3.Client, l RunLayout, enterBody
 		EnterBody: enterBody, MethodBody: methodBody, MethodArg: methodArg,
 		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: "python3", RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
-		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency,
+		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency, BatchSize: l.BatchSize,
 	}
 	body, err := json.Marshal(man)
 	if err != nil {

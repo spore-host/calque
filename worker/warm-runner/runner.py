@@ -103,6 +103,19 @@ class Runner:
         result = fn(self.state, payload)
         return result, time.perf_counter() - t0
 
+    def batch(self, payloads: list) -> Any:
+        """Call the compiled method function ONCE with the whole payload LIST bound
+        to the method arg. In batch mode the @method body is batch-shaped — it takes
+        the list (e.g. `prompts`) and returns a list — so vLLM batches the whole
+        group in a single .generate(list) call. Same self.state as the serial path.
+        """
+        if not self.entered:
+            raise RuntimeError("batch before enter; warm state not loaded")
+        fn = self._method_fn
+        if fn is None:
+            raise RuntimeError("method not compiled; enter did not run")
+        return fn(self.state, payloads)
+
     def _exec_body(self, body: str, extra_locals: dict, capture_return: bool = False) -> Any:
         """Exec a verbatim Modal body with `self` bound to the warm namespace.
 
@@ -181,6 +194,35 @@ def _process_item(runner: Runner, index: Any, payload: Any) -> None:
         _emit({"kind": "error", "index": index, "error": str(e), "traceback": traceback.format_exc()})
 
 
+def _process_batch(runner: Runner, indices: list, payloads: list) -> None:
+    """Run the method body ONCE over a LIST of payloads and emit one batch_result
+    with a per-item outcome for each index. This is the micro-batch path: the body
+    receives the whole list (e.g. self.llm.generate(prompts, ...)) so vLLM batches
+    internally — the real GPU-occupancy lever. Contract: the body returns a LIST
+    aligned 1:1 with payloads. A whole-batch exception fails every item in the
+    batch (structured, not a crash); a length mismatch fails each item with a clear
+    error. Per-item wall-clock is the batch time / count (overlapping by nature).
+    """
+    n = len(payloads)
+    try:
+        t0 = time.perf_counter()
+        results = runner.batch(payloads)
+        secs = (time.perf_counter() - t0) / max(n, 1)
+        if not isinstance(results, (list, tuple)) or len(results) != n:
+            raise ValueError(
+                f"batch body must return a list of {n} results aligned to inputs, "
+                f"got {type(results).__name__} of len {len(results) if hasattr(results, '__len__') else 'n/a'}"
+            )
+        items = [{"index": idx, "result": r, "seconds": secs} for idx, r in zip(indices, results)]
+        _emit({"kind": "batch_result", "results": items})
+    except Exception as e:
+        # Whole-batch failure: report each item as failed (partial failure), so the
+        # supervisor records them without treating it as a runner crash.
+        tb = traceback.format_exc()
+        items = [{"index": idx, "error": str(e), "traceback": tb} for idx in indices]
+        _emit({"kind": "batch_result", "results": items})
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     # Config (enter/method bodies + arg name) arrives as a JSON file path or via a
@@ -230,6 +272,15 @@ def main(argv: list[str] | None = None) -> int:
                     pool.submit(_process_item, runner, msg.get("index"), msg.get("payload"))
                 else:
                     _process_item(runner, msg.get("index"), msg.get("payload"))
+            elif kind == "batch":
+                # Micro-batch: the method body is called ONCE with the LIST of B
+                # payloads (batch-shaped body — how vLLM actually batches: a single
+                # .generate([p1..pB]) fills the GPU). It returns a LIST of B results,
+                # aligned to indices. A whole-batch failure marks every item failed;
+                # a body that returns the wrong count is a structured error per item.
+                if runner is None:
+                    raise RuntimeError("batch before config")
+                _process_batch(runner, msg.get("indices") or [], msg.get("payloads") or [])
             elif kind == "shutdown":
                 # Drain in-flight work before acking, so no result is lost on exit.
                 if pool is not None:

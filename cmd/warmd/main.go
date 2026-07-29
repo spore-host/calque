@@ -44,6 +44,7 @@ type Manifest struct {
 	VolumeSync   []calexec.VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged (aws s3 sync) before @enter (§3/§15)
 	VolumeCommit []calexec.VolumeSyncSpec `json:"volume_commit,omitempty"` // written back (mount -> S3) after @method drains (§E)
 	Concurrency  int                      `json:"concurrency,omitempty"`   // items in flight at once; 0/1 => serial (raises GPU occupancy)
+	BatchSize    int                      `json:"batch_size,omitempty"`    // items per micro-batch (one .generate(list) call); 0/1 => per-item
 }
 
 // Summary is what warmd writes back so the control plane's measure step can fold
@@ -126,6 +127,7 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 		Leak:        stderrLeaker{},
 		Config:      warm.Config{EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg},
 		Concurrency: man.Concurrency,
+		BatchSize:   man.BatchSize,
 	}
 	failed, runErr := sup.Run(ctx, man.Items)
 	ended := time.Now()

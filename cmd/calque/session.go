@@ -37,6 +37,7 @@ type sessionOpts struct {
 	spotMaxPrice    string        // $/hr bid cap; "" => spawn caps at on-demand price
 	prepTimeout     time.Duration // how long to wait for the one-time image pull; 0 => 30m default
 	concurrency     int           // items warmd keeps in flight per rung; 0/1 => serial (occupancy knob)
+	batchSize       int           // items per micro-batch (real vLLM occupancy lever); 0/1 => per-item
 }
 
 // runSession acquires ONE GPU instance (patiently — acquisition is the expensive,
@@ -201,13 +202,19 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 		Bucket: o.bucket, ArtifactPfx: sessBase + "/artifacts",
 		ManifestKey: rungBase + "/manifest.json", ResultPrefix: rungBase + "/results",
 		SummaryKey: rungBase + "/summary.json", LogKey: rungBase + "/test.log",
-		Concurrency: o.concurrency,
+		Concurrency: o.concurrency, BatchSize: o.batchSize,
 	}
 	items := make([]warm.Item, n)
 	for i := range items {
 		items[i] = warm.Item{Index: i, Payload: fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)}
 	}
-	if err := calexec.WriteManifest(ctx, s3c, layout, realEnterBody, realMethodBody, "prompt", hostWorkerDir, items); err != nil {
+	// Batch mode uses the LIST-shaped body + arg `prompts` (one vLLM .generate(list)
+	// call per batch); the default single-item path is unchanged.
+	methodBody, methodArg := realMethodBody, "prompt"
+	if o.batchSize > 1 {
+		methodBody, methodArg = realBatchMethodBody, "prompts"
+	}
+	if err := calexec.WriteManifest(ctx, s3c, layout, realEnterBody, methodBody, methodArg, hostWorkerDir, items); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
 
