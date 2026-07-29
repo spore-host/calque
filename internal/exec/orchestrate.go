@@ -30,6 +30,7 @@ type Manifest struct {
 	Occupancy    string           `json:"occupancy_path"`
 	VolumeSync   []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
 	VolumeCommit []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
+	Concurrency  int              `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
 }
 
 // VolumeSyncSpec tells warmd to `aws s3 sync <URI> <MountPath>` before @enter, so
@@ -48,6 +49,7 @@ type RunLayout struct {
 	ResultPrefix string
 	SummaryKey   string
 	LogKey       string // bootstrap log, uploaded on instance exit (observability)
+	Concurrency  int    // items warmd keeps in flight; 0/1 => serial (occupancy knob)
 }
 
 func NewLayout(bucket, runID string) RunLayout {
@@ -101,7 +103,7 @@ func WriteManifestFull(ctx context.Context, c *s3.Client, l RunLayout, enterBody
 		EnterBody: enterBody, MethodBody: methodBody, MethodArg: methodArg,
 		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: "python3", RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
-		VolumeSync: volumeSync, VolumeCommit: volumeCommit,
+		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency,
 	}
 	body, err := json.Marshal(man)
 	if err != nil {

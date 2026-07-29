@@ -42,8 +42,10 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 
@@ -67,6 +69,8 @@ class Runner:
         self.state = _Namespace()
         # Globals shared by enter and method bodies (imports done in @enter persist).
         self.globals: dict[str, Any] = {"__name__": "__calque_worker__"}
+        # Compiled @method function, built once in enter() (see _compile_method).
+        self._method_fn = None
 
     def enter(self) -> float:
         if self.entered:
@@ -75,6 +79,10 @@ class Runner:
             raise RuntimeError("enter called twice; model would reload (see spec §6)")
         t0 = time.perf_counter()
         self._exec_body(self.enter_body, extra_locals={})
+        # Compile the @method body once, AFTER @enter (so any imports @enter added to
+        # self.globals are in scope for the method). Reused for every item, incl.
+        # concurrent calls.
+        self._compile_method()
         self.entered = True
         return time.perf_counter() - t0
 
@@ -82,10 +90,17 @@ class Runner:
         if not self.entered:
             raise RuntimeError("item before enter; warm state not loaded")
         t0 = time.perf_counter()
-        # The @method body refers to its argument by name (e.g. `prompt`) and
-        # returns a value. We bind the arg, exec the body, and capture the return.
-        local_ns: dict[str, Any] = {self.method_arg: payload}
-        result = self._exec_body(self.method_body, extra_locals=local_ns, capture_return=True)
+        # Call the compiled @method function (built once in enter()). Under
+        # concurrency (C>1) many threads call this at once — each call binds only
+        # its own args and shares `self.state`, exactly as concurrent @method calls
+        # would on a Modal container. We do NOT hold a lock across the body: the
+        # whole point is to let inference overlap (the library releases the GIL).
+        # Bodies that mutate shared self.state under concurrency race the same way
+        # they would on Modal — that's the honest behavior, not something we serialize.
+        fn = self._method_fn
+        if fn is None:  # method body compiled lazily at first enter
+            raise RuntimeError("method not compiled; enter did not run")
+        result = fn(self.state, payload)
         return result, time.perf_counter() - t0
 
     def _exec_body(self, body: str, extra_locals: dict, capture_return: bool = False) -> Any:
@@ -106,6 +121,21 @@ class Runner:
         ret = fn(self.state, *extra_locals.values())
         return ret if capture_return else None
 
+    def _compile_method(self) -> None:
+        """Compile the @method body ONCE into a reusable function (thread-safe to
+        call concurrently). The old path re-exec'd the body per item, defining
+        __calque_fn__ in shared globals each time — a data race under concurrency
+        (two threads clobber the same name). Compiling once, into a distinct name,
+        removes that race; the returned function closes over nothing mutable beyond
+        the shared self.state, which is intentional (see item()).
+        """
+        body = self.method_body
+        indented = "\n".join("    " + ln for ln in body.splitlines()) or "    pass"
+        src = f"def __calque_method__(self, {self.method_arg}):\n{indented}\n"
+        code = compile(src, "<calque-method>", "exec")
+        exec(code, self.globals)
+        self._method_fn = self.globals["__calque_method__"]
+
 
 class _Namespace:
     """A permissive attribute bag standing in for the @cls `self`."""
@@ -125,9 +155,30 @@ sys.stdout.flush()
 os.dup2(sys.stderr.fileno(), sys.stdout.fileno())  # library stdout -> stderr
 
 
+# Under concurrency (C>1) multiple worker threads emit results, so the write+flush
+# to the single protocol channel must be atomic or newline frames interleave and
+# corrupt the JSON stream. The lock is uncontended in the serial (C=1) path.
+_EMIT_LOCK = threading.Lock()
+
+
 def _emit(obj: dict) -> None:
-    _PROTO.write(json.dumps(obj) + "\n")
-    _PROTO.flush()  # flush every line so warmd sees responses as they land
+    line = json.dumps(obj) + "\n"
+    with _EMIT_LOCK:
+        _PROTO.write(line)
+        _PROTO.flush()  # flush every line so warmd sees responses as they land
+
+
+def _process_item(runner: Runner, index: Any, payload: Any) -> None:
+    """Run one item and emit its result/error. Safe to call from a pool thread —
+    _emit is locked, and runner.item() shares only self.state (see item()). The
+    per-item try/except keeps a bad payload from killing the worker thread: it
+    becomes a structured 'error' (a partial failure), exactly as in the serial path.
+    """
+    try:
+        result, secs = runner.item(payload)
+        _emit({"kind": "result", "index": index, "seconds": secs, "result": result})
+    except Exception as e:
+        _emit({"kind": "error", "index": index, "error": str(e), "traceback": traceback.format_exc()})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -137,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     reader = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
 
     runner: Runner | None = None
+    pool: ThreadPoolExecutor | None = None  # non-None only when concurrency > 1
     for line in reader:
         line = line.strip()
         if not line:
@@ -155,6 +207,12 @@ def main(argv: list[str] | None = None) -> int:
                     method_body=msg.get("method_body", ""),
                     method_arg=msg.get("method_arg", "item"),
                 )
+                # concurrency=C>1 => items run in a C-wide thread pool so inference
+                # overlaps (vLLM batches in-flight requests). Absent/1 => the serial
+                # path below, byte-for-byte the original behavior.
+                conc = int(msg.get("concurrency", 1) or 1)
+                if conc > 1:
+                    pool = ThreadPoolExecutor(max_workers=conc)
                 _emit({"kind": "configured"})
             elif kind == "enter":
                 if runner is None:
@@ -164,9 +222,19 @@ def main(argv: list[str] | None = None) -> int:
             elif kind == "item":
                 if runner is None:
                     raise RuntimeError("item before config")
-                result, secs = runner.item(msg.get("payload"))
-                _emit({"kind": "result", "index": msg.get("index"), "seconds": secs, "result": result})
+                if pool is not None:
+                    # Concurrent: submit and move on. The result/error is emitted by
+                    # the worker thread when it finishes — OUT OF ORDER, keyed by
+                    # index (warmd collects by index). Backpressure: warmd caps items
+                    # in flight at C (it won't send the C+1th until one lands).
+                    pool.submit(_process_item, runner, msg.get("index"), msg.get("payload"))
+                else:
+                    _process_item(runner, msg.get("index"), msg.get("payload"))
             elif kind == "shutdown":
+                # Drain in-flight work before acking, so no result is lost on exit.
+                if pool is not None:
+                    pool.shutdown(wait=True)
+                    pool = None
                 _emit({"kind": "bye"})
                 return 0
             else:
