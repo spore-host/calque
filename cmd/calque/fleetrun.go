@@ -216,6 +216,7 @@ func runShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Client,
 		Occupancy: measure.OccupancySummary{
 			MeanOccupancy: summary.Occupancy.MeanOccupancy, Samples: summary.Occupancy.Samples,
 			Source: summary.Occupancy.Source, Measured: summary.Occupancy.Measured,
+			Scope: summary.Occupancy.ScopeOrWholeRun(),
 		},
 		AcquiredAt: acquired.AcquiredAt, TerminatedAt: time.Now(),
 		EnterSeconds: summary.EnterSeconds, AcquireWaitSeconds: acquired.TimeToAcquire().Seconds(),
@@ -239,6 +240,7 @@ func emitFleetK(o realOpts, perInstance []measure.Measurement, priceHr float64) 
 		CardAskedFor: agg.CardAskedFor, InstanceUsed: agg.InstanceUsed, SecPerItem: agg.PerItem.MeanSecs,
 		Occupancy: occFrac, SampleItems: agg.PerItem.Count, AWSRateMeasured: awsMeasured,
 		AcquireSeconds: agg.AcquireWaitSeconds, EnterSeconds: agg.EnterSeconds,
+		OccupancyScope: agg.Occupancy.ScopeOrWholeRun(),
 	}}
 	fmt.Printf("\n--- crossover K (§9) — FLEET of %d instances, MEASURED ---\n", len(perInstance))
 	verdict, verr := model.Verdict(o.n)

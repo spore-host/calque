@@ -11,6 +11,16 @@ the phase detector working, not a failure.
 > it answers "does AWS win at this occupancy on a spot g7e," and the honest answer
 > at ≤45% occupancy is no. calque emitted this caveat as a leak at run time.
 
+> **Occupancy scope caveat (#71, added 2026-08-06):** every occupancy figure in this
+> record is a **`whole_run`** mean — averaged over the entire rung *including the
+> ~173 s one-time `@enter` model load*, when the GPU is idle by definition. It
+> therefore **understates steady-state GPU fill**. It cannot be recomputed: this run's
+> samples were not timestamped, so windowing them now would mean inventing data.
+> Per-item seconds, `enter_seconds`, result counts, and the STAY-ON-MODAL verdicts are
+> unaffected — and since a whole-run occupancy double-counts the load idle (once as low
+> occupancy, again as `enter_seconds`), these verdicts were conservative in Modal's
+> favor, not AWS's. Runs after #71 report `scope: inference`.
+
 ## Provenance
 
 | Field | Value |
@@ -31,7 +41,10 @@ the phase detector working, not a failure.
 Occupancy is reported dual-metric; **DCGM SM-activity is the accurate source**
 (host-sampled), nvsmi is shown for comparison. All values `measured`, `enter_count=1`.
 
-| Rung | @enter load (s) | per-item (s) | occupancy DCGM (host) | occupancy nvsmi | results | verdict |
+All occupancy columns are `scope: whole_run` (they include the `@enter` load — see the
+scope caveat above).
+
+| Rung | @enter load (s) | per-item (s) | occupancy DCGM (host, `whole_run`) | occupancy nvsmi | results | verdict |
 |---|---|---|---|---|---|---|
 | N=1    | 207.39 | 0.404 | 0.4% | 0.4% | 1/1, 0 missing | STAY ON MODAL |
 | N=100  | 172.37 | 0.358 (mean) | **12.2%** | 18.1% | 100/100, 0 missing | STAY ON MODAL |
@@ -40,9 +53,13 @@ Occupancy is reported dual-metric; **DCGM SM-activity is the accurate source**
 Notes:
 - **RTX PRO 6000 per-item ≈ 0.36–0.40 s** — roughly 4–5× faster than the L4's 1.70 s
   (2026-07-16 N=1 run).
-- **Occupancy climbs with N** (0.4% → 12% → 45%) as the one-time ~173 s model load
-  amortizes across more items — the load-amortization economics the ramp exists to
-  measure.
+- **Occupancy climbs with N** (0.4% → 12% → 45%) — but read this carefully. It is
+  *mostly an artifact of the averaging window*: as N grows, the fixed ~173 s load is a
+  smaller share of the run, so a `whole_run` mean rises even if GPU fill during
+  inference is unchanged. The real load-amortization economics live in `enter_seconds`
+  ÷ N, which the K math already handles. Since #71, the occupancy column measures fill
+  during inference only, and it should be roughly *flat* across these rungs (same
+  single-stream B=1 work at every N) rather than climbing.
 - **Ordered collection held**: 0 missing at every rung, including 1000/1000.
 
 ## K at N=1000 (spot R_a, 45% occupancy)
@@ -86,6 +103,10 @@ run is the clean one.)
 - **Occupancy is single-stream (B=1)** — one prompt at a time leaves the GPU largely
   idle even at N=1000 (45%). Raising occupancy (batching, concurrency) or buying down
   the rate (Savings Plan / reserved) is what would move the verdict — the tool says so.
+  Micro-batching was tried next and did make inference **24× faster**
+  ([`2026-07-29-qwen-g7e-batch32.md`](2026-07-29-qwen-g7e-batch32.md)) — and exposed
+  that this occupancy metric was measuring the wrong window (#71).
+- **Occupancy scope is `whole_run`** and not recomputable — see the caveat at the top.
 - **Why the earlier attempts failed** (context, now fixed): (1) calque couldn't request
   spot; (2) a prep-visibility bug hid the real failure, which was (3) instances lacking
   S3 write to a fresh bucket outside the role policy. All resolved in `933a33c`; this

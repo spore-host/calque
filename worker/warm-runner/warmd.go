@@ -31,6 +31,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Config is the warm unit's verbatim bodies (from the parser) plus its item arg.
@@ -171,6 +172,27 @@ type Supervisor struct {
 	// batches — a single .generate([p1..pB]) fills the GPU — so it's the real
 	// occupancy lever for offline vLLM. 0/1 => one item per call (unchanged).
 	BatchSize int
+
+	// InferenceSpans are the wall-clock windows during which items were actually
+	// being processed — one span per drain, starting AFTER that runner's @enter
+	// returned and ending when its drain stops (clean finish or crash).
+	//
+	// Why a LIST and not one start/end pair (#71): a crash-restart reloads the model,
+	// so a run can be [load][infer][load][infer]. A single outer start→end would
+	// swallow the second load and re-contaminate the very number we're separating.
+	// Occupancy is averaged over the UNION of these spans, so every load gap — first
+	// or after a restart — is excluded by construction.
+	InferenceSpans []Span
+}
+
+// Span is a closed wall-clock window in unix epoch seconds (float, sub-second).
+// Epoch (not monotonic) because these are correlated against a SEPARATE process's
+// timestamped samples — the occupancy sampler, which may even run on the host while
+// warmd runs in a container. Both read the same clock; a monotonic reading would be
+// meaningless across processes.
+type Span struct {
+	StartUnix float64 `json:"start_unix"`
+	EndUnix   float64 `json:"end_unix"`
 }
 
 // bodyIsVLLMOffline reports whether a @method body looks like it calls vLLM's
@@ -240,7 +262,14 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 		// on the next loop iteration (a fresh warm runner) — re-drive is implicit.
 		// C=1 uses the strictly-serial send-one/recv-one drain; C>1 pipelines up to
 		// C items in flight and matches OUT-OF-ORDER results by their echoed index.
+		//
+		// Bracket the drain to record the INFERENCE span (#71): warm-up (the @enter
+		// model load) has already returned, so this window contains item work only.
+		// Recorded even on crash — the GPU was genuinely busy up to the crash, and the
+		// following restart's load is excluded because it lands OUTSIDE every span.
+		spanStart := nowUnix()
 		crashed, sinkErr := s.drain(ctx, rn, pending, done, failed)
+		s.InferenceSpans = append(s.InferenceSpans, Span{StartUnix: spanStart, EndUnix: nowUnix()})
 		if sinkErr != nil {
 			rn.close()
 			return unsettled(items, settled), sinkErr
@@ -453,6 +482,10 @@ func (s *Supervisor) warmUp(rn *runner) error {
 }
 
 // --- helpers ---
+
+// nowUnix is the wall clock as a float epoch second — the shared time basis
+// between warmd's spans and the sampler's per-tick `ts`.
+func nowUnix() float64 { return float64(time.Now().UnixNano()) / 1e9 }
 
 func (s *Supervisor) leak(kind, detail string) {
 	if s.Leak != nil {

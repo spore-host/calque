@@ -47,3 +47,39 @@ func TestSessionPrepNoDoneKeyOmitsMarker(t *testing.T) {
 		t.Errorf("no DoneKey set but marker emitted:\n%s", cmd)
 	}
 }
+
+// TestTestRunCommandUploadsRawSamples proves the per-rung command uploads the
+// sampler's RAW timestamped JSONL, not just its summary (#71). In the session path
+// the sampler runs on the HOST (dcgmi isn't in the vLLM image) while warmd runs in
+// the container, so warmd cannot see these samples — the control plane does the
+// inference-window re-average, and it needs this file to do it.
+func TestTestRunCommandUploadsRawSamples(t *testing.T) {
+	cmd := TestRunCommand("img", "/tmp/calque", "us-east-1", "buk", "runs/x/manifest.json",
+		"Qwen/Qwen2.5-1.5B-Instruct", "runs/x/test.log", "runs/x/occ.json", "runs/x/occ.jsonl")
+
+	if !strings.Contains(cmd, "s3://buk/runs/x/occ.jsonl") {
+		t.Errorf("command does not upload the raw sample stream:\n%s", cmd)
+	}
+	if !strings.Contains(cmd, "/tmp/calque-occ.jsonl") {
+		t.Errorf("command does not reference the sampler's --out path:\n%s", cmd)
+	}
+	// The upload must happen AFTER the sampler is stopped, or the file is truncated.
+	stop := strings.Index(cmd, "kill -TERM $OCC")
+	up := strings.Index(cmd, "occ.jsonl s3://")
+	if stop < 0 || up < 0 || up < stop {
+		t.Errorf("raw samples must upload after the sampler is SIGTERM'd:\n%s", cmd)
+	}
+	// And the container's exit code must still be what the command returns.
+	if !strings.Contains(cmd, "exit $RC") {
+		t.Errorf("command lost its exit-code propagation:\n%s", cmd)
+	}
+}
+
+// TestTestRunCommandNoSamplesKeyOmitsUpload proves the upload is opt-in: an empty key
+// yields no raw-sample copy (back-compat with callers that only want the summary).
+func TestTestRunCommandNoSamplesKeyOmitsUpload(t *testing.T) {
+	cmd := TestRunCommand("img", "/tmp/calque", "us-east-1", "buk", "m.json", "", "log", "occ.json", "")
+	if strings.Contains(cmd, ".jsonl s3://") {
+		t.Errorf("no samples key given, but the command still uploads a JSONL:\n%s", cmd)
+	}
+}

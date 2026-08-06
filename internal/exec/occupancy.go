@@ -17,4 +17,23 @@ type OccupancyRaw struct {
 	Source          string              `json:"source"` // = OccupancySource (back-compat)
 	IntervalS       float64             `json:"interval_s"`
 	Measured        bool                `json:"measured"`
+
+	// Scope names the averaging WINDOW this mean covers: ScopeWholeRun (sampler
+	// lifetime, includes the one-time @enter model load) or ScopeInference (item work
+	// only). The same run yields very different occupancy per scope, so a number
+	// without its scope isn't auditable — and the load-contaminated whole-run mean
+	// moves the wrong way when work gets faster (#71). Empty means whole_run: that's
+	// what a pre-#71 sampler emitted, and reading it as steady-state is the bug.
+	Scope string `json:"scope,omitempty"`
+}
+
+// ScopeOrWholeRun returns the declared scope, defaulting to ScopeWholeRun for
+// summaries written before the scope field existed. Conservative on purpose: an
+// unlabeled number IS a whole-run mean, and labeling it as inference-window would
+// overstate GPU fill.
+func (o OccupancyRaw) ScopeOrWholeRun() string {
+	if o.Scope == "" {
+		return ScopeWholeRun
+	}
+	return o.Scope
 }

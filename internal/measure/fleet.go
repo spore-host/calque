@@ -71,7 +71,27 @@ func FleetFold(perInstance []Measurement) Measurement {
 			Samples:       occItems,
 			Source:        perInstance[0].Occupancy.Source,
 			Measured:      allOccMeasured,
+			Scope:         foldScope(perInstance),
 		}
 	}
 	return agg
+}
+
+// foldScope reduces the shards' occupancy scopes to one label for the fold. Mixed
+// scopes degrade to "whole_run": averaging an inference-window mean together with a
+// load-contaminated one yields a contaminated result, so the weaker label is the
+// only honest one for the mixture (#71).
+func foldScope(perInstance []Measurement) string {
+	scope := ""
+	for _, m := range perInstance {
+		s := m.Occupancy.ScopeOrWholeRun()
+		if scope == "" {
+			scope = s
+			continue
+		}
+		if s != scope {
+			return "whole_run"
+		}
+	}
+	return scope
 }

@@ -13,9 +13,15 @@ type Measured struct {
 	CardAskedFor    string  // e.g. "H100" — drives R_m (the asymmetry, §9)
 	InstanceUsed    string  // e.g. "g7e.2xlarge" — drives R_a
 	SecPerItem      float64 // mean warm per-item compute seconds
-	Occupancy       float64 // mean GPU utilization fraction [0,1] across the run
+	Occupancy       float64 // mean GPU utilization fraction [0,1]; see OccupancyScope
 	SampleItems     int     // how many items the measurement is based on
 	AWSRateMeasured bool    // is R_a a live rate or a proxy constant?
+	// OccupancyScope names the window Occupancy was averaged over: "inference" (item
+	// work only — what this model wants, since EnterSeconds already carries the load)
+	// or "whole_run" (includes the one-time @enter load, so it DOUBLE-COUNTS that idle
+	// time: once as low occupancy, again as EnterSeconds). Empty => unknown/whole_run.
+	// Reported in the verdict because K is only auditable if its inputs are labeled (#71).
+	OccupancyScope string
 	// AcquireSeconds is the lagotto/spawn time-to-acquire (idle the rectangle pays
 	// for before any work) + any warm-idle; part of the AWS rectangle (§8).
 	AcquireSeconds float64
@@ -169,8 +175,8 @@ func (m *Model) Verdict(atItems int) (string, error) {
 		return "", ErrNoComputeMeasured
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Your workload:   %s (asked for %s -> substituted %s), %d items, measured %.3fs/item, occupancy %.0f%%\n",
-		"map-batch", m.M.CardAskedFor, m.M.InstanceUsed, atItems, m.M.SecPerItem, m.M.Occupancy*100)
+	fmt.Fprintf(&b, "Your workload:   %s (asked for %s -> substituted %s), %d items, measured %.3fs/item, occupancy %.0f%% (%s)\n",
+		"map-batch", m.M.CardAskedFor, m.M.InstanceUsed, atItems, m.M.SecPerItem, m.M.Occupancy*100, m.occScopeLabel())
 	if m.M.SampleItems > 0 && m.M.SampleItems < atItems {
 		fmt.Fprintf(&b, "  (per-item + occupancy measured on %d items; Modal-at-scale built from that, NOT linearly extrapolated)\n", m.M.SampleItems)
 	}
@@ -226,7 +232,26 @@ func (m *Model) Verdict(atItems int) (string, error) {
 		flag = "PROXY (g7e not yet in AWS Pricing API; rate is a cited constant)"
 	}
 	fmt.Fprintf(&b, "AWS side of K: [%s]\n", flag)
+	// A whole-run occupancy double-counts the load idle (once in P, once in
+	// EnterSeconds), so K comes out pessimistic for AWS. Say so rather than letting
+	// the reader assume the occupancy figure means steady-state fill (#71).
+	if m.M.OccupancyScope != "" && m.M.OccupancyScope != "inference" {
+		fmt.Fprintf(&b, "NOTE: occupancy is a WHOLE-RUN mean (includes the %.0fs one-time @enter load), so it\n"+
+			"      understates steady-state GPU fill and makes this K pessimistic for AWS.\n", m.M.EnterSeconds)
+	}
 	return b.String(), nil
+}
+
+// occScopeLabel renders the occupancy window for the verdict line.
+func (m *Model) occScopeLabel() string {
+	switch m.M.OccupancyScope {
+	case "inference":
+		return "inference window; the one-time load is priced separately via enter"
+	case "", "whole_run":
+		return "WHOLE-RUN mean — includes the one-time model load"
+	default:
+		return m.M.OccupancyScope
+	}
 }
 
 func ladder(at int) []int {

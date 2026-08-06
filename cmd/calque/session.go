@@ -219,9 +219,12 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 	}
 
 	// Drive the test over SSM on the HELD instance (image already pulled). The
-	// host-side occupancy JSON (with true DCGM SM-activity) lands at occKey.
+	// host-side occupancy JSON (with true DCGM SM-activity) lands at occKey, and its
+	// raw timestamped samples at occSamplesKey — the host sampler is outside warmd's
+	// container, so the INFERENCE-WINDOW re-average (#71) happens here, not in warmd.
 	occKey := rungBase + "/occupancy-host.json"
-	cmd := calexec.TestRunCommand("vllm/vllm-openai:latest", hostWorkerDir, o.region, o.bucket, layout.ManifestKey, o.model, layout.LogKey, occKey)
+	occSamplesKey := rungBase + "/occupancy-host.jsonl"
+	cmd := calexec.TestRunCommand("vllm/vllm-openai:latest", hostWorkerDir, o.region, o.bucket, layout.ManifestKey, o.model, layout.LogKey, occKey, occSamplesKey)
 	fmt.Printf("[N=%d] running warmd-in-docker over SSM (model load once, %d items)...\n", n, n)
 	// SSM RunShellScript blocks until the command finishes or the timeout; give it
 	// room for model load (~2min) + N generations.
@@ -239,11 +242,12 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 		return fmt.Errorf("no summary for rung N=%d", n)
 	}
 	var summary struct {
-		EnterSeconds float64              `json:"enter_seconds"`
-		EnterCount   int                  `json:"enter_count"`
-		PerItemSecs  []float64            `json:"per_item_secs"`
-		Failed       []int                `json:"failed"`
-		Occupancy    calexec.OccupancyRaw `json:"occupancy"`
+		EnterSeconds   float64              `json:"enter_seconds"`
+		EnterCount     int                  `json:"enter_count"`
+		PerItemSecs    []float64            `json:"per_item_secs"`
+		Failed         []int                `json:"failed"`
+		Occupancy      calexec.OccupancyRaw `json:"occupancy"`
+		InferenceSpans []calexec.Span       `json:"inference_spans"`
 	}
 	_ = json.Unmarshal(summaryBytes, &summary)
 	// Prefer the HOST-sampled occupancy (has true DCGM SM-activity; dcgmi isn't in
@@ -252,12 +256,40 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 	if hb, hok := calexec.TryGetSummary(ctx, s3c, o.bucket, occKey); hok {
 		var hostOcc calexec.OccupancyRaw
 		if json.Unmarshal(hb, &hostOcc) == nil && hostOcc.Measured {
+			if hostOcc.Scope == "" {
+				hostOcc.Scope = calexec.ScopeWholeRun // host summary is a whole-life mean
+			}
 			summary.Occupancy = hostOcc
 		}
+	}
+	// Re-average the HOST samples over warmd's inference spans (#71): the sampler's
+	// own mean spans the ~200s @enter model load, so it understates steady-state fill
+	// and moves the wrong way as inference speeds up. Falls back to the labeled
+	// whole-run mean whenever windowing isn't possible — a weaker number that says so,
+	// never a fabricated one.
+	wholeRun := summary.Occupancy
+	if sb, sok := calexec.TryGetSummary(ctx, s3c, o.bucket, occSamplesKey); sok && len(summary.InferenceSpans) > 0 {
+		samples := calexec.ParseOccSamples(sb)
+		if windowed, wok := calexec.OccupancyInWindows(samples, summary.InferenceSpans, wholeRun.IntervalS); wok {
+			summary.Occupancy = windowed
+		} else {
+			fmt.Fprintf(os.Stderr, "[N=%d] NOTE: no host occupancy samples fell in the inference window "+
+				"(%d parsed, %d span(s)); using the WHOLE-RUN mean (load-contaminated)\n", n, len(samples), len(summary.InferenceSpans))
+		}
+	} else if len(summary.InferenceSpans) == 0 {
+		fmt.Fprintf(os.Stderr, "[N=%d] NOTE: warmd reported no inference spans (older worker image?); "+
+			"occupancy is the WHOLE-RUN mean and includes the @enter load\n", n)
 	}
 	results, missing, _ := calexec.Collect(ctx, s3c, o.bucket, layout.ResultPrefix, n)
 	fmt.Printf("[N=%d] @enter x%d (%.1fs), %d/%d results (%d missing), occupancy %s\n",
 		n, summary.EnterCount, summary.EnterSeconds, len(results), n, len(missing), occStr(summary.Occupancy))
+	fmt.Printf("[N=%d]   %s\n", n, calexec.OccScopeNote(summary.Occupancy))
+	// Show BOTH scopes when they differ, so the load-vs-fill split is visible rather
+	// than replaced. A large gap is the signal that load dominates this rung.
+	if wholeRun.Measured && wholeRun.MeanOccupancy != nil && summary.Occupancy.Scope == calexec.ScopeInference {
+		fmt.Printf("[N=%d]   (whole-run mean was %.0f%% — the difference IS the one-time %.0fs model load)\n",
+			n, *wholeRun.MeanOccupancy*100, summary.EnterSeconds)
+	}
 
 	// Emit K for this rung.
 	pi := measure.Aggregate(summary.PerItemSecs)
@@ -270,6 +302,7 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o session
 		CardAskedFor: "H100", InstanceUsed: o.instance, SecPerItem: pi.MeanSecs,
 		Occupancy: occFrac, SampleItems: pi.Count, AWSRateMeasured: awsMeasured,
 		AcquireSeconds: acq.TimeToAcquire().Seconds(), EnterSeconds: summary.EnterSeconds,
+		OccupancyScope: summary.Occupancy.ScopeOrWholeRun(),
 	}}
 	if v, verr := model.Verdict(100000); verr == nil {
 		fmt.Printf("[N=%d] --- crossover K ---\n%s", n, v)
