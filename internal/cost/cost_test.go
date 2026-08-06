@@ -172,4 +172,10 @@ func TestVerdictLabelsOccupancyScope(t *testing.T) {
 	if !strings.Contains(v3, "WHOLE-RUN") {
 		t.Errorf("unlabeled occupancy must default to the WHOLE-RUN label, got:\n%s", v3)
 	}
+	// ...and must carry the same pessimism warning as an explicitly-labeled one. The
+	// dry-run path leaves scope empty, so without this the most-run command in the
+	// tool printed "WHOLE-RUN mean" with no word on which way it biases K.
+	if !strings.Contains(v3, "pessimistic for AWS") {
+		t.Errorf("unlabeled occupancy must warn like whole_run does, got:\n%s", v3)
+	}
 }

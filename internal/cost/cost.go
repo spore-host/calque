@@ -235,9 +235,26 @@ func (m *Model) Verdict(atItems int) (string, error) {
 	// A whole-run occupancy double-counts the load idle (once in P, once in
 	// EnterSeconds), so K comes out pessimistic for AWS. Say so rather than letting
 	// the reader assume the occupancy figure means steady-state fill (#71).
-	if m.M.OccupancyScope != "" && m.M.OccupancyScope != "inference" {
-		fmt.Fprintf(&b, "NOTE: occupancy is a WHOLE-RUN mean (includes the %.0fs one-time @enter load), so it\n"+
-			"      understates steady-state GPU fill and makes this K pessimistic for AWS.\n", m.M.EnterSeconds)
+	// Note the "" case deliberately: an unlabeled scope IS a whole-run mean (that's
+	// what pre-#71 samplers and the dry-run stand-in produce), and occScopeLabel
+	// already renders it as one. Suppressing the warning only when the scope is
+	// unlabeled would print "WHOLE-RUN mean" with no explanation of which way it
+	// biases K — the exact reading this note exists to prevent.
+	if m.M.OccupancyScope != "inference" {
+		// Name the load's cost only when we measured one: "the 0s one-time load" reads
+		// as a bug, and in the dry-run path (where enter is a CPU stand-in) there is no
+		// honest number to quote.
+		// %.0f would render a sub-second load as "0s", which reads as a bug rather than
+		// a measurement, so keep a digit of precision below 1s.
+		load := "the one-time @enter load"
+		switch {
+		case m.M.EnterSeconds >= 1:
+			load = fmt.Sprintf("the %.0fs one-time @enter load", m.M.EnterSeconds)
+		case m.M.EnterSeconds > 0:
+			load = fmt.Sprintf("the %.2gs one-time @enter load", m.M.EnterSeconds)
+		}
+		fmt.Fprintf(&b, "NOTE: occupancy is a WHOLE-RUN mean (includes %s), so it\n"+
+			"      understates steady-state GPU fill and makes this K pessimistic for AWS.\n", load)
 	}
 	return b.String(), nil
 }
