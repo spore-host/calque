@@ -123,3 +123,53 @@ func mustModalAWS(t *testing.T, m *Model, n int) (pair, pair) {
 	}
 	return pair{md.Dollars, aw.Dollars}, pair{}
 }
+
+// TestVerdictLabelsOccupancyScope proves K declares WHICH window its occupancy came
+// from (#71). The same 45% means two different things depending on scope, and a
+// whole-run figure additionally double-counts the load idle (once as low occupancy,
+// again as EnterSeconds) — so the verdict must warn that such a K is pessimistic for
+// AWS rather than let the reader assume steady-state fill.
+func TestVerdictLabelsOccupancyScope(t *testing.T) {
+	r := loadTestRates(t)
+	base := Measured{
+		CardAskedFor: "H100", InstanceUsed: "g7e.2xlarge",
+		SecPerItem: 0.5, Occupancy: 0.45, SampleItems: 1000,
+		AcquireSeconds: 20, EnterSeconds: 210,
+	}
+
+	wholeRun := base
+	wholeRun.OccupancyScope = "whole_run"
+	v, err := (&Model{Rates: r, M: wholeRun}).Verdict(100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(v, "WHOLE-RUN") {
+		t.Errorf("whole-run K must label its occupancy window, got:\n%s", v)
+	}
+	if !strings.Contains(v, "pessimistic for AWS") {
+		t.Errorf("whole-run K must warn it is pessimistic for AWS (load idle double-counted), got:\n%s", v)
+	}
+
+	infer := base
+	infer.OccupancyScope = "inference"
+	v2, err := (&Model{Rates: r, M: infer}).Verdict(100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(v2, "inference window") {
+		t.Errorf("inference-scoped K must say so, got:\n%s", v2)
+	}
+	if strings.Contains(v2, "pessimistic for AWS") {
+		t.Errorf("inference-scoped K must NOT carry the whole-run caveat, got:\n%s", v2)
+	}
+
+	// An UNLABELED measurement (pre-#71 artifact) must read as whole-run, never be
+	// silently presented as an inference-window number.
+	v3, err := (&Model{Rates: r, M: base}).Verdict(100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(v3, "WHOLE-RUN") {
+		t.Errorf("unlabeled occupancy must default to the WHOLE-RUN label, got:\n%s", v3)
+	}
+}

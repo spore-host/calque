@@ -14,9 +14,19 @@ Runs as a sidecar next to warmd/runner.py on the acquired instance. warmd starts
 it at @enter and signals stop when the drain completes; the summary is written to
 S3 alongside results so `measure` can fold it into the cost model.
 
+TIMESTAMPS (#71): every JSONL sample carries `ts`, the tick's START as a unix
+epoch float. Without it the only occupancy anyone could compute was the mean over
+the sampler's WHOLE life — which spans the one-time model load, so a fast workload
+paradoxically reported LOW occupancy (batch-32 measured 2% while running 24x
+faster). With `ts`, the control plane windows the samples to the inference span
+warmd reports, and occupancy answers the question readers think it answers: "while
+the GPU was doing the work, how full was it?" The whole-run mean is still emitted
+(`scope: whole_run`) for back-compat and comparison.
+
 Usage:
   occupancy.py sample --interval 1.0 --out /tmp/occ.jsonl   # runs until SIGTERM
   # on stop, prints: {"mean_occupancy":0.83,"samples":420,"source":"nvidia-smi",...}
+  # each --out line: {"ts":1753800000.12,"nvsmi_util":0.41,"nvsmi_sm":0.44,"dcgm_sm":0.82}
 """
 
 from __future__ import annotations
@@ -107,26 +117,44 @@ class Sampler:
                     pass
         return sum(vals) / len(vals) if vals else None
 
-    def _sample_once(self) -> None:
+    def _sample_once(self) -> dict[str, float | None]:
+        """Sample every available source once. Returns THIS tick's values (None for a
+        metric that didn't report), and appends the ones that did to the series.
+
+        The returned dict is what goes in the JSONL — it must be this tick's real
+        readings, not `series[-1]`. The old code wrote the last-known value, so a
+        collector that missed a tick silently duplicated a stale sample into the
+        stream; windowed means (#71) are computed from that stream, so a stale repeat
+        would be a fabricated measurement inside the window.
+        """
+        tick: dict[str, float | None] = {k: None for k in self.series}
         if self.have["nvsmi"]:
             u = self._nvsmi_util()
             if u is not None:
                 self.series["nvsmi_util"].append(u)
+                tick["nvsmi_util"] = u
             sm = self._dmon_sm("nvidia-smi")
             if sm is not None:
                 self.series["nvsmi_sm"].append(sm)
+                tick["nvsmi_sm"] = sm
         if self.have["dcgmi"]:
             d = self._dmon_sm("dcgmi")
             if d is not None:
                 self.series["dcgm_sm"].append(d)
+                tick["dcgm_sm"] = d
+        return tick
 
     def run(self) -> dict:
         out_f = open(self.out_path, "w", encoding="utf-8") if self.out_path else None
         while not self._stop:
-            self._sample_once()
+            # Stamp the tick's START before sampling: the sample describes the GPU
+            # from here forward (the collectors themselves take ~0.1-1s). The control
+            # plane windows on this to exclude the @enter load (#71).
+            ts = time.time()
+            tick = self._sample_once()
             if out_f:
-                last = {k: (v[-1] if v else None) for k, v in self.series.items()}
-                out_f.write(json.dumps(last) + "\n")
+                tick["ts"] = ts
+                out_f.write(json.dumps(tick) + "\n")
                 out_f.flush()
             time.sleep(self.interval)
         if out_f:
@@ -148,7 +176,7 @@ class Sampler:
                 break
         primary = means[primary_key] if primary_key else None
         return {
-            "mean_occupancy": primary,        # fraction [0,1] — K uses this (best available)
+            "mean_occupancy": primary,        # fraction [0,1], WHOLE-RUN mean (see scope)
             "occupancy_source": primary_key or "none",  # which metric fed mean_occupancy
             "metrics": means,                 # ALL metrics, for comparison/audit
             "metric_samples": counts,
@@ -156,6 +184,12 @@ class Sampler:
             "samples": counts.get(primary_key, 0) if primary_key else 0,
             "interval_s": self.interval,
             "measured": primary is not None,  # feeds K's measured|proxy flag
+            # scope names WHAT WINDOW this mean covers. The sampler lives for the whole
+            # run — including the one-time @enter model load — so its own mean is
+            # load-contaminated and must NOT be read as steady-state GPU fill (#71).
+            # The control plane recomputes an inference-window mean from the timestamped
+            # JSONL and labels that one scope="inference".
+            "scope": "whole_run",
         }
 
     def stop(self, *_):

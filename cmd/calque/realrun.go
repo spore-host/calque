@@ -225,7 +225,8 @@ func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.Occupanc
 		InstanceUsed: o.instance,
 		PerItem:      pi,
 		Occupancy: measure.OccupancySummary{
-			MeanOccupancy: occ.MeanOccupancy, Samples: occ.Samples, Source: occ.Source, Measured: occ.Measured,
+			MeanOccupancy: occ.MeanOccupancy, Samples: occ.Samples, Source: occ.Source,
+			Measured: occ.Measured, Scope: occ.ScopeOrWholeRun(),
 		},
 		AcquiredAt: acq.AcquiredAt, TerminatedAt: time.Now(), EnterSeconds: enterSec,
 		AcquireWaitSeconds: acq.TimeToAcquire().Seconds(),
@@ -236,6 +237,7 @@ func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.Occupanc
 		CardAskedFor: m.CardAskedFor, InstanceUsed: m.InstanceUsed, SecPerItem: pi.MeanSecs,
 		Occupancy: occFrac, SampleItems: pi.Count, AWSRateMeasured: awsMeasured,
 		AcquireSeconds: m.AcquireWaitSeconds, EnterSeconds: enterSec,
+		OccupancyScope: m.Occupancy.ScopeOrWholeRun(),
 	}}
 	fmt.Println("\n--- crossover K (§9) — MEASURED on real GPU ---")
 	verdict, err := model.Verdict(100000)
@@ -252,6 +254,7 @@ func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.Occupanc
 	} else {
 		fmt.Printf("This K is grounded in a REAL measured run: %d items @ %.3fs/item, %.0f%% occupancy on %s.\n",
 			pi.Count, pi.MeanSecs, occFrac*100, o.instance)
+		fmt.Printf("  %s\n", calexec.OccScopeNote(occ))
 	}
 	return nil
 }

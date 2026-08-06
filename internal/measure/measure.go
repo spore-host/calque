@@ -24,6 +24,20 @@ type OccupancySummary struct {
 	Source        string   `json:"source"` // dcgm | nvidia-smi | none
 	IntervalS     float64  `json:"interval_s"`
 	Measured      bool     `json:"measured"`
+	// Scope is the averaging window: "inference" (item work only) or "whole_run"
+	// (includes the one-time @enter load, understating steady-state fill). Carried
+	// through to K's output so the number is labeled, not implicit (#71).
+	Scope string `json:"scope,omitempty"`
+}
+
+// ScopeOrWholeRun defaults an unlabeled scope to "whole_run" — what pre-#71
+// summaries contained. Conservative: never claim inference-window accuracy we
+// don't have.
+func (o OccupancySummary) ScopeOrWholeRun() string {
+	if o.Scope == "" {
+		return "whole_run"
+	}
+	return o.Scope
 }
 
 // PerItem aggregates the per-item wall-clock series warmd collected.

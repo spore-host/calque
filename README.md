@@ -143,6 +143,13 @@ The per-capability detail follows; nothing is removed, only sequenced under the 
   on-demand (~18 with a Savings Plan); verdict at 100k = **CROSS**.
 - N=1: same load amortized over one item → 5% occupancy → **STAY ON MODAL**.
 
+> **Occupancy scope (#71):** those occupancy percentages are `whole_run` means — averaged over
+> the *whole* rung including the one-time model load, so they understate steady-state GPU fill
+> and are not recomputable (those runs' samples were not timestamped). Occupancy now carries an
+> explicit `scope` (`inference` vs `whole_run`); see
+> [`docs/measured-runs/README.md`](docs/measured-runs/README.md). Per-item seconds, load times,
+> and the verdicts are unaffected.
+
 The N=1↔N=100 contrast is the phase detector working: same code, same model, honest verdict at each
 scale (§9). Getting real inference end-to-end surfaced five genuine deployment findings, each caught
 fast and fixed: worker dir `/opt`→`/tmp`, docker needs `sudo`, IMDSv2 hop-limit 2 for container creds,

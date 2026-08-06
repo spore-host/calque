@@ -77,7 +77,14 @@ func (p SessionPrep) PrepCommand(artifactPrefix string) string {
 // warmd-in-docker against a specific manifest. The instance is already prepped
 // (image pulled), so this is just the container run. Output goes to a per-run log
 // uploaded to S3. warmd writes results + summary to S3 as before.
-func TestRunCommand(baseImage, workerDir, region, bucket, manifestKey, modelEnv, logKey, occKey string) string {
+//
+// occSamplesKey (#71) uploads the sampler's RAW timestamped JSONL, not just its
+// summary. It's needed because in this path the sampler runs on the HOST (for dcgmi)
+// while warmd runs in the container: warmd therefore cannot see these samples and
+// cannot do its own inference-window re-average. The control plane does it instead,
+// pairing this stream with the inference spans warmd reports in its summary. Empty
+// key => no upload (the whole-run mean stays the only number, labeled as such).
+func TestRunCommand(baseImage, workerDir, region, bucket, manifestKey, modelEnv, logKey, occKey, occSamplesKey string) string {
 	wd := workerDir
 	if wd == "" {
 		wd = "/tmp/calque"
@@ -113,8 +120,14 @@ func TestRunCommand(baseImage, workerDir, region, bucket, manifestKey, modelEnv,
 			"kill -TERM $OCC 2>/dev/null || true",
 			"wait $OCC 2>/dev/null || true",
 			fmt.Sprintf("aws s3 cp /tmp/calque-occ.json s3://%s/%s || true", bucket, occKey),
-			"exit $RC",
 		)
+		if occSamplesKey != "" {
+			// Raw per-tick samples: the control plane re-averages these over warmd's
+			// inference spans to get load-free occupancy (#71).
+			lines = append(lines,
+				fmt.Sprintf("aws s3 cp /tmp/calque-occ.jsonl s3://%s/%s || true", bucket, occSamplesKey))
+		}
+		lines = append(lines, "exit $RC")
 	} else {
 		lines = append(lines, "set -e", strings.Join(docker, " "))
 	}

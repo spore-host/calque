@@ -50,13 +50,26 @@ type Manifest struct {
 // Summary is what warmd writes back so the control plane's measure step can fold
 // the ground truth into the cost model.
 type Summary struct {
-	EnterSeconds float64              `json:"enter_seconds"`
-	EnterCount   int                  `json:"enter_count"`
-	PerItemSecs  []float64            `json:"per_item_secs"`
-	Failed       []int                `json:"failed"`
-	Occupancy    calexec.OccupancyRaw `json:"occupancy"`
-	StartedUnix  int64                `json:"started_unix"`
-	EndedUnix    int64                `json:"ended_unix"`
+	EnterSeconds float64   `json:"enter_seconds"`
+	EnterCount   int       `json:"enter_count"`
+	PerItemSecs  []float64 `json:"per_item_secs"`
+	Failed       []int     `json:"failed"`
+
+	// Occupancy is the number K stands on. Since #71 it is the INFERENCE-WINDOW mean
+	// whenever the sampler's timestamped stream allows computing one, with Scope
+	// saying so; OccupancyWholeRun keeps the old load-contaminated mean alongside it
+	// so the two are comparable and nothing is quietly replaced.
+	Occupancy         calexec.OccupancyRaw `json:"occupancy"`
+	OccupancyWholeRun calexec.OccupancyRaw `json:"occupancy_whole_run,omitempty"`
+
+	// InferenceSpans are the windows during which items were processed (one per
+	// drain; a crash-restart adds another). Committed to the summary so the windowing
+	// is auditable after the fact, not just trusted.
+	InferenceSpans   []warm.Span `json:"inference_spans,omitempty"`
+	InferenceSeconds float64     `json:"inference_seconds,omitempty"`
+
+	StartedUnix int64 `json:"started_unix"`
+	EndedUnix   int64 `json:"ended_unix"`
 }
 
 func main() {
@@ -151,15 +164,64 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 		_ = json.Unmarshal([]byte(strings.TrimSpace(occSummaryBuf.String())), &occ)
 	}
 
+	// Recompute occupancy over the INFERENCE WINDOW only (#71). The sampler's own
+	// mean spans its whole life, which includes the one-time @enter model load — so it
+	// understates steady-state fill and, perversely, DROPS when inference gets faster
+	// (batch-32: 24x faster, 2% reported). Re-averaging the timestamped samples inside
+	// warmd's inference spans gives the number the cost model actually wants; the load
+	// is still paid for, via enter_seconds, which K amortizes separately.
+	//
+	// If windowing isn't possible (sampler absent, no timestamps from an older image,
+	// or zero samples landed in the window) we KEEP the whole-run mean and leave Scope
+	// saying whole_run — an unavailable measurement must degrade to a labeled weaker
+	// number, never to a fabricated one.
+	wholeRun := occ
+	if wholeRun.Scope == "" {
+		wholeRun.Scope = calexec.ScopeWholeRun
+	}
+	spans := toExecSpans(sup.InferenceSpans)
+	inferSecs := calexec.SpansSeconds(spans)
+	if occStarted {
+		raw, rerr := os.ReadFile(occOut)
+		switch {
+		case rerr != nil:
+			fmt.Fprintf(os.Stderr, "LEAK[integration_edge] occupancy samples unreadable (%v); "+
+				"occupancy stays WHOLE-RUN (includes the @enter load, understates fill)\n", rerr)
+		default:
+			samples := calexec.ParseOccSamples(raw)
+			if windowed, ok := calexec.OccupancyInWindows(samples, spans, occ.IntervalS); ok {
+				occ = windowed
+			} else {
+				fmt.Fprintf(os.Stderr, "LEAK[unhandled_case] no occupancy samples fell inside the inference "+
+					"window (%d parsed, %d span(s), %.1fs); occupancy stays WHOLE-RUN and is load-contaminated\n",
+					len(samples), len(spans), inferSecs)
+				occ = wholeRun
+			}
+		}
+	}
+
 	summary := Summary{
 		EnterSeconds: sup.EnterSeconds, EnterCount: sup.EnterCount,
-		PerItemSecs: sink.Seconds(), Failed: failed, Occupancy: occ,
+		PerItemSecs: sink.Seconds(), Failed: failed,
+		Occupancy: occ, OccupancyWholeRun: wholeRun,
+		InferenceSpans: sup.InferenceSpans, InferenceSeconds: inferSecs,
 		StartedUnix: started.Unix(), EndedUnix: ended.Unix(),
 	}
 	if err := putJSON(ctx, s3c, man.Bucket, man.SummaryKey, summary); err != nil {
 		return fmt.Errorf("write summary: %w", err)
 	}
 	return runErr
+}
+
+// toExecSpans converts the supervisor's spans to the exec package's shape (the two
+// are deliberately separate types so the worker supervisor doesn't depend on the
+// control-plane cost path).
+func toExecSpans(in []warm.Span) []calexec.Span {
+	out := make([]calexec.Span, len(in))
+	for i, s := range in {
+		out[i] = calexec.Span{StartUnix: s.StartUnix, EndUnix: s.EndUnix}
+	}
+	return out
 }
 
 // --- small S3/URI helpers ---

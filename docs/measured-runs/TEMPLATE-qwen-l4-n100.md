@@ -45,7 +45,8 @@ Paste the run's actual measurement block verbatim:
 @enter_count  = <FILL: expect 1 — warm-once>
 enter_seconds = <FILL: e.g. 102.7>
 per_item      = <FILL: claimed 1.583 s>
-occupancy     = <FILL: claimed 59% — state measured (nvidia-smi/DCGM) + sample count>
+occupancy     = <FILL: value — state metric (DCGM/nvidia-smi), sample count, AND scope>
+occ_scope     = <FILL: "inference" (post-#71, load excluded) | "whole_run" (load included)>
 missing[]     = <FILL: any dropped item indices, or "none">
 ```
 
@@ -63,6 +64,11 @@ Paste the `--- crossover K (§9) ---` block verbatim, then record:
 - **Occupancy metric:** state whether occupancy is nvidia-smi or DCGM SM-activity,
   and the sample count. (Project history notes nvidia-smi can misreport; DCGM is the
   accurate source — record which one this is.)
+- **Occupancy scope (#71):** record the `scope` the run reported. `inference` means the
+  one-time `@enter` load is excluded (what K should stand on); `whole_run` means it is
+  included, which understates steady-state fill and makes K pessimistic for AWS. A
+  figure without its scope is not auditable — the same run reads 45% or 2% depending on
+  the window.
 - **Card substitution:** if this ran on an L4 (`g6.2xlarge`) rather than the intended
   RTX PRO 6000 (g7e) due to capacity, say so — the K is honest for the card it ran on.
 - **`[proxy]` inputs:** list any input flagged proxy rather than measured.
