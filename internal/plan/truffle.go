@@ -10,8 +10,9 @@ package plan
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sort"
+	"strings"
 
 	truffleaws "github.com/spore-host/truffle/pkg/aws"
 	"github.com/spore-host/truffle/pkg/find"
@@ -43,44 +44,46 @@ type Pricer interface {
 }
 
 // TruffleResolver is the offline card->candidates resolver (no AWS creds needed;
-// truffle's ParseQuery + ResolveGPUInstances read a static catalog).
+// truffle's ResolveCard reads a static catalog).
 type TruffleResolver struct {
 	rep *leak.Report
 }
 
 func NewTruffleResolver(rep *leak.Report) *TruffleResolver { return &TruffleResolver{rep: rep} }
 
-// Resolve maps a card name to candidate instance types via truffle. It GUARDS the
-// known `.*` match-all footgun (truffle#90): if truffle resolves nothing, we
-// return an explicit error instead of letting a downstream treat "match
-// everything" as a real answer.
+// Resolve maps a card name to candidate instance types via truffle's strict
+// find.ResolveCard, which returns find.ErrNoMatch rather than falling back to
+// a `.*` match-all pattern (truffle#90). ResolveCard is card-oriented and
+// never match-all by construction, so no separate guard is needed here.
 func (r *TruffleResolver) Resolve(card string) ([]Candidate, error) {
-	pq, err := find.ParseQuery(card)
+	instances, err := find.ResolveCard(card)
 	if err != nil {
-		return nil, fmt.Errorf("truffle ParseQuery(%q): %w", card, err)
-	}
-	instances := pq.ResolveGPUInstances()
-	families := pq.ResolveInstanceFamilies()
-	if len(instances) == 0 {
-		// truffle#90: an unresolved card falls back to a `.*` match-all pattern in
-		// the live search path. We refuse to proceed on a non-resolution.
-		if r.rep != nil {
-			r.rep.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, card, 0,
-				"truffle resolved card %q to NO instances (would fall back to `.*` match-all downstream); refusing", card)
+		if errors.Is(err, find.ErrNoMatch) {
+			if r.rep != nil {
+				r.rep.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, card, 0,
+					"truffle resolved card %q to NO instances: %v", card, err)
+			}
+			return nil, fmt.Errorf("truffle resolved card %q to no instances: %w", card, err)
 		}
-		return nil, fmt.Errorf("truffle resolved card %q to no instances", card)
+		return nil, fmt.Errorf("truffle ResolveCard(%q): %w", card, err)
 	}
-	fam := ""
-	if len(families) > 0 {
-		fam = families[0]
-	}
-	// Deterministic order: truffle returns map-order; sort so plans are stable.
-	sort.Strings(instances)
+	// instances is already sorted by ResolveCard.
 	out := make([]Candidate, 0, len(instances))
 	for _, it := range instances {
-		out = append(out, Candidate{Instance: it, Family: fam})
+		out = append(out, Candidate{Instance: it, Family: instanceFamily(it)})
 	}
 	return out, nil
+}
+
+// instanceFamily extracts the family prefix from an instance type string, e.g.
+// "g7e.2xlarge" -> "g7e". ResolveCard returns bare instance types with no
+// separate family list, so we derive it structurally rather than via a second
+// truffle call.
+func instanceFamily(instance string) string {
+	if i := strings.IndexByte(instance, '.'); i >= 0 {
+		return instance[:i]
+	}
+	return instance
 }
 
 // PickSmallest chooses the smallest candidate instance as the single resolved
