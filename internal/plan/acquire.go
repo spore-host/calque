@@ -184,12 +184,19 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 	}
 }
 
-// --- failure classification (mirrors lagotto watcher.ClassifyFailure) ---
+// --- failure classification (mirrors lagotto pkg/failure) ---
 //
-// We MIRROR lagotto's taxonomy rather than import pkg/watcher, which would drag
-// in DynamoDB/S3/SageMaker/SSM transitively (the poller's deps) for ~30 lines of
+// We MIRROR lagotto's taxonomy rather than import it, which would drag in
+// DynamoDB/S3/SageMaker/SSM transitively (the poller's deps) for ~30 lines of
 // well-defined AWS error codes. The owner blessed keying retry on this in
-// lagotto#73. Source of truth: lagotto/pkg/watcher/failure.go — keep in sync.
+// lagotto#73. Source of truth: lagotto/pkg/failure/failure.go (extracted as a
+// leaf package in lagotto v0.49.0, dependency-light — pkg/watcher now aliases
+// it) — keep in sync. NOTE: terminalCodes below is currently a SUPERSET of
+// lagotto's: ParameterNotFound/AccessDenied(Exception)/ValidationError(Exception)
+// were added here after a real misconfig (spawn's missing GPU AL2023 SSM param)
+// retried silently as "unknown" for a full deadline; lagotto doesn't have them
+// yet (tracked upstream: lagotto#105). Do not blindly resync from lagotto's list
+// without carrying these 5 forward.
 
 type failureKind int
 

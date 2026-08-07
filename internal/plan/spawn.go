@@ -23,10 +23,10 @@ type SpawnLauncher struct {
 	OnComplete string        // "terminate" (default) so the instance dies when the job signals done
 	Username   string        // primary linux user (for pre-stop hook $HOME resolution)
 	Timeout    time.Duration // per-Provision call timeout
-	// AMI pins the machine image. Empty lets spawn auto-select, but spawn's
-	// GetRecommendedAMI resolves a GPU AL2023 SSM parameter that AWS does not
-	// publish (ParameterNotFound) and misdetects g6e/g7/g7e as non-GPU — so for
-	// GPU instances we pin a Deep Learning AMI explicitly. See spawn#356.
+	// AMI pins the machine image. Empty lets spawn auto-select. spawn#356 (GPU
+	// AL2023 SSM param missing g6e/g7/g7e auto-detect) was fixed upstream in
+	// spawn v0.79.0 — auto-select may now be safe for GPU instances, but that's
+	// unverified against a live launch, so we keep pinning until confirmed.
 	AMI string
 	// IMDSv2HopLimit sets the instance metadata hop limit. Set to 2 when warmd
 	// runs inside a docker container so it can reach instance-role creds via IMDS
@@ -96,7 +96,7 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region, az,
 	}
 	return LaunchOutcome{
 		InstanceID:       res.InstanceID,
-		Region:           region, // spawn#351: LaunchResult carries no Region; use ours
+		Region:           region, // res.Region also available since spawn#352; ours is authoritative here
 		AvailabilityZone: res.AvailabilityZone,
 		PublicIP:         res.PublicIP,
 		State:            res.State,
