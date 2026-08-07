@@ -17,3 +17,6 @@ __pycache__/
 
 # stray build artifact from `go build ./cmd/warmd`
 /warmd
+/warm-runner
+/spored-runner
+/calque
