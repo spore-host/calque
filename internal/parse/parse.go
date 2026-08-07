@@ -151,6 +151,13 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	// if there are several we take the first deterministically and leak the ambiguity.
 	app.Image = resolveImage(out, script, rep)
 
+	// calque#76: a function/class's image=<var> kwarg may reference a name the AST
+	// walker never resolved to an Image chain (e.g. built via a factory function
+	// rather than a direct `x = modal.Image....` assignment). resolveImage() above
+	// silently picks whatever DID resolve in that case — loudly flag every such
+	// dangling reference so the pick isn't mistaken for the function's real image.
+	flagUnresolvedImageRefs(out, script, rep)
+
 	// How is each callable invoked? (spec §13: "where .map() is called", §C: the
 	// other sync idioms .starmap/.for_each/.remote). The target of a call like
 	// `Chat().generate.map(...)` is the trailing attribute ("generate"); we key by
@@ -272,6 +279,64 @@ func mergeConfig(dst, src ir.Config) ir.Config {
 		dst.Region = src.Region
 	}
 	return dst
+}
+
+// decodeImageRef decodes a decorator's image=<var> kwarg, emitted by pyast as
+// {"__ref__": "<varname>"} for a plain name reference. Returns ("", false) for
+// any other shape (e.g. an inline chain or non-literal), which readConfigKwargs
+// already leaks separately via the "image" no-op case.
+func decodeImageRef(raw json.RawMessage) (string, bool) {
+	var ref struct {
+		Ref string `json:"__ref__"`
+	}
+	if err := json.Unmarshal(raw, &ref); err != nil || ref.Ref == "" {
+		return "", false
+	}
+	return ref.Ref, true
+}
+
+// flagUnresolvedImageRefs walks every function/class-level decorator's image=
+// kwarg and leaks loudly when it names a variable that never resolved to an
+// Image chain in out.Images (calque#76). Without this, resolveImage()'s pick
+// (whatever chain DID resolve, possibly for a wholly different function) is
+// silently substituted with no signal that the reference was dangling.
+func flagUnresolvedImageRefs(out pyOut, script string, rep *leak.Report) {
+	check := func(owner string, decos []pyDecorator) {
+		for _, d := range decos {
+			raw, ok := d.Kwargs["image"]
+			if !ok {
+				continue
+			}
+			ref, ok := decodeImageRef(raw)
+			if !ok {
+				continue // inline chain or non-literal; not this check's concern
+			}
+			if _, resolved := out.Images[ref]; !resolved {
+				rep.Addf(leak.PrimImage, leak.KindSemanticGap, script, d.Lineno,
+					"%s: image=%s did not resolve to a known Image chain (built via a factory function, or another pattern the AST walker doesn't see through); the app image picked above may NOT be %s's real image", owner, ref, owner)
+			}
+		}
+	}
+	for _, f := range out.Functions {
+		check(f.Name, f.Decorators)
+	}
+	for _, c := range out.Classes {
+		check(c.Name, classDecorators(c))
+		for _, m := range c.Methods {
+			check(c.Name+"."+m.Name, m.Decorators)
+		}
+	}
+}
+
+// classDecorators synthesizes a pyDecorator carrying a @cls's kwargs, so
+// flagUnresolvedImageRefs can treat class-level and function-level image=
+// checks uniformly. cls_kwargs has no decorator name/lineno of its own in the
+// wire contract, so the class's own line stands in.
+func classDecorators(c pyClass) []pyDecorator {
+	if len(c.ClsKwargs) == 0 {
+		return nil
+	}
+	return []pyDecorator{{Kwargs: c.ClsKwargs, Lineno: c.Lineno}}
 }
 
 func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {

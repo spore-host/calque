@@ -166,6 +166,41 @@ func TestParsePortableConfig(t *testing.T) {
 	}
 }
 
+// TestParseFactoryBuiltImageIsFlagged (calque#76): a function whose image=<var>
+// references an Image built by a factory function (never resolved to a chain by
+// the AST walker) must get a loud leak naming it — never silently inherit
+// whatever OTHER image happened to resolve, with no signal anything went wrong.
+func TestParseFactoryBuiltImageIsFlagged(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/factory_image.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	// render_image resolves directly, so it's the one app.Image should carry.
+	if app.Image.Base != "debian_slim" {
+		t.Errorf("app.Image.Base = %q, want debian_slim (render_image)", app.Image.Base)
+	}
+	foundGPUImageLeak := false
+	foundRenderImageLeak := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "gpu_work") && strings.Contains(l.Detail, "did not resolve") {
+			foundGPUImageLeak = true
+		}
+		if strings.Contains(l.Detail, "render:") && strings.Contains(l.Detail, "did not resolve") {
+			foundRenderImageLeak = true
+		}
+	}
+	if !foundGPUImageLeak {
+		t.Errorf("gpu_work's factory-built image=_gpu_image should leak as unresolved; leaks=%+v", rep.Leaks)
+	}
+	if foundRenderImageLeak {
+		t.Errorf("render's directly-resolved image=render_image must NOT leak; leaks=%+v", rep.Leaks)
+	}
+}
+
 // TestParseServeEntryKind (F1): serve decorators are detected and carried onto the
 // IR as EntryServe, so the run path can gate/leak them instead of crashing.
 func TestParseServeEntryKind(t *testing.T) {
