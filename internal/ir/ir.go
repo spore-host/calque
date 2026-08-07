@@ -8,13 +8,13 @@ package ir
 
 // App is a whole Modal application, transcribed from its decorators.
 type App struct {
-	Name       string            // modal.App("name")
-	Image      Image             // resolved image for the app (see parse.resolveImage)
-	Volumes    map[string]string // module-level Volume var name -> Modal volume name (from_name)
-	Functions  []Function        // @app.function
-	Classes    []Class           // @app.cls
-	Entrypoint *Function         // @app.local_entrypoint (nil if none)
-	Script     string            // source path, for leak attribution (§10)
+	Name        string            // modal.App("name")
+	Image       Image             // resolved image for the app (see parse.resolveImage)
+	Volumes     map[string]string // module-level Volume var name -> Modal volume name (from_name)
+	Functions   []Function        // @app.function
+	Classes     []Class           // @app.cls
+	Entrypoints []Function        // @app.local_entrypoint (may be more than one)
+	Script      string            // source path, for leak attribution (§10)
 }
 
 // Image is the .image DSL chain (§13). Base+Pip cover the common case called out

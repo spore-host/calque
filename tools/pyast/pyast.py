@@ -223,7 +223,7 @@ class Collector(ast.NodeVisitor):
         self.app_name: str | None = None
         self.functions: list[dict[str, Any]] = []
         self.classes: list[dict[str, Any]] = []
-        self.entrypoint: dict[str, Any] | None = None
+        self.entrypoints: list[dict[str, Any]] = []
         self.images: dict[str, Any] = {}       # varname -> image chain
         self.volumes: dict[str, Any] = {}       # varname -> {from_name: str, lineno}
         self.map_calls: list[dict[str, Any]] = []  # every `.map(` occurrence
@@ -296,7 +296,7 @@ class Collector(ast.NodeVisitor):
         decos = self._decos(node)
         leaves = {d.rsplit(".", 1)[-1] for d in decos}
         if any(d.endswith("local_entrypoint") for d in decos):
-            self.entrypoint = _describe_fn(self.src, node)
+            self.entrypoints.append(_describe_fn(self.src, node))
         elif any(d.endswith("function") for d in decos) or (leaves & _SERVE_DECOS):
             # A serve entrypoint (§F) may carry @app.function too, or only the serve
             # decorator — collect it either way so its entry_kind reaches the IR.
@@ -353,7 +353,7 @@ def analyze(path: str) -> dict[str, Any]:
         "volumes": c.volumes,
         "functions": c.functions,
         "classes": c.classes,
-        "entrypoint": c.entrypoint,
+        "entrypoints": c.entrypoints,
         "map_calls": c.map_calls,
         "invoke_calls": c.invoke_calls,
         "volume_writes": c.volume_writes,

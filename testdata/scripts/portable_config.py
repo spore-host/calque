@@ -5,6 +5,13 @@ pass-through: the portable kwargs (cpu/memory/retries/region) that should land i
 ir.Config, an autoscaling kwarg (keep_warm) that must be recognized-and-leaked as
 behind-the-seam (§4/§1, M10-S1), and the synchronous invocation idioms
 (.starmap / .for_each / .remote) that should be classified beyond plain .map.
+
+`bin_pack` additionally exercises cpu=(request, limit) — the same
+request/limit tuple convention Modal also allows for memory= (calque#77).
+
+Two @app.local_entrypoint()s (`main`, `secondary`) exercise a script with
+more than one local entrypoint — a real pattern (calque#78) that must not
+silently collapse to just one.
 """
 
 import modal
@@ -24,6 +31,11 @@ def combine(a, b):
     return a + b
 
 
+@app.function(cpu=(0.25, 1))
+def bin_pack(x):
+    return x
+
+
 @app.local_entrypoint()
 def main():
     # .map — items -> results (already supported)
@@ -34,3 +46,8 @@ def main():
     transform.for_each(range(10))
     # .remote — a single blocking call
     combine.remote(5, 6)
+
+
+@app.local_entrypoint()
+def secondary():
+    bin_pack.remote(1)

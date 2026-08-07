@@ -137,6 +137,33 @@ func TestParsePortableConfig(t *testing.T) {
 	if !foundAutoscale {
 		t.Errorf("keep_warm= should be recognized+leaked as behind-the-seam; leaks=%+v", rep.Leaks)
 	}
+	// cpu=(request, limit): the request (first) element lands in Config.CPU, and
+	// the dropped limit must be leaked, mirroring memory=[request,limit] (calque#77).
+	bp := app.Functions[byName["bin_pack"]]
+	if bp.Config.CPU != 0.25 {
+		t.Errorf("bin_pack.Config.CPU = %v, want 0.25 (request element of cpu=(0.25,1))", bp.Config.CPU)
+	}
+	foundCPULeak := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "cpu=[request,limit]") {
+			foundCPULeak = true
+		}
+	}
+	if !foundCPULeak {
+		t.Errorf("cpu=(request,limit) should leak the dropped limit; leaks=%+v", rep.Leaks)
+	}
+	// Two @app.local_entrypoint()s in one script must both survive (calque#78) —
+	// neither the pyast collector nor the IR may collapse to just one.
+	if len(app.Entrypoints) != 2 {
+		t.Fatalf("Entrypoints = %d, want 2 (main, secondary)", len(app.Entrypoints))
+	}
+	epNames := map[string]bool{}
+	for _, ep := range app.Entrypoints {
+		epNames[ep.Name] = true
+	}
+	if !epNames["main"] || !epNames["secondary"] {
+		t.Errorf("Entrypoints = %v, want {main, secondary}", epNames)
+	}
 }
 
 // TestParseServeEntryKind (F1): serve decorators are detected and carried onto the

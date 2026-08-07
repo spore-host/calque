@@ -309,8 +309,8 @@ func analyze(scripts []string) error {
 		corpus.NoGPU += c.NoGPU
 
 		fmt.Printf("=== %s (app %q) ===\n", filepath.Base(s), app.Name)
-		fmt.Printf("  functions=%d classes=%d entrypoint=%v image.base=%q pip=%v\n",
-			len(app.Functions), len(app.Classes), app.Entrypoint != nil, app.Image.Base, app.Image.Pip)
+		fmt.Printf("  functions=%d classes=%d entrypoints=%d image.base=%q pip=%v\n",
+			len(app.Functions), len(app.Classes), len(app.Entrypoints), app.Image.Base, app.Image.Pip)
 		for _, sub := range log.Subs {
 			// Every clean swap resolves its instance via the seam, never inlined.
 			line := ""

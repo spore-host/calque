@@ -195,8 +195,10 @@ func serveApp(app ir.App) bool {
 			return true
 		}
 	}
-	if app.Entrypoint != nil && app.Entrypoint.EntryKind == ir.EntryServe {
-		return true
+	for _, ep := range app.Entrypoints {
+		if ep.EntryKind == ir.EntryServe {
+			return true
+		}
 	}
 	return false
 }

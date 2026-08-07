@@ -28,7 +28,7 @@ type pyOut struct {
 	Volumes      map[string]pyVolume `json:"volumes"`
 	Functions    []pyFunc            `json:"functions"`
 	Classes      []pyClass           `json:"classes"`
-	Entrypoint   *pyFunc             `json:"entrypoint"`
+	Entrypoints  []pyFunc            `json:"entrypoints"`
 	MapCalls     []pyMapCall         `json:"map_calls"`
 	InvokeCalls  []pyInvokeCall      `json:"invoke_calls"`
 	VolumeWrites []pyVolumeWrite     `json:"volume_writes"`
@@ -163,9 +163,8 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	for _, c := range out.Classes {
 		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes))
 	}
-	if out.Entrypoint != nil {
-		fn := buildFn(*out.Entrypoint, script, rep, invokes)
-		app.Entrypoint = &fn
+	for _, ep := range out.Entrypoints {
+		app.Entrypoints = append(app.Entrypoints, buildFn(ep, script, rep, invokes))
 	}
 
 	// E3: volume.commit()/reload() call sites. A volume that's WRITTEN (not just
@@ -403,9 +402,17 @@ func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner
 					"%s: volumes= not a {str:str} map (%s)", owner, string(raw))
 			}
 		case "cpu":
-			// cpu= may be an int or float (cores). Accept either.
+			// cpu= is cores (int or float) in Modal; a [request, limit] list also
+			// occurs (mirrors memory=) — take the request (first) element and leak
+			// the limit we don't model.
 			if f, ok := decodeFloat(raw); ok {
 				cfg.CPU = f
+			} else if lst, ok := decodeFloatList(raw); ok && len(lst) > 0 {
+				cfg.CPU = lst[0]
+				if len(lst) > 1 {
+					rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, script, line,
+						"%s: cpu=[request,limit] — using request %g cores; the limit is not enforced", owner, lst[0])
+				}
 			}
 		case "memory":
 			// memory= is MB (int) in Modal; a [request, limit] list also occurs — take
@@ -496,6 +503,14 @@ func decodeFloat(raw json.RawMessage) (float64, bool) {
 
 func decodeIntList(raw json.RawMessage) ([]int, bool) {
 	var xs []int
+	if err := json.Unmarshal(raw, &xs); err == nil {
+		return xs, true
+	}
+	return nil, false
+}
+
+func decodeFloatList(raw json.RawMessage) ([]float64, bool) {
+	var xs []float64
 	if err := json.Unmarshal(raw, &xs); err == nil {
 		return xs, true
 	}
