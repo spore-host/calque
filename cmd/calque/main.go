@@ -137,12 +137,16 @@ func realCmd(args []string) error {
 	ttl := fs.String("ttl", "40m", "instance TTL hard cap")
 	deadlineMin := fs.Int("deadline-min", 40, "give up acquiring/waiting after N minutes")
 	rates := fs.String("rates", "config/rates.json", "rate table path")
+	pool := fs.Bool("pool", false, "submit to the existing model pool (via `calque pool create --model M`) instead of self-acquiring a dedicated instance (calque#103)")
 	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *bucket == "" || *runID == "" || *ami == "" {
-		return fmt.Errorf("usage: calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] --i-understand-this-spends-money")
+	if *bucket == "" || *runID == "" {
+		return fmt.Errorf("usage: calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
+	}
+	if !*pool && *ami == "" {
+		return fmt.Errorf("--ami is required unless --pool is set (a pool's workers already have an AMI baked in at `calque pool create` time)")
 	}
 	if !*confirm {
 		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money")
@@ -153,6 +157,12 @@ func realCmd(args []string) error {
 	opts := realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
+	}
+	if *pool {
+		if *shards > 1 {
+			return fmt.Errorf("--pool and --shards>1 are mutually exclusive: a pool submission is one claim against one already-provisioned pool, not a fleet acquisition")
+		}
+		return realRunViaPool(opts)
 	}
 	// shards>1 fans out across a fleet (§15); shards<=1 is the single-instance path.
 	return fleetRun(opts, *shards)
@@ -241,7 +251,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque analyze <script.py> [...]")
 	fmt.Fprintln(os.Stderr, "  calque run [--n N] [--region R] [--dry-run] <script.py>")
 	fmt.Fprintln(os.Stderr, "  calque smoke --bucket B --run-id ID [--region R] [--ttl 30m] --i-understand-this-spends-money")
-	fmt.Fprintln(os.Stderr, "  calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] [--rungs 1,100,1000] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque pool create --model M --instance-type T --manifest-bucket B --results-bucket B --runner-path P [--workers N] --i-understand-this-spends-money")
 }

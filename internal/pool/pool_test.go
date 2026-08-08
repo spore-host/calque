@@ -115,9 +115,10 @@ type fakeResults struct {
 }
 
 type writtenSummary struct {
-	man     calexec.Manifest
-	failed  []int
-	warmHit bool
+	man              calexec.Manifest
+	failed           []int
+	warmHit          bool
+	enterSecondsPaid float64
 }
 
 func (f *fakeResults) Sink(_ calexec.Manifest) warm.Sink {
@@ -128,13 +129,13 @@ func (f *fakeResults) Sink(_ calexec.Manifest) warm.Sink {
 	return s
 }
 
-func (f *fakeResults) WriteSummary(_ context.Context, man calexec.Manifest, failed []int, warmHit bool) error {
+func (f *fakeResults) WriteSummary(_ context.Context, man calexec.Manifest, failed []int, warmHit bool, enterSecondsPaid float64) error {
 	if f.writeErr != nil {
 		return f.writeErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.summaries = append(f.summaries, writtenSummary{man: man, failed: failed, warmHit: warmHit})
+	f.summaries = append(f.summaries, writtenSummary{man: man, failed: failed, warmHit: warmHit, enterSecondsPaid: enterSecondsPaid})
 	return nil
 }
 
@@ -266,6 +267,16 @@ func TestWorker_StaysWarmAcrossClaims(t *testing.T) {
 	}
 	if !results.summaries[1].warmHit {
 		t.Error("second claim's summary reports warmHit=false, want true (it reused the resident runner)")
+	}
+	// calque#103: EnterSecondsPaid must be >0 for the load-triggering claim
+	// and exactly 0 for the claim that reused the resident runner — this is
+	// the number a submitter feeds into cost.Measured.EnterSeconds for a
+	// warm-hit run (near-zero, not the pool's original load time).
+	if results.summaries[0].enterSecondsPaid <= 0 {
+		t.Errorf("first claim's EnterSecondsPaid = %v, want >0 (it paid the load)", results.summaries[0].enterSecondsPaid)
+	}
+	if results.summaries[1].enterSecondsPaid != 0 {
+		t.Errorf("second claim's EnterSecondsPaid = %v, want 0 (it paid no load)", results.summaries[1].enterSecondsPaid)
 	}
 }
 

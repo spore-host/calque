@@ -72,13 +72,15 @@ type ResultWriter interface {
 	// batch — implementations key it by the manifest's own Bucket/ResultPrefix
 	// so concurrent claims' results never collide.
 	Sink(man calexec.Manifest) warm.Sink
-	// WriteSummary persists the claim's completion record (failed indices,
-	// plus warmHit — calque#102: was the resident runner already warm and
-	// loaded when this claim was served, or did this claim pay a fresh
-	// acquire+@enter?) so a submitter polling man.SummaryKey (via
-	// calexec.WaitForSummary, reused unmodified) observes the claim as done
-	// AND knows which fixed-cost regime to feed cost.Measured.WarmHit with.
-	WriteSummary(ctx context.Context, man calexec.Manifest, failed []int, warmHit bool) error
+	// WriteSummary persists the claim's completion record so a submitter
+	// polling man.SummaryKey (via calexec.WaitForSummary, reused unmodified)
+	// observes the claim as done AND knows which fixed-cost regime to feed
+	// cost.Measured with (calque#102/#103): warmHit — was the resident
+	// runner already warm when this claim was served; enterSecondsPaid —
+	// the @enter cost THIS claim actually paid (0 on a warm hit; the
+	// measured load time on a miss, since the runner just reloaded to serve
+	// it).
+	WriteSummary(ctx context.Context, man calexec.Manifest, failed []int, warmHit bool, enterSecondsPaid float64) error
 }
 
 // Queue is the slice of spawn's taskpool.Queue this package needs — an
@@ -208,8 +210,11 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 	// claim arrived" (calque#102's WarmHit), not "is it warm now" (DrainBatch
 	// always leaves it warm on a clean drain, which would make every claim
 	// after the pool's first look like a hit regardless of whether IT paid a
-	// reload after a crash).
+	// reload after a crash). enterCountBefore lets us detect the (rarer) case
+	// where a claim STARTED warm but a mid-drain crash forced a reload anyway —
+	// that claim did pay for a load even though it wasn't a cold-start claim.
 	wasWarm := w.Supervisor.IsWarm()
+	enterCountBefore := w.Supervisor.EnterCount
 	if !wasWarm {
 		w.Supervisor.Config = warm.Config{EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg}
 	}
@@ -226,7 +231,18 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 		return
 	}
 
-	if serr := w.Results.WriteSummary(ctx, man, failed, wasWarm); serr != nil {
+	// A load happened during THIS claim if EnterCount advanced, regardless of
+	// whether the claim started warm (covers the started-warm-but-crashed-
+	// mid-drain case above). warmHit (reported to the submitter) is about
+	// whether the claim STARTED warm — those are different questions: a claim
+	// can start warm, crash once, and still have paid a partial reload cost.
+	paidLoad := w.Supervisor.EnterCount > enterCountBefore
+	enterSecondsPaid := 0.0
+	if paidLoad {
+		enterSecondsPaid = w.Supervisor.EnterSeconds
+	}
+
+	if serr := w.Results.WriteSummary(ctx, man, failed, wasWarm, enterSecondsPaid); serr != nil {
 		// Wrote results (if any landed before this point they're already in the
 		// sink) but couldn't signal completion. Leave un-acked: a redelivery
 		// re-drains against the (still warm, unaffected) resident runner and

@@ -128,10 +128,17 @@ check needed.
   against an already-warm `warmd` process from a prior claim), which is
   directly observable via `warmd`'s own `EnterCount` (`warmd.go:160`,
   already incremented once per actual `@enter` call).
-- **#103** (`--pool` flag wiring): submission logic is now just "does a pool
-  named `<name>` exist and match this run's model → submit a `PoolClaimRef`
-  to `PoolQueueName(model)`; else fall back to `Acquirer.Acquire`," no
-  cross-model routing decision to build.
+- **#103 (done)** — `calque real --pool` submits the run's manifest to
+  `OpenPoolQueue(model)` and waits on the SAME `calexec.WaitForSummary`
+  every other run path already uses, then folds the claim's own reported
+  `Summary.WarmHit`/`EnterSecondsPaid` into `cost.Model` (not a fresh
+  acquisition's numbers) — the honest fixed cost for a pool-submitted run is
+  whatever the CLAIM paid, per #102. `--pool` and `--shards>1` are mutually
+  exclusive (a pool submission is one claim against an already-provisioned
+  pool, not a fleet acquisition); `--ami` is not required in `--pool` mode
+  (the pool's workers already have one baked in at `calque pool create`
+  time). Occupancy sampling in pool mode is explicitly out of scope for this
+  pass — flagged in the emitted K's notes, not silently omitted.
 
 ## Explicitly deferred (not blocking M12)
 
