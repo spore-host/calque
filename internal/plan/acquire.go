@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/aws/smithy-go"
+
+	"github.com/spore-host/lagotto/pkg/failure"
 
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/target"
@@ -68,7 +69,22 @@ type Progress func(attempt int, code, detail string, waited time.Duration)
 // failure, retries with backoff until it lands or the deadline passes — the
 // block-and-wait posture (§5). This is the lean path the spore.host owner blessed
 // in lagotto#73 (Provision + ClassifyFailure), avoiding lagotto's DynamoDB
-// dependency. When watcher.Snipe ships, it swaps in behind this same interface.
+// dependency.
+//
+// lagotto's own leaf extraction of this exact shape now exists —
+// lagotto/pkg/snipe.Snipe, shipped in v0.52.0 (lagotto#106) — but is not yet a
+// drop-in replacement: Snipe hardcodes spawnaws.NewClient(ctx) (default
+// credential-chain region) with no way to inject a region-pinned client, which
+// every one of calque's 7 Acquirer call sites needs (spawn#276: using the
+// wrong region can resolve AMIs/AZs/identity incorrectly). Filed upstream as
+// lagotto#111. Re-evaluate deleting this whole type once that's fixed — this
+// is the largest remaining deletion opportunity in this package (~100 lines),
+// but per the original audit's own guidance, do not attempt piecemeal.
+//
+// classify() below (the failure-taxonomy half of this file) HAS already been
+// migrated to delegate to lagotto/pkg/failure directly (lagotto#105, fixed in
+// v0.52.0/#108) — that swap needed no client-injection story, since
+// ClassifyFailure takes only an error.
 type Acquirer struct {
 	Launcher     Launcher
 	Report       *leak.Report
@@ -184,19 +200,32 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 	}
 }
 
-// --- failure classification (mirrors lagotto pkg/failure) ---
+// --- failure classification (delegates to lagotto/pkg/failure) ---
 //
-// We MIRROR lagotto's taxonomy rather than import it, which would drag in
-// DynamoDB/S3/SageMaker/SSM transitively (the poller's deps) for ~30 lines of
-// well-defined AWS error codes. The owner blessed keying retry on this in
-// lagotto#73. Source of truth: lagotto/pkg/failure/failure.go (extracted as a
-// leaf package in lagotto v0.49.0, dependency-light — pkg/watcher now aliases
-// it) — keep in sync. NOTE: terminalCodes below is currently a SUPERSET of
-// lagotto's: ParameterNotFound/AccessDenied(Exception)/ValidationError(Exception)
-// were added here after a real misconfig (spawn's missing GPU AL2023 SSM param)
-// retried silently as "unknown" for a full deadline; lagotto doesn't have them
-// yet (tracked upstream: lagotto#105). Do not blindly resync from lagotto's list
-// without carrying these 5 forward.
+// Previously calque MIRRORED lagotto's taxonomy locally rather than importing
+// it, reasoning that importing pkg/failure would drag in the poller's
+// DynamoDB/S3/SageMaker/SSM dependency tree. That reasoning no longer holds:
+// pkg/failure was extracted as a genuinely dependency-light leaf in lagotto
+// v0.49.0 (imports only smithy-go + spawn/pkg/launchererr), confirmed via
+// `go list -deps` — and since calque already imports spawn (which transitively
+// pulls in nearly everything pkg/failure's own module would add), adopting it
+// here adds exactly ZERO new third-party dependency weight beyond the leaf
+// package itself. lagotto#105 (the 5-code gap this file used to carry as a
+// "superset" caveat) shipped in lagotto v0.52.0 (#108) — calque's local table
+// and lagotto's are now byte-for-byte identical, so the caveat no longer
+// applies either. Source of truth is now lagotto/pkg/failure/failure.go
+// directly, not a local mirror.
+//
+// Adopting pkg/failure is also a real bug fix, not just deduplication: its
+// ClassifyFailure additionally recognizes spawn#220's post-launch-teardown
+// case (errors.Is(err, launchererr.ErrPostLaunch) → terminal), which calque's
+// old local classify() never handled — a RunInstances call that SUCCEEDED but
+// was torn back down by a downstream step (e.g. ephemeral FSx setup failing)
+// used to fall through to the AWS-error-code switch and misclassify.
+//
+// failureKind stays a local type (test-facing, per-call-site readable names)
+// mapped 1:1 from failure.FailureKind, so acquire.go's own callers/tests are
+// unaffected by the swap.
 
 type failureKind int
 
@@ -207,65 +236,38 @@ const (
 	failureUnknown // unrecognized code: retry, but only a bounded number of times
 )
 
-var capacityCodes = map[string]bool{
-	"InsufficientInstanceCapacity":         true,
-	"InsufficientHostCapacity":             true,
-	"InsufficientReservedInstanceCapacity": true,
-	"InsufficientCapacity":                 true,
-	"Server.InsufficientInstanceCapacity":  true,
-	"SpotMaxPriceTooLow":                   true,
-}
-
-var terminalCodes = map[string]bool{
-	"InstanceLimitExceeded":        true,
-	"VcpuLimitExceeded":            true,
-	"MaxSpotInstanceCountExceeded": true,
-	"InvalidAMIID.NotFound":        true,
-	"InvalidAMIID.Malformed":       true,
-	"UnauthorizedOperation":        true,
-	"AuthFailure":                  true,
-	"InvalidParameterValue":        true,
-	"InvalidParameterCombination":  true,
-	"InvalidSubnetID.NotFound":     true,
-	"InvalidGroup.NotFound":        true,
-	"Unsupported":                  true,
-	// Config/setup errors surfaced by spawn's pre-launch steps (AMI resolution via
-	// SSM, IAM). These will NEVER resolve by waiting — retrying them just masks a
-	// misconfiguration as a capacity wait (observed: spawn's GPU AL2023 SSM param
-	// doesn't exist, yielding ParameterNotFound on every g6/g7 attempt).
-	"ParameterNotFound":     true,
-	"AccessDenied":          true,
-	"AccessDeniedException": true,
-	"ValidationError":       true,
-	"ValidationException":   true,
+// fromLagottoKind maps lagotto/pkg/failure's FailureKind onto calque's own
+// failureKind — a straight 1:1 translation, kept as a named function (not
+// inlined at the one call site) so a future FailureKind addition upstream is
+// a compile error here, not a silent fallthrough to failureUnknown.
+func fromLagottoKind(k failure.FailureKind) failureKind {
+	switch k {
+	case failure.FailureNone:
+		return failureNone
+	case failure.FailureCapacity:
+		return failureCapacity
+	case failure.FailureTerminal:
+		return failureTerminal
+	case failure.FailureUnknown:
+		return failureUnknown
+	default:
+		return failureUnknown
+	}
 }
 
 // classify returns the failure kind and the AWS error code (for status/logging).
-// Unknown and non-AWS errors default to capacity (retryable): a transient blip
-// shouldn't permanently abort, and the deadline bounds the loop regardless.
+// Delegates entirely to lagotto/pkg/failure.ClassifyFailure; code extraction
+// (for logging) is kept here since ClassifyFailure returns only the kind.
 func classify(err error) (failureKind, string) {
+	kind := fromLagottoKind(failure.ClassifyFailure(err))
 	if err == nil {
-		return failureNone, ""
+		return kind, ""
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
-		code := apiErr.ErrorCode()
-		switch {
-		case capacityCodes[code]:
-			return failureCapacity, code
-		case terminalCodes[code]:
-			return failureTerminal, code
-		case strings.Contains(code, "InsufficientInstanceCapacity"),
-			strings.Contains(code, "InsufficientCapacity"):
-			return failureCapacity, code
-		default:
-			// A recognized AWS error we haven't classified: retry, but bounded — an
-			// unknown code looping for the whole deadline masks a real misconfig as a
-			// capacity wait (the ParameterNotFound lesson).
-			return failureUnknown, code
-		}
+		return kind, apiErr.ErrorCode()
 	}
-	return failureUnknown, "" // non-AWS error (e.g. network): retry, bounded
+	return kind, ""
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

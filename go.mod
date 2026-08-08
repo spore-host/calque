@@ -14,8 +14,9 @@ require (
 	github.com/aws/smithy-go v1.27.3
 	github.com/scttfrdmn/substrate v0.94.0
 	github.com/spore-host/cohort v0.2.0
-	github.com/spore-host/spawn v0.97.0
-	github.com/spore-host/truffle v0.48.0
+	github.com/spore-host/lagotto v0.52.0
+	github.com/spore-host/spawn v0.98.0
+	github.com/spore-host/truffle v0.48.1
 )
 
 require (
@@ -115,7 +116,7 @@ require (
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/spf13/viper v1.21.0 // indirect
-	github.com/spore-host/libs v0.43.2 // indirect
+	github.com/spore-host/libs v0.43.3 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/theupdateframework/go-tuf/v2 v2.4.2 // indirect
 	github.com/transparency-dev/formats v0.1.1 // indirect
