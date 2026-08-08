@@ -31,8 +31,15 @@ the census stays honest.
 - **Cost/latency frontier optimization.** The spike reports one K at measured
   occupancy; it does not search the price/latency Pareto frontier. Attach point:
   `internal/cost`.
-- **MIG partitioning / fractional GPUs.** One card per unit; no slicing. Attach
-  point: `internal/plan` sizing + `internal/gpu` guard.
+- **MIG partitioning / fractional GPUs (institutional, M13).** UPDATED
+  (calque#107): no longer a non-goal for the batch/K spike's own scope, but a
+  real primitive now exists behind `internal/mig` (fixed-layout profile
+  picker + boot-time provisioning script, live-hardware-verified profiles per
+  `docs/gpu-sharing-support-matrix.md`) and `internal/tenancy` (check-out/
+  check-in slice binding, `docs/tenancy-vs-session.md`). Still explicitly
+  deferred: LIVE/dynamic reconfiguration while slices are in use, and
+  cross-slice scheduling when all slices are occupied (falls back to the M12
+  fleet layer acquiring another instance) — see calque#107's own scope.
 - **NEFF / Trainium / Inferentia.** No Neuron path; CUDA/GPU only. Attach point:
   `internal/target` card vocabulary + `internal/image` base.
 - **GPU topology / multi-node / gang scheduling.** The gpu guard (§7) explicitly
