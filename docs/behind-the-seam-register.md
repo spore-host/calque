@@ -40,6 +40,20 @@ the census stays honest.
   deferred: LIVE/dynamic reconfiguration while slices are in use, and
   cross-slice scheduling when all slices are occupied (falls back to the M12
   fleet layer acquiring another instance) — see calque#107's own scope.
+- **Multi-tenant GPU sharing via MPS (institutional, M13).** UPDATED
+  (calque#108): Modal declines any cross-tenant single-GPU sharing (#96) —
+  calque's institutional target can accept the trade for a known/bounded
+  university population, gated loudly behind an explicit opt-in
+  (`internal/mps.RequireOptIn`, mirroring
+  `--i-understand-this-spends-money`'s discipline for a different risk
+  category). MPS gives NO per-client isolation, so the blast-radius policy is
+  CONSERVATIVE by design: `internal/mps.Coordinator` restarts every sibling
+  client sharing an MPS context on ANY one crash, not just the crashed
+  client — implemented, not just documented. Reuses `internal/tenancy`'s
+  check-out/check-in `Registry` unmodified (built generically in #107 for
+  exactly this reuse). Not yet wired into any CLI path — that's process
+  wiring, deferred to a follow-up once a real institutional workload needs
+  it.
 - **NEFF / Trainium / Inferentia.** No Neuron path; CUDA/GPU only. Attach point:
   `internal/target` card vocabulary + `internal/image` base.
 - **GPU topology / multi-node / gang scheduling.** The gpu guard (§7) explicitly
