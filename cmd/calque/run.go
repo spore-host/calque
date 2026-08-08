@@ -22,11 +22,12 @@ import (
 
 // runOpts controls a `calque run` invocation.
 type runOpts struct {
-	script  string
-	n       int
-	region  string
-	dryRun  bool // exercise every stage WITHOUT launching a billable instance
-	ratesFP string
+	script     string
+	n          int
+	region     string
+	dryRun     bool // exercise every stage WITHOUT launching a billable instance
+	ratesFP    string
+	entrypoint string // calque#90: --entrypoint <name>; "" => auto-select if unambiguous
 }
 
 // run wires the full pipeline (spec §3). In --dry-run it stops short of the one
@@ -45,6 +46,22 @@ func run(o runOpts) error {
 		return fmt.Errorf("parse: %w", err)
 	}
 	fmt.Printf("parsed %q: %d classes, %d functions\n", app.Name, len(app.Classes), len(app.Functions))
+
+	// calque#90: mimics `modal run file.py::entrypoint` — validates --entrypoint
+	// against app.Entrypoints (or requires it when the choice is ambiguous) and
+	// reports which one is in play. Does NOT yet change pickWarmUnit's selection
+	// below: calque has no call-site-to-entrypoint attribution (a .map()/.remote()
+	// call site isn't tracked as belonging to one entrypoint's body vs. another's),
+	// so --entrypoint can't steer WHICH callable runs yet — see calque#90's
+	// follow-up for that deeper fix. This pass only closes the "silently ran
+	// whichever pickWarmUnit found, no way to even ask for a different one" gap.
+	epName, err := resolveEntrypoint(app, o.entrypoint)
+	if err != nil {
+		return err
+	}
+	if epName != "" {
+		fmt.Printf("entrypoint: %s (selected)\n", epName)
+	}
 
 	// pick the mapped warm unit (a @cls with @enter whose method is .map'd)
 	unit, ok := pickWarmUnit(app)
@@ -176,6 +193,41 @@ func run(o runOpts) error {
 	fmt.Println("\n--- leak report (§10) ---")
 	rep.Summary(os.Stdout)
 	return nil
+}
+
+// resolveEntrypoint validates --entrypoint against app.Entrypoints, mimicking
+// modal run file.py::entrypoint's selection (calque#90). Returns the selected
+// name ("" if the script has none at all — nothing to select, not an error).
+// Errors if a requested name doesn't exist, or if the choice is ambiguous
+// (2+ entrypoints, none specified) — matching Modal's own "pick one" posture
+// rather than silently running whichever pickWarmUnit happens to find.
+func resolveEntrypoint(app ir.App, requested string) (string, error) {
+	if len(app.Entrypoints) == 0 {
+		if requested != "" {
+			return "", fmt.Errorf("--entrypoint %q requested but %s has no @app.local_entrypoint()", requested, app.Script)
+		}
+		return "", nil
+	}
+	if requested != "" {
+		for _, ep := range app.Entrypoints {
+			if ep.Name == requested {
+				return requested, nil
+			}
+		}
+		names := make([]string, len(app.Entrypoints))
+		for i, ep := range app.Entrypoints {
+			names[i] = ep.Name
+		}
+		return "", fmt.Errorf("--entrypoint %q not found in %s; available: %s", requested, app.Script, strings.Join(names, ", "))
+	}
+	if len(app.Entrypoints) == 1 {
+		return app.Entrypoints[0].Name, nil
+	}
+	names := make([]string, len(app.Entrypoints))
+	for i, ep := range app.Entrypoints {
+		names[i] = ep.Name
+	}
+	return "", fmt.Errorf("%s has multiple entrypoints (%s); pass --entrypoint to select one", app.Script, strings.Join(names, ", "))
 }
 
 // warmUnit is the callable calque actually drives through the warm supervisor:

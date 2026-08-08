@@ -145,3 +145,43 @@ func TestCheckInvokeSupportMapAndRemoteAreFine(t *testing.T) {
 		t.Errorf("map/remote/none must not leak; leaks=%+v", rep.Leaks)
 	}
 }
+
+// TestResolveEntrypointNoneDefined: a script with no @app.local_entrypoint()
+// has nothing to select — not an error, unless one was explicitly requested.
+func TestResolveEntrypointNoneDefined(t *testing.T) {
+	app := ir.App{Script: "s.py"}
+	name, err := resolveEntrypoint(app, "")
+	if err != nil || name != "" {
+		t.Errorf("resolveEntrypoint(no entrypoints, \"\") = (%q, %v), want (\"\", nil)", name, err)
+	}
+	if _, err := resolveEntrypoint(app, "main"); err == nil {
+		t.Error("resolveEntrypoint(no entrypoints, \"main\") should error — nothing to select")
+	}
+}
+
+// TestResolveEntrypointSingleAutoSelects: exactly one entrypoint is selected
+// automatically without --entrypoint (calque#90).
+func TestResolveEntrypointSingleAutoSelects(t *testing.T) {
+	app := ir.App{Script: "s.py", Entrypoints: []ir.Function{{Name: "main"}}}
+	name, err := resolveEntrypoint(app, "")
+	if err != nil || name != "main" {
+		t.Errorf("resolveEntrypoint(1 entrypoint, \"\") = (%q, %v), want (\"main\", nil)", name, err)
+	}
+}
+
+// TestResolveEntrypointAmbiguousRequiresSelection (calque#90): 2+ entrypoints
+// with no --entrypoint must error, mirroring Modal's own "ambiguous, pick one"
+// posture — never silently run whichever pickWarmUnit happens to find.
+func TestResolveEntrypointAmbiguousRequiresSelection(t *testing.T) {
+	app := ir.App{Script: "s.py", Entrypoints: []ir.Function{{Name: "do_train"}, {Name: "do_evaluate"}}}
+	if _, err := resolveEntrypoint(app, ""); err == nil {
+		t.Error("resolveEntrypoint(2 entrypoints, \"\") should error — ambiguous")
+	}
+	name, err := resolveEntrypoint(app, "do_evaluate")
+	if err != nil || name != "do_evaluate" {
+		t.Errorf("resolveEntrypoint(2 entrypoints, %q) = (%q, %v), want (%q, nil)", "do_evaluate", name, err, "do_evaluate")
+	}
+	if _, err := resolveEntrypoint(app, "nonexistent"); err == nil {
+		t.Error("resolveEntrypoint(unknown name) should error")
+	}
+}

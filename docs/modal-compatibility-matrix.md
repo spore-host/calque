@@ -204,7 +204,7 @@ is porting *code*, not managing a Modal workspace.
 
 | Modal command | Purpose | calque equivalent | Gap |
 |---|---|---|---|
-| `modal run <file>[::entrypoint] [args]` | Ephemeral run; `::entrypoint` selects which `@app.local_entrypoint()` to invoke when a file has several; passes through arbitrary CLI args to it. | `calque run [--n N] [--region R] [--dry-run] <script.py>` | ❌ **No `::entrypoint` targeting and no arg passthrough.** Now that calque correctly preserves multiple entrypoints per script (calque#78, closed), it has no way to select *which* one to run or pass it arguments — a real gap for any script whose README says `modal run file.py::specific_fn --foo=bar`. |
+| `modal run <file>[::entrypoint] [args]` | Ephemeral run; `::entrypoint` selects which `@app.local_entrypoint()` to invoke when a file has several; passes through arbitrary CLI args to it. | `calque run [--n N] [--region R] [--dry-run] [--entrypoint NAME] <script.py>` | 🟨 (fixed 2026-08-07, calque#90) `--entrypoint <name>` validates against `app.Entrypoints`, auto-selects when there's exactly one, and requires explicit selection when 2+ exist (mirroring Modal's own "ambiguous, pick one" posture) — verified via live repros for all four cases (none/one/many/wrong-name). Does NOT yet steer which callable `pickWarmUnit` selects ([#98](https://github.com/spore-host/calque/issues/98)) or pass through arguments — both confirmed gaps, not silent ones. |
 | `modal deploy <file>` | Publishes a persistent app (survives disconnect); `--strategy rolling\|recreate`. | none | Legitimate scope difference — AWS has no equivalent to Modal's redeploy-in-place model; calque's execution is closer to always-ephemeral. Not a gap to close, just a documented difference. |
 | `modal serve <file>` | Hot-reload dev server for web endpoints. | none | Follows from calque not building the long-lived server at all (documented non-goal, `docs/serve-architecture.md`) — consistent, not a new gap. |
 | `modal shell [ref]` | Interactive shell inside a container matching a function's image/mounts/volumes, or attaching to a live sandbox. | none | No calque equivalent for interactively debugging a port — worth considering once basic execution-shape gaps (backlog #1-#7) are closed, since debugging-the-port is exactly what an adopter mid-migration needs. |
@@ -280,10 +280,13 @@ a generic "unmodeled arg" message.
    verification, no offline test path.
 10. **`modal.Sandbox`** — tracked, explicitly deferred; different execution
     model entirely. [#89](https://github.com/spore-host/calque/issues/89)
-11. **`calque run --entrypoint <name> [-- args...]`** — mimic `modal run
-    file.py::entrypoint args`; now load-bearing given calque#78 preserves
-    multiple entrypoints per script but has no way to select or pass
-    arguments to one. [#90](https://github.com/spore-host/calque/issues/90)
+11. ~~**`calque run --entrypoint <name>`**~~ — closed (validate+inform
+    scope). [#90](https://github.com/spore-host/calque/issues/90) (closed
+    2026-08-07). Confirmed via a live repro that `--entrypoint` doesn't yet
+    STEER which callable `pickWarmUnit` selects (no call-site-to-entrypoint
+    attribution exists) — tracked as
+    [#98](https://github.com/spore-host/calque/issues/98). Argument
+    passthrough also not attempted.
 12. Lower-priority/rare: `modal.Dict`/`Queue`, `@modal.batched`,
     `modal.NetworkFileSystem`, `modal.CloudBucketMount`, `modal.Cron`/`Period`
     object forms, `cloud=`, `App.include`/`.deploy`/`.run` lifecycle nuances.

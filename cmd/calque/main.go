@@ -79,13 +79,14 @@ func runCmd(args []string) error {
 	region := fs.String("region", "us-west-2", "AWS region for acquisition/pricing")
 	dryRun := fs.Bool("dry-run", true, "exercise every stage without launching a billable instance (default true; real launch is gated)")
 	rates := fs.String("rates", "config/rates.json", "path to the dated rate table")
+	entrypoint := fs.String("entrypoint", "", "which @app.local_entrypoint() to select when the script has more than one (mimics `modal run file.py::entrypoint`, calque#90)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: calque run [--n N] [--region R] [--dry-run] <script.py>")
+		return fmt.Errorf("usage: calque run [--n N] [--region R] [--dry-run] [--entrypoint NAME] <script.py>")
 	}
-	return run(runOpts{script: fs.Arg(0), n: *n, region: *region, dryRun: *dryRun, ratesFP: *rates})
+	return run(runOpts{script: fs.Arg(0), n: *n, region: *region, dryRun: *dryRun, ratesFP: *rates, entrypoint: *entrypoint})
 }
 
 // smokeCmd runs the acquire-only smoke test — the FIRST billable action. Gated
