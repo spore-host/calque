@@ -90,10 +90,10 @@ dropped/buggy (a real gap — should not stay this way) · ⬜ not present at al
 |---|---|---|---|---|---|
 | `Image.debian_slim()` | Default base. | 🔥 | ✅ | — | — |
 | `Image.from_registry(...)` | Pull an existing image; `linux/amd64` required. | 🟡 | ✅ | — | — |
-| `Image.from_dockerfile(...)` | Direct Dockerfile ingestion. | ⚪ | ❌ Recognized as a valid chain-terminating base at the AST layer (`_IMAGE_BASES` in `pyast.py`), but `internal/image/dockerfile.go`'s `resolveBase` ref-extraction loop only special-cases `from_registry`/`from_aws_ecr` — falls through to "unknown image base" and silently defaults to the CUDA runtime base. | A script explicitly providing its own Dockerfile gets a completely different, wrong base image with only a generic leak. | [#84](https://github.com/spore-host/calque/issues/84) |
+| `Image.from_dockerfile(...)` | Direct Dockerfile ingestion. | ⚪ | 🟨 (fixed 2026-08-07, calque#84) `resolveBase` now names the specific unstaged local path in the leak (e.g. `from_dockerfile("./Dockerfile.custom"): calque does not read/stage this local Dockerfile`) instead of the generic "unknown image base" message. Still defaults to CUDA — calque can't read/inline an arbitrary local Dockerfile's content, same limitation as `add_local_*`. | Leak is now specific and actionable; the underlying default-base substitution is unavoidable without local-file staging (a separate, bigger capability). | closed |
 | `Image.from_aws_ecr(...)` | Pull from ECR; `secret=` carries IAM/OIDC. | ⚪ | ✅ + emits an `integration_edge` leak noting IAM pull-permission needs. | — | — |
 | `Image.from_gcp_artifact_registry(...)` | GCP equivalent. | 🧊 | ⬜ | — | not yet filed (low priority) |
-| `Image.micromamba()` | Conda-alternative base. | 🧊 | ❌ Same bug class as `from_dockerfile` — recognized as a base at the AST layer, absent from `dockerfile.go`'s `baseImages` map, silently defaults to CUDA/debian. | — | [#84](https://github.com/spore-host/calque/issues/84) |
+| `Image.micromamba()` | Conda-alternative base. | 🧊 | ✅ (fixed 2026-08-07, calque#84) resolves to `mambaorg/micromamba:latest` (the closest stock equivalent) instead of silently defaulting to CUDA/debian, with a leak noting kwargs like `python_version=` aren't captured by `_walk_image_chain`'s positional-only arg collection. | No GPU/CUDA variant of this base exists — a GPU payload built on it needs its own CUDA install, same limitation Modal's own `micromamba()` base has. | closed |
 | `.pip_install(...)` / `.uv_pip_install(...)` | Package install layers. | 🔥 | ✅ | — | — |
 | `.pip_install_from_requirements(...)` / `.poetry_install_from_file(...)` | File-based install. | ⚪ | ✅ (with a leaked caveat: calque doesn't stage the local file into the build context). | — | — |
 | `.apt_install(...)` / `.run_commands(...)` / `.dockerfile_commands(...)` / `.env(...)` / `.workdir(...)` / `.entrypoint(...)` | Standard Dockerfile-equivalent verbs. | 🔥 | ✅ | — | — |
@@ -252,8 +252,8 @@ a generic "unmodeled arg" message.
    full `.starmap` tuple-splat execution (vs. today's safe refusal) needs a
    real input-data-reading prerequisite, tracked separately as
    [#93](https://github.com/spore-host/calque/issues/93).
-5. **`Image.micromamba()`/`from_dockerfile()` base-resolution bug** — silently
-   wrong default base today. [#84](https://github.com/spore-host/calque/issues/84)
+5. ~~**`Image.micromamba()`/`from_dockerfile()` base-resolution bug**~~ — closed.
+   [#84](https://github.com/spore-host/calque/issues/84) (closed 2026-08-07)
 6. **GPU spec string + fallback-list coverage** — `L40S`, `RTX-PRO-6000`,
    `H200`, `B200`/`B200+`, `B300`, `gpu=[...]` list syntax.
    [#85](https://github.com/spore-host/calque/issues/85)

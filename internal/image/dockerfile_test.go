@@ -151,6 +151,58 @@ func TestFromAwsEcrBase(t *testing.T) {
 	}
 }
 
+// TestMicromambaBase (calque#84): Image.micromamba() is recognized as a base at
+// the AST layer but was falling through to "unknown image base" and silently
+// defaulting to CUDA. Must resolve to a real micromamba base + a leak noting
+// kwargs (python_version=) aren't captured by the parser.
+func TestMicromambaBase(t *testing.T) {
+	rep := &leak.Report{}
+	img := ir.Image{
+		Base:  "micromamba",
+		Steps: []ir.ImageStep{{Method: "micromamba"}},
+	}
+	df, err := Render(Spec{Image: img}, "s.py", rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(df, "nvidia/cuda") {
+		t.Errorf("micromamba() must NOT silently default to the CUDA base\n%s", df)
+	}
+	if !strings.Contains(df, "FROM mambaorg/micromamba") {
+		t.Errorf("micromamba() should resolve to a real micromamba base\n%s", df)
+	}
+	if rep.Len() == 0 {
+		t.Error("micromamba() should leak that kwargs aren't captured by the parser")
+	}
+}
+
+// TestFromDockerfileBase (calque#84): Image.from_dockerfile(path) is recognized as
+// a base at the AST layer but was falling through to "unknown image base" and
+// silently defaulting to CUDA, with no mention of the actual local Dockerfile path.
+func TestFromDockerfileBase(t *testing.T) {
+	rep := &leak.Report{}
+	img := ir.Image{
+		Base:  "from_dockerfile",
+		Steps: []ir.ImageStep{{Method: "from_dockerfile", Args: []string{"./Dockerfile.gpu"}}},
+	}
+	df, err := Render(Spec{Image: img}, "s.py", rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Len() == 0 {
+		t.Fatal("from_dockerfile(...) should leak that the local Dockerfile isn't staged")
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "Dockerfile.gpu") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("leak should name the specific unstaged path; leaks=%+v (df=%s)", rep.Leaks, df)
+	}
+}
+
 // TestLocalCopyStagingLeaks (A3): add_local_* emits a COPY AND a semantic-gap leak
 // (the local path must be staged into the build context, which calque doesn't do).
 func TestLocalCopyStagingLeaks(t *testing.T) {

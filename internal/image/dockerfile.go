@@ -21,8 +21,16 @@ import (
 // we target a CUDA-capable base so the RTX PRO 6000 (g7e) can run the payload.
 var baseImages = map[string]string{
 	"debian_slim": "nvidia/cuda:12.4.1-runtime-ubuntu22.04",
-	// from_registry / from_dockerfile are handled specially (they name their own base)
+	// from_registry / from_dockerfile / from_aws_ecr / micromamba are handled
+	// specially in resolveBase (they name their own base ref, need a leak about
+	// a limitation, or both — §D, calque#84).
 }
+
+// micromambaBase is the closest stock equivalent to Modal's Image.micromamba()
+// conda-alternative base. No GPU/CUDA variant of this image exists — a GPU
+// payload built on it needs its own CUDA install via .apt_install/.run_commands,
+// same as it would on Modal's own micromamba() base (calque#84).
+const micromambaBase = "mambaorg/micromamba:latest"
 
 // Spec is the resolved input for a Dockerfile: the IR image plus the worker glue
 // calque always adds (the warm runner + warmd + a python with the right version).
@@ -176,6 +184,26 @@ func resolveBase(img ir.Image, script string, rep *leak.Report) (string, error) 
 			}
 			return s.Args[0], nil
 		}
+		if s.Method == "from_dockerfile" && len(s.Args) > 0 {
+			// from_dockerfile(path) names a LOCAL Dockerfile — the closest 1:1
+			// mapping to calque's own pipeline, but the referenced file isn't
+			// staged by calque (same limitation as add_local_*/copy_local_* — §D,
+			// calque#84). We can't inline its content sight-unseen, so leak the
+			// requirement rather than silently substitute an unrelated base.
+			rep.Addf(leak.PrimImage, leak.KindSemanticGap, script, 0,
+				"image base from_dockerfile(%q): calque does not read/stage this local Dockerfile — defaulting to CUDA runtime base; the payload's real base/deps may be missing", s.Args[0])
+			return baseImages["debian_slim"], nil
+		}
+	}
+	if img.Base == "micromamba" {
+		// calque#84: micromamba() is a real, distinct base (a conda-alternative,
+		// not CUDA/debian) — was silently defaulting to CUDA with only a generic
+		// "unknown image base" leak. _walk_image_chain only captures POSITIONAL
+		// args (tools/pyast/pyast.py), so a kwarg like python_version= is invisible
+		// here — leak that limitation too, since the emitted base won't reflect it.
+		rep.Addf(leak.PrimImage, leak.KindSemanticGap, script, 0,
+			"image base micromamba(...): mapped to %q; any kwargs (e.g. python_version=) are not captured by the parser and are NOT reflected in this base", micromambaBase)
+		return micromambaBase, nil
 	}
 	rep.Addf(leak.PrimImage, leak.KindUnhandledCase, script, 0,
 		"unknown image base %q; defaulting to CUDA runtime base", img.Base)
