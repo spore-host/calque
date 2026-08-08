@@ -1,0 +1,283 @@
+# Modal compatibility matrix
+
+**Status:** living reference document. calque's goal is broad enough Modal-idiom
+mimicry that real Modal code ports to AWS **unchanged** — not the crossover-K
+measurement (README §9), which is secondary. K is a report to emit when it's
+meaningful, not the gate on whether an idiom is worth supporting.
+
+This document merges three research passes (2026-08-07):
+
+1. **calque's current state** — a full read of `tools/pyast/pyast.py`,
+   `internal/parse/parse.go`, `internal/ir/ir.go`, `internal/gpu/gpu.go`,
+   `internal/gate/*.go`, `internal/image/dockerfile.go`, `cmd/calque/run.go`, and
+   the existing `behind-the-seam-register.md`.
+2. **Modal's documented API surface** — from `modal.com/docs` (guide + SDK
+   reference).
+3. **Real-world frequency** — from `modal-labs/modal-examples` (212 files) plus
+   ~20 independent production repos found via GitHub code search.
+4. **Modal's CLI surface** — from `modal.com/docs/reference/cli/*`, compared
+   against calque's current CLI (`analyze`, `run`, `smoke`, `real`, `session`).
+
+Update this table as gaps close or Modal's docs change — that's cheaper than
+re-deriving the survey every time a new adopter's script surfaces a "new" gap.
+
+**Frequency tiers** (Pass 3, rough real-world prevalence): 🔥 very common (used in
+most apps or nearly universal) · 🟡 common (a first-class, recurring use case) ·
+⚪ minority (recurring but not dominant) · 🧊 rare (a handful of real examples).
+
+**calque status legend:** ✅ fully supported (parsed, represented, acted on) ·
+🟨 recognized-and-leaked (detected, deliberately not honored) · ❌ silently
+dropped/buggy (a real gap — should not stay this way) · ⬜ not present at all.
+
+---
+
+## A. App / module-level constructs
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `modal.App(name, ...)` | Deployment/namespace unit; functions don't run just by being deployed. | 🔥 | ✅ `pyast.py:238-240` → `ir.App.Name` | None known. | — |
+| `App(image=..., secrets=..., volumes=...)` (app-level defaults) | Inherited by every Function/Cls unless overridden. | ⚪ | 🟨 `pyast.py:242-245` — recorded as a helper leak, never wired into `ir.App.Image` etc. | A function relying on the app-level default (not setting its own `image=`) silently gets no image at all in calque today. | not yet filed |
+| `@app.function(...)` | Registers an independently-autoscaled serverless function pool. | 🔥 | ✅ (as config carrier) / see §F for execution-shape gap | — | — |
+| `@app.cls(...)` | Same kwarg surface as `.function`, plus lifecycle hooks + method pooling. | 🔥 | ✅ | — | — |
+| `@app.local_entrypoint(name=None)` | Runs **locally**, not in a container; kicks off `.remote()`/`.map()` calls. Multiple entrypoints need `modal run file.py::fn`. | 🔥 | ✅ (fixed 2026-08-07, calque#78 — multiple entrypoints in one script all preserved) | — | closed |
+| `@app.server(...)` | Registers HTTP-only server classes; no `.remote()` support. | 🧊 | ⬜ | — | not yet filed (low priority) |
+| `App.include(...)` / `.deploy()` / `.run()` | Multi-app composition, deploy strategies, ephemeral-vs-deployed lifecycle. | ⚪ | ⬜ | calque has no concept of "deployed" vs. "ephemeral" — its execution model is closer to always-ephemeral. Real scripts calling `App.run(detach=True)` won't be recognized. | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.Stub` (deprecated → hard error since Modal 1.0) | Old name for `App`. | 🧊 (legacy only) | ⬜ | Any script still using this is already broken against current Modal — not calque's problem. | — |
+
+---
+
+## B. Decorators (function/class shape)
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `@app.function(...)` on a plain function | The base serverless unit. | 🔥 (2x as prevalent as `@app.cls`, 118 vs 57 files in modal-examples) | ❌ **`cmd/calque/run.go` `pickWarmUnit` only accepts a `@cls` with `@enter` — a plain `@app.function` is refused entirely** ("no mapped @cls+@enter warm unit found"). This blocks 100% of the real scripts surveyed (AI-Almanac) and, per earth-mover/forecast-datacube-demo, a whole class of scheduled-pipeline apps that use nothing else. | **Highest-priority gap.** [#80](https://github.com/spore-host/calque/issues/80) |
+| `@app.cls(...)` + `@modal.enter()` (no `.map()`) | Holds loaded state (model, DB connection) for `.remote()`-called or web-endpoint-served inference. | 🟡 (very common in GPU-serving apps, frequently paired with `@asgi_app` rather than `.map()`) | ✅ recognized, but `pickWarmUnit` only *selects* it as the runnable shape when a `.map()`'d method exists or falls back to "first method" — a `@cls`+`@enter` used purely for `.remote()` calls (no `.map()` at all) is still selected via the fallback, so this mostly works today. | — | — |
+| `@app.cls` + `@modal.enter()` + `.map()` (calque's ONLY currently-runnable shape) | "Load model once, batch-score many." | ⚪ (~5-10% of files; plain-function `.map()` is at least as common even among `.map()` users — 16/26 vs 10/26 files) | ✅ | This is not the dominant shape it was built around — see §A row above. | — |
+| `@modal.enter(snap=False)` | Runs once per container at startup, before any input. `snap=True` marks pre-snapshot code (see §I memory snapshots). | 🔥 (wherever `@cls` is used) | ✅ body carried as `ir.Class.EnterBody`, actually run once by `warmd`. `snap=` kwarg itself unrecognized (falls through to generic "unmodeled arg"). | Memory-snapshot semantics (`snap=True` vs default) aren't distinguished — low-risk since calque doesn't do container snapshotting at all. | — |
+| `@modal.exit()` | Runs on container shutdown; gets a grace period on preemption specifically for cleanup. | 🟡 (paired with `@enter` wherever teardown matters) | ❌ **No recognition path at all** in `tools/pyast/pyast.py`'s `visit_ClassDef` — falls into the same untagged-method bucket as an ordinary `@method`, and would be invoked by the warm runner as if it were a normal per-item method. | Silent misclassification, not just an unhonored leak — a real bug. | [#86](https://github.com/spore-host/calque/issues/86) |
+| `@modal.method(is_generator=None)` | Converts an instance method into an invokable Modal Function scoped to the class. | 🔥 (wherever `@cls` is used) | ✅ | `is_generator=` kwarg not specifically recognized. | — |
+| `@modal.batched(max_batch_size=, wait_ms=)` | Dynamic input batching; all inputs/outputs must be equal-length lists; at most one batched method per class. | 🧊 (2/212 files in modal-examples; not found in independent-repo sample) | ⬜ | — | [#91](https://github.com/spore-host/calque/issues/91) |
+| `@modal.concurrent(max_inputs=, target_inputs=None)` | **Replaces the deprecated `allow_concurrent_inputs=N` kwarg** (v0.73.148) — now a separate decorator, not a function kwarg. Sync functions get separate OS threads (must be thread-safe); async get coroutines on one thread. | 🟡 (a common tuning pattern in production) | ⬜ (neither the old kwarg spelling `allow_concurrent_inputs` nor the new decorator is recognized — `autoscalingKwargs` in `internal/parse/parse.go` doesn't include it) | A real script using this decorator gets zero recognition — not even a generic leak, since it's a decorator, not a kwarg calque's decorator-kwarg reader would see. | [#82](https://github.com/spore-host/calque/issues/82) |
+| `@app.batched`/`max_batch_size=` | See `@modal.batched` above (same construct, different framing in the original audit). | 🧊 | ⬜ | — | dup of above |
+| Web decorators: `@modal.fastapi_endpoint` (renamed from `@modal.web_endpoint`, v0.73.89), `@modal.asgi_app()`, `@modal.wsgi_app()`, `@modal.web_server(port)` | Long-lived, request-driven, no fixed N, autoscaling-driven termination — fundamentally different execution model from batch `.map()`. | 🟡 (a first-class use case — own top-level directory in modal-examples, ~19% of files) | 🟨 detected via `_SERVE_DECOS` (matches both old and new decorator names by trailing attribute), sets `entry_kind: "serve"`; `run.go` refuses gracefully with a leak, the long-lived server is never built (by design — see `docs/serve-architecture.md`). | Working as intended per the project's own documented scope decision. | — |
+
+---
+
+## C. Function/class config kwargs
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `gpu=` (single string, e.g. `"H100"`) | Card selection. | 🔥 | ✅ drives the actual clean-swap/flag-multi/flag-couple decision. | — | — |
+| `gpu=` newer type strings: `L40S`, `RTX-PRO-6000`, `H200`, `B200`/`B200+`, `B300` | Card types added since calque's `gpu.go` was written. | 🟡 (growing as newer hardware ships) | ❌ `internal/gpu/gpu.go`'s card vocabulary predates these — a script using them would still parse (card is a bare string, not validated against a known list) but truffle instance-resolution may fail to map them. | Needs verification against current truffle card vocabulary, not just calque's gpu.go. | [#85](https://github.com/spore-host/calque/issues/85) |
+| `gpu="H100:8"` (multi-GPU) | >1 card, same physical machine (NVLink-class). | ⚪ | ✅ `FlagMulti` → refuses (by design, §7 guard). | — | — |
+| `gpu=["H100", "A100-40GB:2"]` (fallback-list syntax) | Modal tries types in list order. | 🧊 | ❌ **Not present at all** — `internal/gpu/gpu.go`'s `ParseSpec` assumes a single string; a list would fail `decodeString` and hit the "gpu= is not a plain string literal" leak, losing the whole fallback-list semantic. | Real scripts using this get a generic leak, not a specific one naming the actual construct. | [#85](https://github.com/spore-host/calque/issues/85) |
+| `cpu=` (plain number or `(request, limit)` tuple) | Physical cores; tuple limit is a throttle, not OOM-kill. | 🔥 | ✅ (fixed 2026-08-07, calque#77 — tuple form now leaks the dropped limit, mirroring `memory=`) | Recorded but not used for instance sizing (deliberate, behind the seam). | closed |
+| `memory=` (plain int MB or tuple) | MiB; tuple limit is a **hard OOM-kill** ceiling (different failure mode than CPU's throttle). | 🔥 | ✅ recorded+leaked correctly. | Same sizing-deferred caveat as `cpu=`. | — |
+| `retries=` (plain int or `modal.Retries(...)`) | Per-input retry cap; plain int = fixed delay, object = exponential backoff. | ⚪ | ✅ (plain int) wired into the warm supervisor's crash-restart cap — a genuine reliability knob that's honored. `Retries(...)` object form: recognized+leaked (falls back to default cap). | Exponential-backoff semantics not reproduced even when leaked — acceptable per behind-the-seam scope. | — |
+| `secrets=` | List of `Secret` objects, injected as env vars in list order (later overrides earlier on key clash). | 🔥 | 🟨 recorded, explicitly NOT injected — leaked clearly ("a payload needing them will fail"). | Working as intended per documented scope. | — |
+| `schedule=` (bare cron string) | — | ⚪ | 🟨 recorded, not honored, leaked. | See §H — the *object* forms (`modal.Cron`/`modal.Period`) aren't recognized at all, only a bare string kwarg. | [#91](https://github.com/spore-host/calque/issues/91) |
+| `region=` / `cloud=` | Placement hints. | ⚪ | 🟨 `region=` recorded+leaked. `cloud=` — **not present at all.** | `cloud=` picks AWS/GCP/OCI — directly load-bearing for calque's own translation story (a script that already says `cloud="aws"` is telling you something calque should probably read). | [#91](https://github.com/spore-host/calque/issues/91) |
+| Autoscaling kwargs, old spellings: `concurrency_limit`, `allow_concurrent_inputs`, `min_containers`, `max_containers`, `keep_warm`, `container_idle_timeout` | Warm-pool/scaling config. | 🟡 | 🟨 explicit named set (`autoscalingKwargs` in `internal/parse/parse.go`), each gets a dedicated "behind the seam" leak. | — | — |
+| Autoscaling kwargs, **current spellings**: `min_containers` (was `keep_warm`), `max_containers` (was `concurrency_limit`), `scaledown_window` (was `container_idle_timeout`), `buffer_containers` | Same knobs, renamed at Modal 1.0 (v0.73.76). | 🟡 (real scripts will use EITHER era depending on when they were written) | ❌ **`autoscalingKwargs` only has the OLD names.** The current spellings fall through to the generic "unmodeled decorator arg" leak instead of the dedicated autoscaling message. | Real post-1.0 scripts get a worse (less specific) leak than pre-1.0 scripts for the exact same semantic concept. | [#82](https://github.com/spore-host/calque/issues/82) |
+| `image=<var>` | Per-function image override. | 🔥 | ✅ structural no-op at the kwarg level; resolved at the app level (`resolveImage`). Dangling refs (e.g. built via a factory function) now loudly leaked (fixed 2026-08-07, calque#76). | — | closed |
+| Non-literal / `**kwargs` splat on any decorator | — | 🧊 | 🟨 generic fallback leak — the safety net; nothing silently dropped at this layer. | — | — |
+
+---
+
+## D. Image DSL
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `Image.debian_slim()` | Default base. | 🔥 | ✅ | — | — |
+| `Image.from_registry(...)` | Pull an existing image; `linux/amd64` required. | 🟡 | ✅ | — | — |
+| `Image.from_dockerfile(...)` | Direct Dockerfile ingestion. | ⚪ | ❌ Recognized as a valid chain-terminating base at the AST layer (`_IMAGE_BASES` in `pyast.py`), but `internal/image/dockerfile.go`'s `resolveBase` ref-extraction loop only special-cases `from_registry`/`from_aws_ecr` — falls through to "unknown image base" and silently defaults to the CUDA runtime base. | A script explicitly providing its own Dockerfile gets a completely different, wrong base image with only a generic leak. | [#84](https://github.com/spore-host/calque/issues/84) |
+| `Image.from_aws_ecr(...)` | Pull from ECR; `secret=` carries IAM/OIDC. | ⚪ | ✅ + emits an `integration_edge` leak noting IAM pull-permission needs. | — | — |
+| `Image.from_gcp_artifact_registry(...)` | GCP equivalent. | 🧊 | ⬜ | — | not yet filed (low priority) |
+| `Image.micromamba()` | Conda-alternative base. | 🧊 | ❌ Same bug class as `from_dockerfile` — recognized as a base at the AST layer, absent from `dockerfile.go`'s `baseImages` map, silently defaults to CUDA/debian. | — | [#84](https://github.com/spore-host/calque/issues/84) |
+| `.pip_install(...)` / `.uv_pip_install(...)` | Package install layers. | 🔥 | ✅ | — | — |
+| `.pip_install_from_requirements(...)` / `.poetry_install_from_file(...)` | File-based install. | ⚪ | ✅ (with a leaked caveat: calque doesn't stage the local file into the build context). | — | — |
+| `.apt_install(...)` / `.run_commands(...)` / `.dockerfile_commands(...)` / `.env(...)` / `.workdir(...)` / `.entrypoint(...)` | Standard Dockerfile-equivalent verbs. | 🔥 | ✅ | — | — |
+| `.add_local_dir/.add_local_file/.add_local_python_source(...)` (renamed from `.copy_local_dir`/`.copy_local_file`/`Mount.from_local_python_packages`, v0.66.40-v0.67.28) | Ship local source into the image. | 🔥 | 🟨 renders a `COPY` line but leaks that calque doesn't stage the local path — build fails unless the caller stages it themselves. | Old names (`copy_local_dir` etc.) aren't in calque's `_IMAGE_STEPS` set at all — a pre-1.0 script using them silently fails the "is this an image chain" heuristic if that's the only step present. | not yet filed (verify old-name coverage) |
+| `modal.Mount` (fully removed at Modal 1.0; `mount=`/`context_mount=`/`copy_mount` all gone) | — | 🧊 (legacy only) | ⬜ | Scripts predating 1.0 may still use this — not worth building for, but worth a dedicated "this construct was removed upstream" leak if seen, rather than a generic one. | not yet filed (low priority) |
+| `.run_function(fn)` | Runs arbitrary Python at build time on a full remote worker (GPU/volumes/secrets available). | 🧊 | 🟨 explicitly not reproduced — leaked, no Dockerfile line emitted. | Correct given no direct AWS-build-time equivalent. | — |
+| Unknown/other `.method(...)` step | — | 🧊 | 🟨 catch-all: Dockerfile comment + leak. | — | — |
+
+---
+
+## E. Volumes / Storage
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `modal.Volume.from_name(...)` + `volumes={mount: vol}` | **Not a live shared filesystem** — snapshot-at-container-start, explicit `.commit()`/`.reload()` for cross-container visibility, last-write-wins on concurrent same-file writes (documented, expected data loss). | 🔥 | ✅ maps to a deterministic S3 prefix, real delta-sync before `@enter`, real end-of-run commit write-back. | calque's model (sync-before-run, commit-after-run) matches Modal's snapshot-at-start semantics reasonably well for the common case; **mid-run `.reload()`** (re-sync during execution) is correctly leaked as unreproduced. | — |
+| `.commit()` / `.reload()` call sites | End-of-run persistence / mid-run re-read. | 🔥 (wherever Volumes are used) | ✅ `.commit()` honored as real end-of-run write-back. 🟨 `.reload()` leaked as unreproduced. | — | — |
+| `modal.NetworkFileSystem` (deprecated, being removed) | **Live-shared** filesystem — no commit/reload cycle, closer to EFS/NFS than Volume's snapshot model. | 🧊 (deprecated, Modal steers users to Volume) | ⬜ | If a real script still uses this, calque's Volume→S3-prefix mapping is the WRONG model (S3 has no live-shared-write semantics) — this would need an EFS-shaped mapping instead, not a Volume-shaped one. | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.CloudBucketMount` | Direct S3/R2/GCS mount via `mountpoint-s3` — no append writes, no seek+write, must open in truncate mode, no rename. | 🧊 | ⬜ | A script using this directly against real S3 is a DIFFERENT (and more restrictive) primitive than Volume — calque's Volume mapping doesn't cover it. | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.Dict` | Distributed KV store, cloudpickle values, 7-day inactivity TTL, capped `.len()` at 100,000. | 🧊 | ⬜ | — | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.Queue` | FIFO **per-partition only**, 24h partition auto-expiry. | 🧊 | ⬜ | — | [#91](https://github.com/spore-host/calque/issues/91) |
+
+---
+
+## F. Invocation idioms
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `.map(iterable, order_outputs=True, return_exceptions=False)` | **`order_outputs=True` by default** — results returned in input order, not completion order (Modal buffers internally). Hard cap 1000 concurrent inputs/call. | ⚪ (real minority even among `.map()` users vs. plain-function `.map()`, but still calque's core supported shape) | ✅ highest-precedence idiom, drives `pickWarmUnit` selection and the actual warm-runner execution. | calque's own spec (§10) already flags the ordering-at-scale question as a leak to watch — this confirms it's a real, documented Modal contract to replicate, not a hypothetical concern. | — |
+| `.starmap(iterable_of_tuples)` | Same as `.map` but tuple-splat args. | 🧊 | ❌ **Classified at the IR layer (`ir.InvokeStarmap`) but not distinguished at execution time.** `pickWarmUnit` only checks `IsMap`; `worker/warm-runner/runner.py` has no tuple-splat code path. If a starmap-invoked callable is ever picked as the warm unit, its tuple-splat semantics are silently NOT reproduced. | Real execution gap, not just an unhonored leak. | [#83](https://github.com/spore-host/calque/issues/83) |
+| `.for_each(iterable, ignore_exceptions=False)` | Side-effect-only, no result collection, but still blocks until all complete. | 🧊 | ❌ Same gap as `.starmap` — classified, not distinguished at execution. | — | [#83](https://github.com/spore-host/calque/issues/83) |
+| `.remote(*args, **kwargs)` | Single blocking call. | 🔥 | 🟨/❌ classified (`ir.InvokeRemote`) but `pickWarmUnit` doesn't consult `Invoke` at all beyond the `IsMap` bool — not distinguished from batch execution downstream. | — | [#83](https://github.com/spore-host/calque/issues/83) |
+| `.local(*args, **kwargs)` | Runs in the CALLER's own process/container — no new container, only locally-available resources apply. | 🧊 (rare — mostly same-class intra-container calls or entrypoint-local testing, NOT general pipeline chaining) | ⬜ **Not present at all** — pyast detects `.commit`/`.reload`/sync-idiom call sites but has no case for `.local`. | A script chaining functions via `.local()` (e.g. `blending_app.py`'s `run_blend` calling `build_lat_lon_intermediates_bundle.local(...)`) gets zero recognition of that call site. | [#81](https://github.com/spore-host/calque/issues/81) |
+| `.spawn(*args, **kwargs)` → `FunctionCall` handle | Non-blocking; `FunctionCall.object_id` is a persistable string, reconstructable via `.from_id()` from a different process; results retrievable for 7 days post-completion. | ⚪ (~7% of files; common at web/bot/CLI boundaries — "trigger and poll") | 🟨 detected, leaked as "async result futures / detach — deferred." | Correct given calque's block-and-wait-only posture (§18 non-goal) — but this is a real, common production pattern, not a rare one; worth a real design pass eventually (see backlog #9), not just a permanent leak. | [#88](https://github.com/spore-host/calque/issues/88) |
+| `.spawn_map(*input_iterators)` | Fire-all without waiting; even Modal itself has no clean in-SDK result-collection API for this yet. | 🧊 | ⬜ | — | not yet filed (low priority — even upstream is unfinished here) |
+| `Function.from_name(...)` / `Cls.from_name(...)` (cross-app invocation) | Look up an already-deployed Function/Cls by name from a separate app/process. | ⚪ in curated examples (~5%) but **structurally essential in real external-consumer production code** — anything outside the defining app must use this. | ⬜ **Not present at all.** | This is the boundary AI-Almanac's `forecasts_app.py` actually uses (`modal.Function.from_name("almanac-blending", ...).remote(...)`) — a real design gap, not a parser oversight; calque doesn't own the "call into an already-deployed separate app" boundary at all today. | [#87](https://github.com/spore-host/calque/issues/87) |
+| `.map.aio(...)` / other `.aio` async variants | Coroutine variant of any blocking method. | ⚪ | 🟨 `.map.aio`/`.starmap.aio` detected, leaked as deferred (same bucket as `.spawn`). Other `.aio` variants (`.remote.aio`, `.get.aio`, etc.) — not specifically detected. | — | not yet filed (low priority, narrow) |
+
+---
+
+## G. Execution shape / entrypoints (calque's own dispatch logic)
+
+| Construct | calque behavior today | Frequency of the underlying real shape | Risk / gap |
+|---|---|---|---|
+| `@cls`+`@enter`+`.map()`'d method | The only shape `pickWarmUnit` (`cmd/calque/run.go`) selects without a fallback heuristic. | ⚪ minority (~5-10% of real scripts) | Working as designed, but the design targets a minority shape. |
+| `@cls`+`@enter`, no `.map()`'d method | Falls back to "first method" — runnable, but an arbitrary pick if there's real ambiguity; no leak for this specific fallback. | 🟡 common | Acceptable for now; could use a leak noting the fallback was used. |
+| `@cls`, no `@enter` | Skipped entirely as a warm-unit candidate; separately leaked ("@cls has no @enter"). | 🧊 | Correct — a class with no warm-load-once body genuinely doesn't fit the model. |
+| Plain `@app.function`, no `@cls` anywhere | **Refused outright** — `run()` returns `fmt.Errorf("no mapped @cls+@enter warm unit found")`. No leak recorded for this top-level "nothing runnable" case (a Go error, not a `leak.Report` entry — wouldn't show up in a leak-census aggregation). | 🔥 **the most common real shape**, and the one blocking every AI-Almanac script | **The headline gap this session's code change addresses.** |
+| Serve-shaped app, no batch warm unit | Detected, leaked as deferred, Bedrock route-away still runs, returns cleanly (no error). | 🟡 | Working as designed — documented non-goal (`docs/serve-architecture.md`). |
+
+---
+
+## H. Scheduling
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `schedule=` bare string kwarg | — | ⚪ | 🟨 recorded, leaked as unhonored (no scheduler in the spike). | — | — |
+| `modal.Cron(cron_string, timezone=None)` | Standard 5-field cron; requires the app to be **deployed** to activate (no effect on ephemeral runs). | ⚪ (~5% of files; when present, OFTEN the entire app — e.g. earth-mover/forecast-datacube-demo uses only plain functions + Cron) | ⬜ Not recognized as a distinct construct — only the bare-string `schedule=` kwarg case is handled, and `modal.Cron(...)` is a call expression, not a literal, so it likely falls into the "unmodeled decorator arg" fallback rather than the dedicated `schedule=` leak. | Real scheduled-pipeline apps (a real, recurring shape per Pass 3) get a worse leak than intended. | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.Period(days=, hours=, ...)` | Fixed-interval, **deployment-anchored, not wall-clock-anchored** — resets on every redeploy. | 🧊 | ⬜ same gap as `modal.Cron`. | — | [#91](https://github.com/spore-host/calque/issues/91) |
+
+---
+
+## I. Networking / Web
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `@modal.fastapi_endpoint` / `@modal.asgi_app` / `@modal.wsgi_app` / `@modal.web_server` | Long-lived, request-driven, autoscaling-terminated — see §B. | 🟡 | 🟨 detected, deferred by design. | — | — |
+| `modal.forward(port, unencrypted=False)` (Tunnels) | Exposes a live container TCP port publicly. | 🧊 | ⬜ | — | not yet filed (low priority) |
+| `modal.Proxy` | Static outbound IP; must be provisioned via Dashboard first, referenced via `.from_name`. | 🧊 | ⬜ | — | not yet filed (low priority) |
+| `cloud=` / `region=` / `routing_region=` | See §C. | ⚪ | 🟨/⬜ partial — see §C row. | — | see §C |
+
+---
+
+## J. Sandboxes
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `modal.Sandbox.create(...)` / `.exec()` / `.terminate()` | **Fundamentally different execution model**: a long-lived, explicitly-managed container (create once, `exec()` repeatedly), no autoscaling/warm-pool abstraction at all — closer to `asyncio.subprocess.Process` than to a Function pool. | 🟡 and **growing** — concentrated in modal-examples but disproportionately common in independent agent/code-execution products (Anthropic, OpenAI, LangChain, PostHog, HF smolagents all use it) | ⬜ **Not present at all.** | Flagged as a real, growing gap — but deliberately NOT attempted in this pass. It's a different execution model from everything calque does today (batch-warm-unit or request-driven-serve); needs its own design pass, not a bolt-on. | [#89](https://github.com/spore-host/calque/issues/89) |
+
+---
+
+## K. Secrets
+
+| Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
+|---|---|---|---|---|---|
+| `secrets=[Secret.from_name(...), ...]` | List of Secret objects, injected as env vars, list-order precedence. | 🔥 | 🟨 see §C — recorded, not injected, clearly leaked. | Working as designed. | — |
+| `Secret.from_dict(...)` / `Secret.from_dotenv(...)` / `Secret.from_local_environ(...)` | Alternate construction forms. | ⚪ | ⬜ (not distinguished from the generic `secrets=` case — all become `{"__unparsed__": ...}` markers at the AST layer) | Low risk — the effect (not injected, leaked) is the same regardless of construction form. | — |
+
+---
+
+## L. Multi-node / clustered (explicit non-goal, confirmed real)
+
+| Construct | Modal semantics | Frequency | calque status |
+|---|---|---|---|
+| `@modal.experimental.clustered(size=N, rdma=False)` | Gang-scheduled multi-node; whole-cluster restart on any single-node preemption. | 🧊 (Beta) | 🟨 the underlying signal (multi-GPU `gpu="H100:8"` + coupling-signal body regex) is exactly what calque's §7 guard flags as `FlagCouple`/`FlagMulti` and refuses. Confirms the guard's target is real and documented — no further action needed; this is explicitly out of scope by design (§1). |
+
+---
+
+## M. CLI surface
+
+Modal's `modal` CLI has a core local-dev triad (`run`/`deploy`/`serve`) plus
+`shell` for interactive debugging, and a long tail of remote resource
+management (`secret`/`volume`/`nfs`/`environment`) and observability
+(`app logs`/`container exec`) commands that are about administering Modal's
+own control plane, not about running code — out of scope for a tool whose job
+is porting *code*, not managing a Modal workspace.
+
+| Modal command | Purpose | calque equivalent | Gap |
+|---|---|---|---|
+| `modal run <file>[::entrypoint] [args]` | Ephemeral run; `::entrypoint` selects which `@app.local_entrypoint()` to invoke when a file has several; passes through arbitrary CLI args to it. | `calque run [--n N] [--region R] [--dry-run] <script.py>` | ❌ **No `::entrypoint` targeting and no arg passthrough.** Now that calque correctly preserves multiple entrypoints per script (calque#78, closed), it has no way to select *which* one to run or pass it arguments — a real gap for any script whose README says `modal run file.py::specific_fn --foo=bar`. |
+| `modal deploy <file>` | Publishes a persistent app (survives disconnect); `--strategy rolling\|recreate`. | none | Legitimate scope difference — AWS has no equivalent to Modal's redeploy-in-place model; calque's execution is closer to always-ephemeral. Not a gap to close, just a documented difference. |
+| `modal serve <file>` | Hot-reload dev server for web endpoints. | none | Follows from calque not building the long-lived server at all (documented non-goal, `docs/serve-architecture.md`) — consistent, not a new gap. |
+| `modal shell [ref]` | Interactive shell inside a container matching a function's image/mounts/volumes, or attaching to a live sandbox. | none | No calque equivalent for interactively debugging a port — worth considering once basic execution-shape gaps (backlog #1-#7) are closed, since debugging-the-port is exactly what an adopter mid-migration needs. |
+| `modal secret`/`volume`/`nfs`/`environment`/`app`/`container`/`profile`/`config`/`token` | Remote resource management, observability, auth. | none | Out of scope by design — these manage Modal's own control plane; calque's job is running code, not administering a Modal workspace. |
+
+---
+
+## Kwarg/API rename table (Modal 1.0 migration, and earlier)
+
+Real scripts in the wild will contain **either era** of spelling depending on
+when they were written. calque should recognize both, routing both to the same
+dedicated leak/behavior rather than letting the newer spelling fall through to
+a generic "unmodeled arg" message.
+
+| Old name | Current name | Introduced | calque recognizes old? | calque recognizes new? |
+|---|---|---|---|---|
+| `keep_warm` | `min_containers` | v0.73.76 | ✅ | ❌ |
+| `concurrency_limit` | `max_containers` | v0.73.76 | ✅ | ❌ |
+| `container_idle_timeout` | `scaledown_window` | v0.73.76 | ✅ | ❌ |
+| `_experimental_buffer_containers` | `buffer_containers` | — | ❌ | ❌ |
+| `allow_concurrent_inputs=N` (kwarg) | `@modal.concurrent(max_inputs=N)` (decorator) | v0.73.148 | ❌ | ❌ |
+| `max_inputs` (old: cap before recycle) | `single_use_containers=True` | — | ❌ | ❌ |
+| `modal.gpu.H100()` (object API) | `gpu="H100"` (string API) | v0.73.31 | n/a — calque only ever supported the string form | — |
+| `.lookup()` | `.from_name()` | v0.72.56 | n/a — calque doesn't call this API itself | — |
+| `.resolve()` | `.hydrate()` | v0.72.39 | n/a | — |
+| `modal.web_endpoint` | `modal.fastapi_endpoint` | v0.73.89 | ✅ (matched by trailing decorator name, catches both) | ✅ |
+| `Image.copy_local_dir`/`copy_local_file` | `Image.add_local_dir`/`add_local_file` | v0.66.40 | ❌ (not in `_IMAGE_STEPS`) | ✅ |
+| `Mount.from_local_python_packages` | `Image.add_local_python_source` | v0.67.28 | n/a (Mount never supported) | ✅ |
+| `modal.Mount` / `mount=` / `context_mount=` / `Image.copy_mount` | `add_local_*` + auto context inference | removed at v1.0 | ⬜ never supported | — |
+| `@modal.build` | `modal.Volume` or `Image.run_function` | v0.72.17 | n/a | ✅ (`run_function` supported, leaked) |
+| Custom `Cls.__init__` | `modal.parameter()` + `@modal.enter` | v0.74.0 | ⬜ `modal.parameter()` not recognized at all | — |
+| `modal.Stub` | `modal.App` | hard error since v1.0 | n/a — scripts using this are already broken upstream | — |
+
+---
+
+## Prioritized backlog (sequenced by Pass 3 frequency, highest-leverage first)
+
+1. **Plain `@app.function` as a runnable warm unit** — closes the actual
+   blocker in calque#79. [#80](https://github.com/spore-host/calque/issues/80)
+   *(this session's code change)*
+2. **`.local()` recognition** — currently zero trace; small once (1) lands.
+   [#81](https://github.com/spore-host/calque/issues/81)
+3. **Newer autoscaling-kwarg spellings + `@modal.concurrent`** — extend the
+   rename coverage above. [#82](https://github.com/spore-host/calque/issues/82)
+4. **`.starmap`/`.for_each`/`.remote` execution parity** — classified at the
+   IR layer, not honored by the warm runner; a real correctness gap.
+   [#83](https://github.com/spore-host/calque/issues/83)
+5. **`Image.micromamba()`/`from_dockerfile()` base-resolution bug** — silently
+   wrong default base today. [#84](https://github.com/spore-host/calque/issues/84)
+6. **GPU spec string + fallback-list coverage** — `L40S`, `RTX-PRO-6000`,
+   `H200`, `B200`/`B200+`, `B300`, `gpu=[...]` list syntax.
+   [#85](https://github.com/spore-host/calque/issues/85)
+7. **`@modal.exit()` recognition** — currently invisible, silently merged
+   into the untagged-method bucket. [#86](https://github.com/spore-host/calque/issues/86)
+8. **`Function.from_name`/`Cls.from_name` cross-app invocation** — real
+   design pass; structurally essential for external consumers per Pass 3.
+   [#87](https://github.com/spore-host/calque/issues/87)
+9. **`.spawn()`+`.get()` fan-out over heterogeneous functions** — related to
+   calque's existing `internal/exec/shard.go` fan-out, but keyed by function
+   identity rather than item index. [#88](https://github.com/spore-host/calque/issues/88)
+10. **`modal.Sandbox`** — tracked, explicitly deferred; different execution
+    model entirely. [#89](https://github.com/spore-host/calque/issues/89)
+11. **`calque run --entrypoint <name> [-- args...]`** — mimic `modal run
+    file.py::entrypoint args`; now load-bearing given calque#78 preserves
+    multiple entrypoints per script but has no way to select or pass
+    arguments to one. [#90](https://github.com/spore-host/calque/issues/90)
+12. Lower-priority/rare: `modal.Dict`/`Queue`, `@modal.batched`,
+    `modal.NetworkFileSystem`, `modal.CloudBucketMount`, `modal.Cron`/`Period`
+    object forms, `cloud=`, `App.include`/`.deploy`/`.run` lifecycle nuances.
+    [#91](https://github.com/spore-host/calque/issues/91)
+
+Not individually filed (genuinely low-priority/narrow; revisit if real usage
+surfaces): `@app.server`, `App.include`-equivalent lifecycle nuances beyond
+what #91 covers, `Image.from_gcp_artifact_registry`, old-name coverage for
+`.copy_local_dir`/`.copy_local_file`, `modal.Mount` (removed upstream too),
+`.spawn_map` (unfinished even in Modal itself), other `.aio` variants beyond
+`.map.aio`/`.starmap.aio`, `modal.forward`/`modal.Proxy`, `modal shell`-
+equivalent interactive debugging.
