@@ -176,6 +176,46 @@ func TestParsePortableConfig(t *testing.T) {
 	if !foundLocalLeak {
 		t.Errorf("bin_pack.local(...) should leak that bin_pack is not in scope; leaks=%+v", rep.Leaks)
 	}
+	// Current-generation autoscaling kwarg spellings (scaledown_window,
+	// buffer_containers) and @modal.concurrent's kwargs (max_inputs) on a plain
+	// function must route through the SAME dedicated autoscaling leak as the
+	// older spellings, not the generic unmodeled-arg fallback (calque#82).
+	wantAutoscale := map[string]bool{"scaledown_window": true, "buffer_containers": true, "max_inputs": true}
+	for _, l := range rep.Leaks {
+		for k := range wantAutoscale {
+			if strings.Contains(l.Detail, `"`+k+`"`) && strings.Contains(l.Detail, "behind the seam") {
+				delete(wantAutoscale, k)
+			}
+		}
+	}
+	if len(wantAutoscale) != 0 {
+		t.Errorf("missing dedicated autoscaling leaks for %v; leaks=%+v", wantAutoscale, rep.Leaks)
+	}
+}
+
+// TestParseConcurrentDecoratorMergesIntoClsKwargs (calque#82): @modal.concurrent
+// stacked on @app.cls is a SEPARATE decorator, not one of @app.cls's own kwargs
+// — its max_inputs/target_inputs must merge into the same leak path as any other
+// autoscaling knob, not vanish because visit_ClassDef only read @app.cls's kwargs.
+func TestParseConcurrentDecoratorMergesIntoClsKwargs(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/concurrent_class.py")
+
+	if _, err := Parse(context.Background(), script, rep, r, args...); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wantAutoscale := map[string]bool{"max_inputs": true, "target_inputs": true}
+	for _, l := range rep.Leaks {
+		for k := range wantAutoscale {
+			if strings.Contains(l.Detail, `"`+k+`"`) && strings.Contains(l.Detail, "behind the seam") {
+				delete(wantAutoscale, k)
+			}
+		}
+	}
+	if len(wantAutoscale) != 0 {
+		t.Errorf("missing dedicated autoscaling leaks for %v (Batcher's @modal.concurrent kwargs); leaks=%+v", wantAutoscale, rep.Leaks)
+	}
 }
 
 // TestParseFactoryBuiltImageIsFlagged (calque#76): a function whose image=<var>

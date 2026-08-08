@@ -16,6 +16,12 @@ silently collapse to just one.
 `combine`'s body calling `bin_pack.local(...)` exercises .local() call-site
 recognition (calque#81) — inline in-container invocation, not a separate
 warm unit.
+
+`scaled` exercises the current-generation autoscaling kwarg spellings
+(`scaledown_window`, `buffer_containers`) and `@modal.concurrent` as a
+standalone decorator on a plain function (calque#82) — both must route
+through the SAME dedicated "behind the seam" leak as the older spellings
+(`keep_warm` etc. on `transform`), not the generic unmodeled-arg fallback.
 """
 
 import modal
@@ -40,6 +46,12 @@ def bin_pack(x):
     return x
 
 
+@modal.concurrent(max_inputs=4)
+@app.function(scaledown_window=60, buffer_containers=2)
+def scaled(x):
+    return x
+
+
 @app.local_entrypoint()
 def main():
     # .map — items -> results (already supported)
@@ -55,3 +67,4 @@ def main():
 @app.local_entrypoint()
 def secondary():
     bin_pack.remote(1)
+    scaled.remote(1)

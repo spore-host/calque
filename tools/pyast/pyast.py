@@ -328,8 +328,20 @@ class Collector(ast.NodeVisitor):
             return
         cls_kwargs: dict[str, Any] = {}
         for d in node.decorator_list:
-            if _decorator_name(d).endswith("cls"):
-                cls_kwargs = _decorator_kwargs(d)
+            name = _decorator_name(d)
+            if name.endswith("cls"):
+                # decorator order in source is not significant here, so merge
+                # rather than overwrite — a separate @modal.concurrent(...) may
+                # have already contributed kwargs below (or will, if it comes
+                # later in decorator_list).
+                cls_kwargs.update(_decorator_kwargs(d))
+            elif name.endswith("concurrent"):
+                # calque#82: @modal.concurrent(max_inputs=, target_inputs=) is a
+                # SEPARATE decorator stacked on @app.cls, not a cls_kwargs entry —
+                # fold its kwargs in so the Go side's autoscaling-leak path sees
+                # them (the decorator itself carries no other calque-visible
+                # config, so merging is safe: no real collision with cls_kwargs).
+                cls_kwargs.update(_decorator_kwargs(d))
         methods: list[dict[str, Any]] = []
         enter: dict[str, Any] | None = None
         for item in node.body:

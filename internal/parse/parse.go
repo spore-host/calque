@@ -449,6 +449,15 @@ var autoscalingKwargs = map[string]bool{
 	"min_containers": true, "max_containers": true, "keep_warm": true,
 	// older Modal spellings seen in the wild:
 	"container_idle_timeout": true, "concurrent_inputs": true,
+	// current spellings (Modal 1.0, v0.73.76+; real scripts contain either era,
+	// calque#82): scaledown_window replaces container_idle_timeout,
+	// buffer_containers was promoted from _experimental_buffer_containers.
+	"scaledown_window": true, "buffer_containers": true,
+	// @modal.concurrent(max_inputs=, target_inputs=) replaced the
+	// allow_concurrent_inputs=N kwarg as a SEPARATE decorator (v0.73.148); pyast
+	// folds its kwargs into the same kwargs map (cls_kwargs, or a function's own
+	// decorator kwargs) so they reach this set like any other autoscaling knob.
+	"max_inputs": true, "target_inputs": true,
 }
 
 // readConfigKwargs pulls gpu/volumes/timeout + the portable Config kwargs
