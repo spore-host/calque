@@ -17,6 +17,30 @@ type App struct {
 	Script      string            // source path, for leak attribution (§10)
 }
 
+// FindFunction looks up a plain @app.function by name (calque#88: correlating
+// a .spawn() call site's target string back to its definition). Linear scan,
+// matching every other app.Functions consumer's style — no name index exists
+// or is warranted at typical script sizes.
+func (a App) FindFunction(name string) (Function, bool) {
+	for _, f := range a.Functions {
+		if f.Name == name {
+			return f, true
+		}
+	}
+	return Function{}, false
+}
+
+// FindClass looks up an @app.cls by name (calque#88), same rationale as
+// FindFunction.
+func (a App) FindClass(name string) (Class, bool) {
+	for _, c := range a.Classes {
+		if c.Name == name {
+			return c, true
+		}
+	}
+	return Class{}, false
+}
+
 // Image is the .image DSL chain (§13). Base+Pip cover the common case called out
 // in §14; Steps carries the full ordered chain losslessly for the Dockerfile
 // generator (§image) so nothing has to be re-parsed downstream.
@@ -74,8 +98,11 @@ const (
 )
 
 // InvokeKind is how a callable is invoked (spec §C). Modal's synchronous
-// (block-and-wait) idioms are all in the spike's scope; async (.spawn/.map.aio)
-// is deferred (M10/S2) and never appears here.
+// (block-and-wait) idioms are all in the spike's scope. .spawn() (calque#88) is
+// CLASSIFIED (so a future block-and-wait fan-out driver can find every spawned
+// callable) but not yet EXECUTED — §18 keeps calque block-and-wait-only, so a
+// spawn-classified callable is still never picked as calque's single warm unit
+// on its own. .map.aio remains purely deferred and never appears here.
 type InvokeKind string
 
 const (
@@ -84,6 +111,7 @@ const (
 	InvokeStarmap InvokeKind = "starmap"  // .starmap(iterable_of_tuples) — tuple-splat args
 	InvokeForEach InvokeKind = "for_each" // .for_each(iterable) — side effects, no result collect
 	InvokeRemote  InvokeKind = "remote"   // .remote(args) — single blocking call
+	InvokeSpawn   InvokeKind = "spawn"    // .spawn(args) — classified only; not yet executed (calque#88, driver: #97)
 )
 
 // Class is an @app.cls: a warm, stateful unit whose @enter body runs once per

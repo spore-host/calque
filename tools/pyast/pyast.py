@@ -280,9 +280,24 @@ class Collector(ast.NodeVisitor):
                 # keep the legacy map_calls channel AND the unified invoke_calls one
                 self.map_calls.append({"target": target, "lineno": node.lineno})
                 self.invoke_calls.append({"target": target, "kind": "map", "lineno": node.lineno})
-            elif attr in self._SYNC_IDIOMS or attr == "spawn":
+            elif attr in self._SYNC_IDIOMS:
                 self.invoke_calls.append(
                     {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno}
+                )
+            elif attr == "spawn":
+                # calque#88: .spawn(args) fires an async call — deferred per §18
+                # (still leaked, block-and-wait only), but the TARGET is now also
+                # classified (ir.InvokeSpawn) so a future fan-out driver can find
+                # every spawned callable. Args captured best-effort (mirrors
+                # from_name's _const_str pattern) for the same future driver's
+                # eventual use — not consumed by anything yet.
+                self.invoke_calls.append(
+                    {
+                        "target": ".".join(_attr_chain(node.func)[:-1]),
+                        "kind": "spawn",
+                        "lineno": node.lineno,
+                        "args": [_const_str(a) for a in node.args],
+                    }
                 )
             elif attr == "local":
                 # calque#81: .local() runs the callee in the CALLER's own process —

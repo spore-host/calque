@@ -16,7 +16,8 @@ the census stays honest.
 | Idiom | Where it's recognized | Leak says |
 |---|---|---|
 | Autoscaling kwargs — `concurrency_limit`, `allow_concurrent_inputs`, `min_containers`, `max_containers`, `keep_warm`, `container_idle_timeout` (S1) | `internal/parse/parse.go` `readConfigKwargs` | "autoscaling/warm-pool config — belongs to the real brain behind the seam (§4), not ported in the spike (§1)" |
-| Async futures — `.spawn()`, `.map.aio()` (S2) | `tools/pyast/pyast.py` `visit_Call` → `parse.invocationKinds` | "async result futures / detach — deferred per §18; the spike is block-and-wait only" |
+| `.map.aio()` async future (S2) | `tools/pyast/pyast.py` `visit_Call` → `parse.invocationKinds` | "async result futures / detach — deferred per §18; the spike is block-and-wait only" |
+| `.spawn()` (S2, calque#88) | `tools/pyast/pyast.py` `visit_Call` → `parse.invocationKinds` | now CLASSIFIED (`ir.InvokeSpawn`, findable via `ir.App.FindFunction`/`FindClass`) but still not executed: "classified but not executed — block-and-wait fan-out … deferred per §18 (calque#97 tracks the driver)" |
 | `secrets=`, `schedule=`, `region=` | `readConfigKwargs` | recorded but NOT honored (§B); a payload that needs them fails visibly |
 | Serve entrypoints (§F/M9) | `pyast` `entry_kind` → `run.go` | "serve shape … execution shape deferred" (see [serve-architecture.md](serve-architecture.md)) |
 | Volume mid-run `reload()` (§E/M8) | `pyast` `volume_writes` → `parse` | "mid-run re-read of a mutated volume is not reproduced" |

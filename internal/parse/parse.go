@@ -211,8 +211,13 @@ func build(out pyOut, rep *leak.Report) ir.App {
 // idioms (.spawn/.map.aio) are recognized by the helper and leaked as deferred
 // (§C/M10-S2), never mapped to an executable kind here.
 func invocationKinds(out pyOut, script string, rep *leak.Report) map[string]ir.InvokeKind {
+	// InvokeSpawn ranks lowest (calque#88): a callable that's BOTH .map()'d
+	// somewhere and .spawn()'d elsewhere should still resolve to InvokeMap for
+	// warm-unit selection — .spawn() classification exists so a future fan-out
+	// driver can find spawned callables, not to compete with the idioms calque
+	// actually executes.
 	rank := map[ir.InvokeKind]int{
-		ir.InvokeMap: 4, ir.InvokeStarmap: 3, ir.InvokeForEach: 2, ir.InvokeRemote: 1,
+		ir.InvokeMap: 5, ir.InvokeStarmap: 4, ir.InvokeForEach: 3, ir.InvokeRemote: 2, ir.InvokeSpawn: 1,
 	}
 	invokes := map[string]ir.InvokeKind{}
 	consider := func(target string, kind ir.InvokeKind) {
@@ -236,10 +241,19 @@ func invocationKinds(out pyOut, script string, rep *leak.Report) map[string]ir.I
 			consider(ic.Target, ir.InvokeForEach)
 		case "remote":
 			consider(ic.Target, ir.InvokeRemote)
-		case "spawn", "map.aio":
+		case "map.aio":
 			// S2: async result futures / detach — deferred per §18; block-and-wait only.
 			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
 				"%s.%s(...): async result futures / detach — deferred per §18; the spike is block-and-wait only", leafName(ic.Target), ic.Kind)
+		case "spawn":
+			// calque#88: .spawn() is now CLASSIFIED (ir.InvokeSpawn) so a future
+			// block-and-wait fan-out driver can find every spawned callable — but
+			// still not EXECUTED (§18 keeps calque block-and-wait-only). The leak
+			// reflects that shift: "we know what this is" rather than "deferred,
+			// unclassified."
+			consider(ic.Target, ir.InvokeSpawn)
+			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
+				"%s.spawn(...): classified but not executed — block-and-wait fan-out over distinct spawned callables is deferred per §18 (calque#97 tracks the driver)", leafName(ic.Target))
 		case "local":
 			// calque#81: .local() runs the callee inline in the caller's own
 			// container — no new invocation, no serialization boundary. calque

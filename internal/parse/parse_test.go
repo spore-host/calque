@@ -391,3 +391,50 @@ func TestParseCrossAppFromNameLeaksNotVolumeOrSecret(t *testing.T) {
 		t.Errorf("Volume.from_name/Secret.from_name must NOT be misclassified as cross-app invocation; leaks=%+v", rep.Leaks)
 	}
 }
+
+// TestParseSpawnClassifiedAndFindable (calque#88): .spawn()'d callables get
+// ir.InvokeSpawn and are findable via ir.App.FindFunction — classified so a
+// future fan-out driver (calque#97) can locate them, but NOT executed
+// (caller, the .map()'d function, must still win warm-unit selection over
+// the merely-spawned workers per rank precedence).
+func TestParseSpawnClassifiedAndFindable(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/spawn_fanout.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	for _, name := range []string{"worker_a", "worker_b"} {
+		fn, ok := app.FindFunction(name)
+		if !ok {
+			t.Fatalf("FindFunction(%q) = false, want true", name)
+		}
+		if fn.Invoke != ir.InvokeSpawn {
+			t.Errorf("%s.Invoke = %q, want %q", name, fn.Invoke, ir.InvokeSpawn)
+		}
+	}
+	caller, ok := app.FindFunction("caller")
+	if !ok {
+		t.Fatal(`FindFunction("caller") = false, want true`)
+	}
+	if caller.Invoke != ir.InvokeMap {
+		t.Errorf("caller.Invoke = %q, want %q (InvokeMap must beat InvokeSpawn in rank)", caller.Invoke, ir.InvokeMap)
+	}
+	if _, ok := app.FindFunction("does_not_exist"); ok {
+		t.Error(`FindFunction("does_not_exist") = true, want false`)
+	}
+	sawA, sawB := false, false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "worker_a.spawn(...)") && strings.Contains(l.Detail, "classified but not executed") {
+			sawA = true
+		}
+		if strings.Contains(l.Detail, "worker_b.spawn(...)") && strings.Contains(l.Detail, "classified but not executed") {
+			sawB = true
+		}
+	}
+	if !sawA || !sawB {
+		t.Errorf("both spawn call sites should leak 'classified but not executed'; leaks=%+v", rep.Leaks)
+	}
+}
