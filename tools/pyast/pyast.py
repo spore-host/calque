@@ -260,6 +260,11 @@ class Collector(ast.NodeVisitor):
     # ---- record invocation idioms (spec §13 map; §C starmap/for_each/remote;
     # async spawn/.map.aio recognized so the census stays honest, leaked as
     # deferred on the Go side) ----
+    # .local() (calque#81) is intentionally NOT in _SYNC_IDIOMS: unlike
+    # map/starmap/for_each/remote, it never becomes an ir.InvokeKind for the
+    # TARGET callable (a .local()-called function is not itself a warm unit) —
+    # it is a property of the CALL SITE inside whichever body already shipped,
+    # so it gets its own branch below rather than routing through `consider()`.
     _SYNC_IDIOMS = frozenset({"map", "starmap", "for_each", "remote"})
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -278,6 +283,15 @@ class Collector(ast.NodeVisitor):
             elif attr in self._SYNC_IDIOMS or attr == "spawn":
                 self.invoke_calls.append(
                     {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno}
+                )
+            elif attr == "local":
+                # calque#81: .local() runs the callee in the CALLER's own process —
+                # no new container, no serialization boundary. Recorded so the Go
+                # side can leak that the callee's body isn't shipped (calque ships
+                # only the picked warm unit's body verbatim; a sibling function
+                # referenced via .local() is not in scope and will NameError).
+                self.invoke_calls.append(
+                    {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": "local", "lineno": node.lineno}
                 )
             elif attr in ("commit", "reload"):
                 # §E: volume.commit()/reload() call sites. We record the target var

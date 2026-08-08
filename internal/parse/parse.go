@@ -234,6 +234,16 @@ func invocationKinds(out pyOut, script string, rep *leak.Report) map[string]ir.I
 			// S2: async result futures / detach — deferred per §18; block-and-wait only.
 			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
 				"%s.%s(...): async result futures / detach — deferred per §18; the spike is block-and-wait only", leafName(ic.Target), ic.Kind)
+		case "local":
+			// calque#81: .local() runs the callee inline in the caller's own
+			// container — no new invocation, no serialization boundary. calque
+			// ships only the ONE function/method picked as the warm unit,
+			// verbatim; any OTHER function referenced via .local() is not in
+			// scope in the worker process and will NameError at runtime if the
+			// body it appears in is ever the one shipped. Leak loudly rather
+			// than let that surface as a mysterious crash.
+			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
+				"%s.local(...): runs inline in the caller's own container, not a separate warm unit — calque ships only the picked warm unit's body verbatim, so %s is NOT in scope here and this call will NameError unless %s is also inlined manually", leafName(ic.Target), leafName(ic.Target), leafName(ic.Target))
 		}
 	}
 	return invokes

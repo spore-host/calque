@@ -12,6 +12,10 @@ request/limit tuple convention Modal also allows for memory= (calque#77).
 Two @app.local_entrypoint()s (`main`, `secondary`) exercise a script with
 more than one local entrypoint — a real pattern (calque#78) that must not
 silently collapse to just one.
+
+`combine`'s body calling `bin_pack.local(...)` exercises .local() call-site
+recognition (calque#81) — inline in-container invocation, not a separate
+warm unit.
 """
 
 import modal
@@ -28,7 +32,7 @@ def transform(x):
 
 @app.function(cpu=2)
 def combine(a, b):
-    return a + b
+    return a + b + bin_pack.local(a)
 
 
 @app.function(cpu=(0.25, 1))

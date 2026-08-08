@@ -164,6 +164,18 @@ func TestParsePortableConfig(t *testing.T) {
 	if !epNames["main"] || !epNames["secondary"] {
 		t.Errorf("Entrypoints = %v, want {main, secondary}", epNames)
 	}
+	// .local() call sites must be recognized and leaked — calque ships only the
+	// picked warm unit's body verbatim, so a sibling called via .local() is not
+	// in scope and would NameError at runtime (calque#81).
+	foundLocalLeak := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "bin_pack.local(...)") && strings.Contains(l.Detail, "NOT in scope") {
+			foundLocalLeak = true
+		}
+	}
+	if !foundLocalLeak {
+		t.Errorf("bin_pack.local(...) should leak that bin_pack is not in scope; leaks=%+v", rep.Leaks)
+	}
 }
 
 // TestParseFactoryBuiltImageIsFlagged (calque#76): a function whose image=<var>
