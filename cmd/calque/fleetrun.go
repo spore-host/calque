@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -79,7 +80,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	}
 	shs := calexec.ShardItems(allItems, shards)
 	for i := range shs {
-		mk, rp, sk, lk := calexec.ShardLayout(base, sharedLayout.ArtifactPfx, shs[i].ID)
+		mk, rp, sk, lk := calexec.ShardLayout(base, sharedLayout.ArtifactPfx, strconv.Itoa(shs[i].ID))
 		shs[i].ManifestKey, shs[i].ResultPrefix, shs[i].SummaryKey, shs[i].LogKey = mk, rp, sk, lk
 	}
 
