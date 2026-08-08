@@ -115,6 +115,14 @@ func FillTarget(t *target.Target, r Resolver) error {
 		return err
 	}
 	t.Instance = pick.Instance
+	// calque#105: SharingMode is a hardware FACT about the resolved instance,
+	// not a decision — refresh it here now that the REAL instance (not the
+	// stub's DefaultCard-only guess) is known. Leaves whatever the
+	// Recommender set if this instance family has no table entry yet, rather
+	// than silently clearing it to the zero value.
+	if mode, ok := target.SharingModeFor(t.Instance); ok {
+		t.SharingMode = mode
+	}
 	return nil
 }
 
