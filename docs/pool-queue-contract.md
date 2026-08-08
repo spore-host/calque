@@ -107,11 +107,18 @@ check needed.
 
 ## What this unblocks
 
-- **#100** (fork taskpool's worker loop into a sticky execer): now has a
-  concrete message contract (`PoolClaimRef`) to implement against, and can
-  reuse `taskpool.Queue`'s Claim/Ack/CreateQueue/OpenQueue primitives
-  unmodified — only the execer changes (keep `warmd` resident across claims
-  instead of one-bash-subprocess-per-claim).
+- **#100 (done)** — implemented as `internal/pool` (`Worker`/`Queue`/
+  `ManifestFetcher`/`ResultWriter`) plus `warm.Supervisor.Warm`/`DrainBatch`/
+  `Close`/`IsWarm` (the sticky-runner primitives, `worker/warm-runner/warmd.go`)
+  and a new `warmd pool --model <name>` CLI mode (`cmd/warmd/main.go`). The
+  queue itself (`internal/pool/queue.go`'s `SQSQueue`) mirrors
+  `taskpool.Queue`'s Claim/Ack/CreateQueue/OpenQueue LOGIC against spawn's
+  `taskpool.SQSAPI` interface rather than importing the type verbatim, because
+  `taskpool.Queue` is hardcoded to a run-scoped name + forced 12h retention —
+  wrong for a pool queue that's model-scoped and outlives any one run (see the
+  queue.go doc comment for the full reasoning). `PoolClaimRef` above shipped as
+  `pool.ClaimRef`, carrying an S3 manifest-fragment pointer that reuses
+  `calexec.Manifest`'s existing shape verbatim rather than inventing a new one.
 - **#101** (provision via taskcohort/cohort): pool creation now has a fixed
   meaning — `calque pool create --model M` maps 1:1 to one `PoolQueueName(M)`
   queue and one cohort of instances, mirroring `spawn pool create`'s IAM/AMI

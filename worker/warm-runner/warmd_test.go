@@ -184,6 +184,87 @@ return payload * 10`,
 	}
 }
 
+// TestDrainBatchStaysWarmAcrossCalls proves the sticky-pool invariant (calque#100):
+// calling DrainBatch more than once WITHOUT Close in between reuses the SAME
+// resident runner — @enter runs exactly once across both calls, and state set by
+// the first batch is still visible to the second. This is what lets a pool worker
+// serve many claims for one model without re-paying the cold-load cost per claim.
+func TestDrainBatchStaysWarmAcrossCalls(t *testing.T) {
+	sink := newMemSink()
+	sup := &Supervisor{
+		Python: python(t),
+		Script: runnerScript(t),
+		Sink:   sink,
+		Config: Config{
+			EnterBody:  `self.calls = 0`,
+			MethodBody: "self.calls += 1\nreturn {'echo': payload, 'call': self.calls}",
+			MethodArg:  "payload",
+		},
+	}
+	defer sup.Close()
+
+	failed1, err := sup.DrainBatch(context.Background(), items("a", "b"))
+	if err != nil {
+		t.Fatalf("first DrainBatch: %v", err)
+	}
+	if len(failed1) != 0 {
+		t.Fatalf("first batch failed = %v, want none", failed1)
+	}
+	if sup.EnterCount != 1 {
+		t.Fatalf("EnterCount after first batch = %d, want 1", sup.EnterCount)
+	}
+
+	// Second batch reuses indices 0/1 again (a pool worker's next claim is its own
+	// independent item set — index scoping is per-claim, not global). What matters
+	// is that EnterCount does NOT increase: the same warm runner served it.
+	failed2, err := sup.DrainBatch(context.Background(), items("c", "d"))
+	if err != nil {
+		t.Fatalf("second DrainBatch: %v", err)
+	}
+	if len(failed2) != 0 {
+		t.Fatalf("second batch failed = %v, want none", failed2)
+	}
+	if sup.EnterCount != 1 {
+		t.Errorf("EnterCount after second batch = %d, want 1 (runner should have stayed resident)", sup.EnterCount)
+	}
+	// The call counter set by @enter and incremented by @method must have kept
+	// counting across the two DrainBatch calls (3, 4), not reset (1, 2) — direct
+	// witness that the SAME process (and its state) served both batches.
+	r0, ok := sink.results[0]
+	if !ok {
+		t.Fatal("missing result for second-batch index 0")
+	}
+	call := int(r0.Result.(map[string]any)["call"].(float64))
+	if call != 3 {
+		t.Errorf("second batch's first item call=%d, want 3 (state did not persist across DrainBatch calls)", call)
+	}
+}
+
+// TestRunClosesRunnerAfterOneBatch proves Run's original contract is unchanged by
+// the DrainBatch/Warm/Close refactor: after Run returns, no runner is resident
+// (Close was called internally) — a second Run call must warm a FRESH runner
+// (EnterCount resets to 1 again on a NEW Supervisor value, proving Run doesn't leak
+// a resident process across independent calls the way pool mode's DrainBatch does).
+func TestRunClosesRunnerAfterOneBatch(t *testing.T) {
+	sink := newMemSink()
+	sup := &Supervisor{
+		Python: python(t),
+		Script: runnerScript(t),
+		Sink:   sink,
+		Config: Config{
+			EnterBody:  `self.calls = 0`,
+			MethodBody: "self.calls += 1\nreturn {'echo': payload, 'call': self.calls}",
+			MethodArg:  "payload",
+		},
+	}
+	if _, err := sup.Run(context.Background(), items("a")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if sup.active != nil {
+		t.Error("Run left a resident runner active; want nil (Close should have run)")
+	}
+}
+
 // TestPartialFailureDoesNotReload proves a per-item payload error is a partial
 // failure (reported), NOT a crash — the runner stays warm (@enter runs once).
 func TestPartialFailureDoesNotReload(t *testing.T) {

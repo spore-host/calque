@@ -23,9 +23,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
 	calexec "github.com/spore-host/calque/internal/exec"
+	calpool "github.com/spore-host/calque/internal/pool"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
@@ -73,21 +76,90 @@ type Summary struct {
 }
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "run" {
+	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: warmd run --manifest s3://bucket/key")
+		fmt.Fprintln(os.Stderr, "       warmd pool --model <name> --region <region> [--idle-timeout 30m]")
 		os.Exit(2)
 	}
-	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	manifestURI := fs.String("manifest", "", "s3://bucket/key of the work manifest")
-	_ = fs.Parse(os.Args[2:])
-	if *manifestURI == "" {
-		fmt.Fprintln(os.Stderr, "error: --manifest required")
+	switch os.Args[1] {
+	case "run":
+		fs := flag.NewFlagSet("run", flag.ExitOnError)
+		manifestURI := fs.String("manifest", "", "s3://bucket/key of the work manifest")
+		_ = fs.Parse(os.Args[2:])
+		if *manifestURI == "" {
+			fmt.Fprintln(os.Stderr, "error: --manifest required")
+			os.Exit(2)
+		}
+		if err := runOnInstance(context.Background(), *manifestURI); err != nil {
+			fmt.Fprintln(os.Stderr, "warmd error:", err)
+			os.Exit(1)
+		}
+	case "pool":
+		fs := flag.NewFlagSet("pool", flag.ExitOnError)
+		model := fs.String("model", "", "this pool's fixed model identity (calque#99 decision 2: single-model-per-pool)")
+		region := fs.String("region", "", "AWS region the pool's SQS queue lives in")
+		pythonBin := fs.String("python-bin", "python3", "interpreter for the warm runner")
+		runnerPath := fs.String("runner-path", "", "path to runner.py in the image")
+		idleTimeout := fs.Duration("idle-timeout", 30*time.Minute, "how long to keep the resident runner warm with an empty queue before closing it")
+		pollWait := fs.Int("poll-wait-seconds", 20, "SQS long-poll wait per claim (0..20)")
+		_ = fs.Parse(os.Args[2:])
+		if *model == "" || *runnerPath == "" {
+			fmt.Fprintln(os.Stderr, "error: --model and --runner-path required")
+			os.Exit(2)
+		}
+		if err := runPoolWorker(context.Background(), poolWorkerArgs{
+			model: *model, region: *region, pythonBin: *pythonBin, runnerPath: *runnerPath,
+			idleTimeout: *idleTimeout, pollWaitSeconds: int32(*pollWait),
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "warmd pool error:", err)
+			os.Exit(1)
+		}
+	default:
+		fmt.Fprintln(os.Stderr, "usage: warmd run --manifest s3://bucket/key")
+		fmt.Fprintln(os.Stderr, "       warmd pool --model <name> --region <region> [--idle-timeout 30m]")
 		os.Exit(2)
 	}
-	if err := runOnInstance(context.Background(), *manifestURI); err != nil {
-		fmt.Fprintln(os.Stderr, "warmd error:", err)
-		os.Exit(1)
+}
+
+// poolWorkerArgs bundles `warmd pool`'s flags.
+type poolWorkerArgs struct {
+	model, region, pythonBin, runnerPath string
+	idleTimeout                          time.Duration
+	pollWaitSeconds                      int32
+}
+
+// runPoolWorker starts a calque#100 sticky pool worker: claims from the
+// model's SQS queue, drains each claim's batch against a resident
+// warm.Supervisor (warm ONCE across many claims), writes results+summary to
+// S3, and acks — until idle past idleTimeout, then closes the resident runner
+// and exits (the instance's own idle-reaper/spored lifecycle handles
+// terminating the instance itself; this process just stops claiming).
+func runPoolWorker(ctx context.Context, a poolWorkerArgs) error {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(a.region))
+	if err != nil {
+		return fmt.Errorf("load aws config: %w", err)
 	}
+	sqsClient := sqs.NewFromConfig(cfg)
+	s3Client := s3.NewFromConfig(cfg)
+
+	q, err := calpool.OpenPoolQueue(ctx, sqsClient, a.model)
+	if err != nil {
+		return fmt.Errorf("open pool queue for model %q: %w", a.model, err)
+	}
+
+	sup := &warm.Supervisor{Python: a.pythonBin, Script: a.runnerPath, Leak: stderrLeaker{}}
+	w := &calpool.Worker{
+		Queue:      q,
+		Fetcher:    &calpool.S3Manifests{Client: s3Client},
+		Results:    &calpool.S3Results{Client: s3Client},
+		Supervisor: sup,
+		Config: calpool.WorkerConfig{
+			Model: a.model, PollWaitSeconds: a.pollWaitSeconds, IdleTimeout: a.idleTimeout, Log: os.Stderr,
+		},
+	}
+	served, err := w.Run(ctx)
+	fmt.Fprintf(os.Stderr, "pool worker for model %q served %d claim(s)\n", a.model, served)
+	return err
 }
 
 func runOnInstance(ctx context.Context, manifestURI string) error {

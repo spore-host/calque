@@ -183,6 +183,14 @@ type Supervisor struct {
 	// Occupancy is averaged over the UNION of these spans, so every load gap — first
 	// or after a restart — is excluded by construction.
 	InferenceSpans []Span
+
+	// active is the resident runner surviving across DrainBatch calls (calque#100:
+	// sticky pool mode). nil when no runner is currently up. Run() (the original,
+	// single-batch entrypoint) is now a thin wrapper: Warm, DrainBatch, Close — so
+	// its crash-restart behavior is unchanged, but pool mode can call Warm once and
+	// DrainBatch repeatedly across many claims without ever calling Close between
+	// them, keeping @enter's state loaded (the whole point of #99/#100).
+	active *runner
 }
 
 // Span is a closed wall-clock window in unix epoch seconds (float, sub-second).
@@ -204,15 +212,87 @@ func bodyIsVLLMOffline(body string) bool {
 		(strings.Contains(body, "llm") || strings.Contains(body, "LLM"))
 }
 
-// Run drains items in index order, writing each successful result to the sink. It
-// returns the indices that permanently FAILED (partial failure — spec §10: "3 of
-// 10k items die"). An item is "settled" when it either lands in the sink or fails
-// permanently; Run continues until every item is settled or restarts are exhausted.
-func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
-	maxRestarts := s.MaxRestarts
-	if maxRestarts == 0 {
-		maxRestarts = 5
+// maxRestarts returns the configured restart cap, defaulting to 5.
+func (s *Supervisor) maxRestarts() int {
+	if s.MaxRestarts == 0 {
+		return 5
 	}
+	return s.MaxRestarts
+}
+
+// warmOnce makes exactly ONE attempt to start a runner and warm it (@enter),
+// storing it as the resident s.active on success. Callers own their own retry
+// budget — this never retries internally, so nesting two retry loops (Warm's and
+// DrainBatch's) can't silently multiply the effective restart cap.
+func (s *Supervisor) warmOnce(ctx context.Context) error {
+	rn, err := startRunner(ctx, s.Python, s.Script)
+	if err != nil {
+		return fmt.Errorf("start runner: %w", err)
+	}
+	if err := s.warmUp(rn); err != nil {
+		rn.close()
+		return err
+	}
+	s.active = rn
+	return nil
+}
+
+// Warm ensures a runner is resident and warmed (starts one via warmOnce if none is
+// active), retrying a failed warm-up up to MaxRestarts. A no-op if already warm.
+//
+// This is the sticky-pool entrypoint (calque#100): a pool worker calls Warm ONCE
+// at boot (or on first claim), then DrainBatch repeatedly across many claims — the
+// resident runner is never torn down between them, so @enter's cost is paid once
+// per worker lifetime, not once per claim. Run (below) still calls this internally
+// for its own single-batch-then-shutdown contract, unchanged.
+func (s *Supervisor) Warm(ctx context.Context) error {
+	if s.active != nil {
+		return nil
+	}
+	maxRestarts := s.maxRestarts()
+	restarts := 0
+	for {
+		if err := s.warmOnce(ctx); err != nil {
+			restarts++
+			if restarts > maxRestarts {
+				return fmt.Errorf("warm-up failed after %d restarts: %w", restarts, err)
+			}
+			s.leak("integration_edge", fmt.Sprintf("runner warm-up failed (restart %d): %v", restarts, err))
+			continue
+		}
+		return nil
+	}
+}
+
+// IsWarm reports whether a runner is currently resident (Warm/DrainBatch has
+// started one and Close hasn't run yet). Exported so a caller outside this
+// package (calque#100's pool worker) can tell whether it's safe to change
+// s.Config before the FIRST warm-up without racing an already-loaded runner —
+// once warm, Config changes never reach the resident process (see DrainBatch).
+func (s *Supervisor) IsWarm() bool { return s.active != nil }
+
+// Close cleanly shuts down the resident runner, if any: sends "shutdown", waits for
+// the process's best-effort "bye", closes it, and clears the resident state. A
+// pool worker calls this on its OWN idle-timeout/shutdown (calque#100); Run calls
+// it after one clean drain, preserving its original per-call teardown contract.
+func (s *Supervisor) Close() {
+	if s.active == nil {
+		return
+	}
+	_ = s.active.send(map[string]any{"kind": "shutdown"})
+	_, _ = s.active.recv() // best-effort "bye"
+	s.active.close()
+	s.active = nil
+}
+
+// DrainBatch drains one batch of items against the resident runner (warming one via
+// warmOnce first if none is active), restarting on crash and re-driving unsettled
+// items — the SAME crash-restart discipline Run always had, under a single shared
+// restart budget for this call. Unlike Run, DrainBatch does NOT shut the runner
+// down afterward: it stays resident so a caller (pool mode) can call DrainBatch
+// again for the next claim without re-paying @enter's cost. Returns the indices
+// that permanently FAILED within this batch (payload errors, not crashes).
+func (s *Supervisor) DrainBatch(ctx context.Context, items []Item) ([]int, error) {
 	// Concurrency guard (#68): threads calling vLLM's OFFLINE LLM.generate() on one
 	// shared engine race its step loop and hang — the engine isn't thread-safe; it
 	// batches via a LIST passed to a single .generate() call, not concurrent calls.
@@ -227,12 +307,24 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 				"use --batch-size to micro-batch instead of --concurrency.", s.Concurrency))
 		s.Concurrency = 1
 	}
+	maxRestarts := s.maxRestarts()
 	done := make(map[int]bool, len(items)) // written to sink
 	failed := make(map[int]bool)           // permanent per-item payload failures
 	settled := func(idx int) bool { return done[idx] || failed[idx] }
 
 	restarts := 0
 	for {
+		if s.active == nil {
+			if err := s.warmOnce(ctx); err != nil {
+				restarts++
+				if restarts > maxRestarts {
+					return unsettled(items, settled), fmt.Errorf("warm-up failed after %d restarts: %w", restarts, err)
+				}
+				s.leak("integration_edge", fmt.Sprintf("runner warm-up failed (restart %d): %v", restarts, err))
+				continue
+			}
+		}
+
 		// Build the work list: everything not yet settled, in original index order.
 		var pending []Item
 		for _, it := range items {
@@ -242,20 +334,6 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 		}
 		if len(pending) == 0 {
 			break
-		}
-
-		rn, err := startRunner(ctx, s.Python, s.Script)
-		if err != nil {
-			return unsettled(items, settled), fmt.Errorf("start runner: %w", err)
-		}
-		if err := s.warmUp(rn); err != nil {
-			rn.close()
-			restarts++
-			if restarts > maxRestarts {
-				return unsettled(items, settled), fmt.Errorf("warm-up failed after %d restarts: %w", restarts, err)
-			}
-			s.leak("integration_edge", fmt.Sprintf("runner warm-up failed (restart %d): %v", restarts, err))
-			continue
 		}
 
 		// Drain. If the runner dies mid-drain, unsettled items simply get picked up
@@ -268,26 +346,23 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 		// Recorded even on crash — the GPU was genuinely busy up to the crash, and the
 		// following restart's load is excluded because it lands OUTSIDE every span.
 		spanStart := nowUnix()
-		crashed, sinkErr := s.drain(ctx, rn, pending, done, failed)
+		crashed, sinkErr := s.drain(ctx, s.active, pending, done, failed)
 		s.InferenceSpans = append(s.InferenceSpans, Span{StartUnix: spanStart, EndUnix: nowUnix()})
 		if sinkErr != nil {
-			rn.close()
+			s.active.close()
+			s.active = nil
 			return unsettled(items, settled), sinkErr
 		}
 
 		if crashed {
-			rn.close()
+			s.active.close()
+			s.active = nil
 			restarts++
 			if restarts > maxRestarts {
 				return unsettled(items, settled), fmt.Errorf("exceeded %d runner restarts", maxRestarts)
 			}
-			continue // re-loop: rebuilds pending from unsettled, restarts runner
+			continue // re-loop: rebuilds pending from unsettled, re-warms at top
 		}
-
-		// clean drain — tell the runner to flush and exit
-		_ = rn.send(map[string]any{"kind": "shutdown"})
-		_, _ = rn.recv() // best-effort "bye"
-		rn.close()
 	}
 
 	if len(failed) == 0 {
@@ -298,6 +373,21 @@ func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
 		out = append(out, i)
 	}
 	return out, nil
+}
+
+// Run drains items in index order, writing each successful result to the sink. It
+// returns the indices that permanently FAILED (partial failure — spec §10: "3 of
+// 10k items die"). An item is "settled" when it either lands in the sink or fails
+// permanently; Run continues until every item is settled or restarts are exhausted.
+//
+// Run is now a thin wrapper over DrainBatch+Close (calque#100): one batch, then
+// shut the runner down — its crash-restart behavior and restart budget are
+// unchanged from before the sticky-pool refactor. Pool mode calls DrainBatch
+// directly, without the trailing Close, to keep the runner warm across claims.
+func (s *Supervisor) Run(ctx context.Context, items []Item) ([]int, error) {
+	failed, err := s.DrainBatch(ctx, items)
+	s.Close()
+	return failed, err
 }
 
 // drain runs one warm runner over `pending`, recording settled items into done/
