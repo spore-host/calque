@@ -107,23 +107,68 @@ type pyInvokeCall struct {
 // during transcription. runner/runnerArgs is how we invoke the helper (so callers
 // and tests can point at `uv run ...`); see DefaultRunner.
 func Parse(ctx context.Context, scriptPath string, rep *leak.Report, runner string, runnerArgs ...string) (ir.App, error) {
+	out, err := runHelper(ctx, scriptPath, runner, runnerArgs...)
+	if err != nil {
+		return ir.App{}, err
+	}
+	return build(out, rep), nil
+}
+
+// SpawnCallSite is one .spawn() call site's target callable + best-effort
+// string args (calque#112: the CLI-wiring glue a real spawnRun driver needs
+// — pyInvokeCall.Args is captured at parse time per calque#88's own plan
+// ("for the same future driver's eventual use — not consumed by anything
+// yet") but wasn't exposed anywhere outside this package until now). Kept
+// as its own exported type here, rather than exporting pyInvokeCall itself,
+// so callers depend on a minimal stable shape instead of this package's
+// full wire-format struct.
+type SpawnCallSite struct {
+	Target string
+	Args   []*string
+}
+
+// SpawnCallSites re-runs the same pyast helper invocation as Parse and
+// returns every .spawn() call site found in scriptPath — a sibling entry
+// point, not an addition to Parse's own return shape, so every existing
+// Parse caller (cmd/calque/run.go, cmd/calque/main.go's analyze) is
+// unaffected. A caller that needs BOTH the ir.App and its spawn call sites
+// currently pays for two helper invocations; this is acceptable for a
+// design-time convenience function driving a real-AWS-verification-gated
+// path (calque#112), not a hot loop.
+func SpawnCallSites(ctx context.Context, scriptPath string, runner string, runnerArgs ...string) ([]SpawnCallSite, error) {
+	out, err := runHelper(ctx, scriptPath, runner, runnerArgs...)
+	if err != nil {
+		return nil, err
+	}
+	var sites []SpawnCallSite
+	for _, ic := range out.InvokeCalls {
+		if ic.Kind != "spawn" {
+			continue
+		}
+		sites = append(sites, SpawnCallSite{Target: leafName(ic.Target), Args: ic.Args})
+	}
+	return sites, nil
+}
+
+// runHelper invokes the pyast helper and decodes its JSON output — the
+// shared subprocess-invocation logic behind both Parse and SpawnCallSites.
+func runHelper(ctx context.Context, scriptPath string, runner string, runnerArgs ...string) (pyOut, error) {
 	args := append(append([]string{}, runnerArgs...), scriptPath)
 	cmd := exec.CommandContext(ctx, runner, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return ir.App{}, fmt.Errorf("pyast helper failed: %w (stderr: %s)", err, stderr.String())
+		return pyOut{}, fmt.Errorf("pyast helper failed: %w (stderr: %s)", err, stderr.String())
 	}
 
 	var out pyOut
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		return ir.App{}, fmt.Errorf("pyast JSON decode: %w", err)
+		return pyOut{}, fmt.Errorf("pyast JSON decode: %w", err)
 	}
 	if out.Error != "" {
-		return ir.App{}, fmt.Errorf("pyast reported error: %s", out.Error)
+		return pyOut{}, fmt.Errorf("pyast reported error: %s", out.Error)
 	}
-
-	return build(out, rep), nil
+	return out, nil
 }
 
 // DefaultRunner is how the CLI invokes the helper: uv, from the pyast project.

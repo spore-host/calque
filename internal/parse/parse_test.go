@@ -449,3 +449,47 @@ func TestParseSpawnClassifiedAndFindable(t *testing.T) {
 		t.Errorf("both spawn call sites should leak 'classified but not executed'; leaks=%+v", rep.Leaks)
 	}
 }
+
+// TestSpawnCallSitesCapturesStringAndNumericArgs (calque#112): SpawnCallSites
+// exposes .spawn()'s best-effort call-site args, extracted via pyast.py's
+// _spawn_arg_str. Discovered via LIVE real-AWS spawn-run verification: a
+// numeric literal (worker.spawn(5)) silently captured NO arg at all under
+// the original _const_str-based extraction (string-only by design, correct
+// for from_name's needs but wrong for .spawn()'s actual per-call payload) —
+// indistinguishable from a variable reference like worker.spawn(x). This
+// fixture's literal_caller exercises the fix; caller's variable-arg spawns
+// (worker_a.spawn(x)/worker_b.spawn(x)) must still correctly capture NO arg
+// (a genuine "can't resolve a variable" case, not a bug).
+func TestSpawnCallSitesCapturesStringAndNumericArgs(t *testing.T) {
+	r, args := runner(t)
+	script, _ := filepath.Abs("../../testdata/scripts/spawn_fanout.py")
+
+	sites, err := SpawnCallSites(context.Background(), script, r, args...)
+	if err != nil {
+		t.Fatalf("SpawnCallSites: %v", err)
+	}
+
+	var sawNumericArg, sawVariableArgsAsNil bool
+	varArgNilCount := 0
+	for _, s := range sites {
+		if s.Target == "worker_a" && len(s.Args) == 1 {
+			if s.Args[0] != nil && *s.Args[0] == "5" {
+				sawNumericArg = true
+			}
+			if s.Args[0] == nil {
+				varArgNilCount++
+			}
+		}
+	}
+	// worker_a is spawned twice: once with a numeric literal (5, from
+	// literal_caller) and once with a variable (x, from caller) — both call
+	// sites appear, so we can't just count "worker_a" entries; distinguish
+	// by whether the arg resolved.
+	sawVariableArgsAsNil = varArgNilCount >= 1
+	if !sawNumericArg {
+		t.Errorf("no worker_a call site captured the numeric literal \"5\"; sites=%+v", sites)
+	}
+	if !sawVariableArgsAsNil {
+		t.Errorf("expected at least one worker_a call site with a nil arg (the variable-arg spawn from caller); sites=%+v", sites)
+	}
+}

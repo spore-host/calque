@@ -31,6 +31,22 @@ def _const_str(node: ast.AST) -> str | None:
     return None
 
 
+def _spawn_arg_str(node: ast.AST) -> str | None:
+    """Best-effort string form of a .spawn() call arg (calque#112, discovered
+    via live-AWS verification: _const_str's string-only scope — correct for
+    from_name's needs, which .spawn() originally reused as-is — silently
+    dropped numeric args to None, e.g. worker.spawn(5) captured no arg at
+    all, indistinguishable from worker.spawn(some_variable)). Accepts str/
+    int/float/bool Constant nodes and stringifies them; None-valued
+    Constants (a literal `None` argument) and everything else (variables,
+    expressions) stay None — same "we do not evaluate expressions" contract
+    _const_str already documents, just widened to numeric/bool literals
+    the wire's Optional[str] shape can represent losslessly via str()."""
+    if isinstance(node, ast.Constant) and node.value is not None and isinstance(node.value, (str, int, float, bool)):
+        return str(node.value)
+    return None
+
+
 def _literal(node: ast.AST) -> Any:
     """Best-effort literal for a decorator kwarg. Non-literals become a tagged
     marker so the Go side can log a leak instead of silently dropping meaning."""
@@ -288,15 +304,18 @@ class Collector(ast.NodeVisitor):
                 # calque#88: .spawn(args) fires an async call — deferred per §18
                 # (still leaked, block-and-wait only), but the TARGET is now also
                 # classified (ir.InvokeSpawn) so a future fan-out driver can find
-                # every spawned callable. Args captured best-effort (mirrors
-                # from_name's _const_str pattern) for the same future driver's
-                # eventual use — not consumed by anything yet.
+                # every spawned callable. Args captured best-effort via
+                # _spawn_arg_str (calque#112: widened beyond from_name's
+                # string-only _const_str, since .spawn()'s args are the actual
+                # per-call PAYLOAD a real driver sends, not just an app-name
+                # string — a numeric literal like worker.spawn(5) must not
+                # silently collapse to the same None a variable reference gets).
                 self.invoke_calls.append(
                     {
                         "target": ".".join(_attr_chain(node.func)[:-1]),
                         "kind": "spawn",
                         "lineno": node.lineno,
-                        "args": [_const_str(a) for a in node.args],
+                        "args": [_spawn_arg_str(a) for a in node.args],
                     }
                 )
             elif attr == "local":

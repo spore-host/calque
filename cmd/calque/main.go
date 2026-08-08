@@ -72,6 +72,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "spawn-run":
+		if err := spawnRunCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -254,6 +259,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] [--rungs 1,100,1000] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque pool create --model M --instance-type T --manifest-bucket B --results-bucket B --runner-path P [--workers N] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque spawn-run --bucket B --run-id ID --ami AMI [--instance m7i.large] <script.py> --i-understand-this-spends-money")
 }
 
 // pyastDir locates the helper relative to the repo. We resolve it from this

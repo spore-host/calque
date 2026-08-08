@@ -36,6 +36,16 @@ def caller(x):
     return call_a.get() + call_b.get()
 
 
+@app.function()
+def literal_caller():
+    # calque#112: a numeric literal arg, exercising _spawn_arg_str's fix for
+    # the gap _const_str's string-only scope left (a live-AWS spawn-run
+    # verification surfaced worker.spawn(5) capturing NO arg at all,
+    # indistinguishable from a variable reference).
+    call_a = worker_a.spawn(5)
+    return call_a.get()
+
+
 @app.local_entrypoint()
 def main():
     list(caller.map(range(3)))
