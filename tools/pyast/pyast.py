@@ -301,6 +301,22 @@ class Collector(ast.NodeVisitor):
                 self.volume_writes.append(
                     {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno}
                 )
+            elif attr == "from_name" and _attr_chain(node.func)[-2:-1] in (["Function"], ["Cls"]):
+                # calque#87: Function.from_name(app, fn)/Cls.from_name(app, cls) look
+                # up an ALREADY-DEPLOYED separate app by name — cross-app invocation,
+                # a fundamentally different execution boundary than anything calque
+                # owns (calque parses+runs ONE script). Detected independently of
+                # whatever's chained after it (.remote()/.spawn()/etc, which would
+                # otherwise record a target-less "remote"/"spawn" invoke_calls entry
+                # here — see the leading owner chain being empty in that case).
+                # Guarded to Function/Cls specifically: Volume.from_name(...) and
+                # Secret.from_name(...) are unrelated, already-handled constructs
+                # that happen to share the same method name.
+                base = _attr_chain(node.func)[-2]
+                args = [_const_str(a) for a in node.args]
+                self.invoke_calls.append(
+                    {"target": base, "kind": "from_name", "lineno": node.lineno, "args": args}
+                )
         self.generic_visit(node)
 
     def _decos(self, node: ast.FunctionDef) -> list[str]:

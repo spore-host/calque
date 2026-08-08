@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
@@ -96,6 +97,10 @@ type pyInvokeCall struct {
 	Target string `json:"target"`
 	Kind   string `json:"kind"`
 	Lineno int    `json:"lineno"`
+	// Args carries from_name(app_name, obj_name)'s string literals (calque#87),
+	// best-effort — a nil entry means that positional arg wasn't a plain string.
+	// Empty for every other invoke kind.
+	Args []*string `json:"args"`
 }
 
 // Parse runs the helper on scriptPath and returns the IR plus any leaks emitted
@@ -245,9 +250,35 @@ func invocationKinds(out pyOut, script string, rep *leak.Report) map[string]ir.I
 			// than let that surface as a mysterious crash.
 			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
 				"%s.local(...): runs inline in the caller's own container, not a separate warm unit — calque ships only the picked warm unit's body verbatim, so %s is NOT in scope here and this call will NameError unless %s is also inlined manually", leafName(ic.Target), leafName(ic.Target), leafName(ic.Target))
+		case "from_name":
+			// calque#87: Function.from_name(app, fn)/Cls.from_name(app, cls) look up
+			// an ALREADY-DEPLOYED separate app by name — cross-app invocation, an
+			// execution boundary calque doesn't own (calque parses+runs ONE script;
+			// it has no notion of a separately-deployed app to call into). Recognize
+			// and leak distinctly, naming the looked-up app/object when the args are
+			// plain string literals, rather than let whatever's chained after
+			// from_name(...) (.remote()/.spawn()/etc.) record a target-less,
+			// unexplained invoke entry.
+			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
+				"%s.from_name(%s): cross-app invocation of an already-deployed separate app — calque has no notion of a separately-deployed app to call into; not reproduced", ic.Target, formatFromNameArgs(ic.Args))
 		}
 	}
 	return invokes
+}
+
+// formatFromNameArgs renders Function.from_name/Cls.from_name's positional
+// args for a leak message, falling back to "?" for any non-string-literal arg
+// (calque#87) rather than guessing at its value.
+func formatFromNameArgs(args []*string) string {
+	parts := make([]string, len(args))
+	for i, a := range args {
+		if a == nil {
+			parts[i] = "?"
+			continue
+		}
+		parts[i] = strconv.Quote(*a)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // leafName returns the trailing attribute of a dotted call target: the callable's

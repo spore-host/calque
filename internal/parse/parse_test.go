@@ -354,3 +354,40 @@ func TestParseExitHookExcludedFromMethods(t *testing.T) {
 		t.Errorf("@modal.exit() should leak that teardown isn't reproduced; leaks=%+v", rep.Leaks)
 	}
 }
+
+// TestParseCrossAppFromNameLeaksNotVolumeOrSecret (calque#87):
+// Function.from_name/Cls.from_name (cross-app invocation) must be recognized
+// and leaked distinctly — but Volume.from_name/Secret.from_name (unrelated,
+// already-handled constructs sharing the same method name) must NOT be
+// misclassified as cross-app invocation.
+func TestParseCrossAppFromNameLeaksNotVolumeOrSecret(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/cross_app.py")
+
+	if _, err := Parse(context.Background(), script, rep, r, args...); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var sawFunctionFromName, sawClsFromName, sawVolumeOrSecretMisfire bool
+	for _, l := range rep.Leaks {
+		switch {
+		case strings.Contains(l.Detail, `Function.from_name("other-app", "remote_worker")`):
+			sawFunctionFromName = true
+		case strings.Contains(l.Detail, `Cls.from_name("other-app", "RemoteBatcher")`):
+			sawClsFromName = true
+		case strings.Contains(l.Detail, "weights-cache") || strings.Contains(l.Detail, "api-key"):
+			sawVolumeOrSecretMisfire = true
+		case strings.Contains(l.Detail, "cross-app invocation") && !strings.Contains(l.Detail, "other-app"):
+			sawVolumeOrSecretMisfire = true
+		}
+	}
+	if !sawFunctionFromName {
+		t.Errorf("Function.from_name should leak cross-app invocation; leaks=%+v", rep.Leaks)
+	}
+	if !sawClsFromName {
+		t.Errorf("Cls.from_name should leak cross-app invocation; leaks=%+v", rep.Leaks)
+	}
+	if sawVolumeOrSecretMisfire {
+		t.Errorf("Volume.from_name/Secret.from_name must NOT be misclassified as cross-app invocation; leaks=%+v", rep.Leaks)
+	}
+}
