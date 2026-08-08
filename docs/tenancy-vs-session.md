@@ -1,0 +1,130 @@
+# Design note: disambiguating "session" — interactive tenancy vs. today's K-ramp (calque#106)
+
+**Status:** decision record, design-only (no code). Settles terminology and
+lifecycle for M13's institutional-sharing primitive before any implementation
+issue (MIG slice provisioning, MPS trusted-tenant mode) starts, so neither
+has to invent naming under its own scope or collide with what `cmd/calque
+session` already means.
+
+## The collision
+
+`cmd/calque/session.go` today implements **acquire-once, hold, run-many**:
+one instance is acquired patiently (acquisition is the slow, expensive part),
+held for an entire N-item ramp (`sessionOpts.rungs`), and terminated only at
+the end (`session.go:39-48`'s doc comment: "amortizes the painful acquisition
+across every test instead of re-acquiring per test"). It is single-tenant —
+one `calque session` invocation, one user, one instance, for the whole
+K-measurement ramp.
+
+M13's institutional-sharing design needs a **different** thing: one
+university user's bounded interactive occupancy of a MIG slice or MPS
+client-slot on an instance that may be serving several such users
+*concurrently*. Both are naturally called "a session" in everyday English —
+"my session on the shared GPU," "run the K-ramp session" — and would collide
+in docs, the CLI, and support conversations if left undisambiguated.
+
+## Decision: rename the existing verb, keep "session" for the new concept
+
+**`cmd/calque session` (today's K-ramp verb) is renamed `calque ramp`.**
+"Session" is freed for M13's interactive-tenancy primitive, because:
+
+1. **"Session" is the term university users will actually reach for.** The
+   primary audience for M13 (per the project's institutional-university
+   pivot) thinks in terms of "starting a session on the GPU," matching how
+   interactive HPC/Slurm allocations and Jupyter/notebook servers already use
+   the word. Overloading it for calque's internal K-measurement ramp — a
+   spike-only benchmarking tool most end users never invoke — is the
+   avoidable collision.
+2. **"Ramp" already describes the existing verb's actual behavior precisely.**
+   `sessionOpts.rungs` IS a ramp (a comma-separated N-item ramp:
+   `--rungs 1,100,1000`, `session.go:167`) — the rename doesn't require
+   inventing new vocabulary, it surfaces vocabulary the code already uses
+   internally.
+3. **The K-ramp verb is a lower-traffic, more spike-internal tool.** It exists
+   to produce a measured crossover K for the project's own benchmarking
+   (§8/§9), not as an end-user workflow. Renaming the less-user-facing verb is
+   the smaller disruption.
+
+This is a rename ONLY — `cmd/calque/session.go`'s behavior, flags, and
+acquire-once/hold/run-many contract are UNCHANGED. Renaming the file and CLI
+verb (`calque session` → `calque ramp`) is left to the implementation issue
+that actually needs to touch that code path (not bundled into this
+design-only issue, consistent with #106's own "no code" scope).
+
+## The new primitive: `calque session` (interactive tenancy)
+
+### Lifecycle
+
+```
+check-out  →  interactive use (bounded TTL)  →  check-in / release
+```
+
+- **check-out**: bind ONE user to ONE slice (a MIG partition, or an MPS
+  client-slot) on an instance that is ALREADY acquired and running — this
+  primitive never calls `RunInstances`/`Acquirer.Acquire` itself (see
+  boundary statement below). Check-out fails if every slice on the target
+  instance is occupied; the caller's job (the M12 fleet layer, or a future
+  scheduler) decides whether to wait, route to another instance, or trigger
+  the fleet to acquire one more.
+- **interactive use**: the user runs work against their slice for up to a
+  bounded TTL — NOT a fixed N-item ramp like `calque ramp`'s rungs. A
+  session's workload is open-ended/interactive (the university-user use
+  case: notebook-style exploration, ad hoc inference calls), so its
+  lifecycle is time-bounded, not item-count-bounded. This is the same
+  batch-vs-serve distinction `docs/serve-architecture.md` already draws for
+  a different reason (fixed N vs. open-ended work) — reusing that framing
+  here rather than inventing a third shape.
+- **check-in/release**: the user (or the TTL) ends the session; the slice
+  becomes available for the next check-out. The underlying instance is
+  UNAFFECTED — releasing a slice never terminates the instance, since other
+  slices/sessions may still be live on it (this is the entire point of
+  sharing: one instance, many sequential or concurrent sessions).
+
+### Contrast with `calque ramp`'s model
+
+| | `calque ramp` (renamed `session`) | `calque session` (new, tenancy) |
+|---|---|---|
+| Unit of work | Fixed N-item ramp (`--rungs`) | Open-ended, bounded by TTL |
+| Tenancy | Single-tenant: one instance, one user | Multi-tenant: N slices, N concurrent users |
+| Acquires from AWS? | Yes — `Acquirer.Acquire` directly | No — consumes an already-acquired `Instance` |
+| Terminates the instance? | Yes, at the end of the ramp | No — releasing a slice never terminates the host instance |
+| Purpose | K-measurement (spec §8/§9) | Institutional interactive GPU access |
+
+## Boundary with M12 (idle fleet)
+
+Per #109's own framing (the M12/M13 joint reconciliation issue, itself
+downstream of this one): **M12 decides WHICH/HOW MANY whole instances are
+warm and idle; M13's tenancy decides how many concurrent users occupy slices
+WITHIN one such instance once it's handed over.**
+
+Concretely: `internal/plan/acquire.go`'s `Acquirer` (and M12's pool-worker
+layer, `internal/pool`) is the ONLY thing that ever calls AWS to acquire or
+release an EC2 instance. Tenancy's check-out/check-in primitive receives an
+already-live `Instance` handle (or, in the pool case, an already-resident
+`warm.Supervisor`) from that layer and operates strictly WITHIN it —
+subdividing GPU access on hardware someone else acquired, never acquiring
+hardware itself. A tenancy check-out failing (no free slice) is a signal for
+the FLEET layer to consider acquiring another instance; tenancy itself never
+makes that call.
+
+This mirrors the M12 pool worker's own layering discipline (per
+`docs/pool-queue-contract.md`): `internal/pool.Worker` never calls
+`plan.Acquirer` either — it's handed an instance's worth of compute by
+`calque pool create`'s cohort provisioning and operates within it. Tenancy
+is the SAME shape one level further down: subdividing what the fleet layer
+already provisioned, rather than provisioning it.
+
+## What this unblocks
+
+- **MIG slice provisioning issue**: has a named lifecycle (check-out/
+  check-in) to implement against, and a clear non-goal (it does not acquire
+  instances) so its scope stays bounded to "manage slices on an instance
+  I'm handed."
+- **MPS trusted-tenant issue**: same lifecycle, same non-goal — the two
+  issues differ only in whether the slice is hardware-isolated (MIG) or
+  software-cooperative (MPS), not in how a user checks in/out.
+- **#109 (M12/M13 joint boundary doc)**: can cite this note's boundary
+  statement directly rather than re-deriving it.
+- **A future rename issue** for `cmd/calque/session.go` → `cmd/calque/ramp.go`
+  (`calque session` → `calque ramp`) is now well-defined; not attempted here
+  per this issue's own explicit "design-only, no code" scope.
