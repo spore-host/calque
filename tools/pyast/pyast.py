@@ -344,12 +344,19 @@ class Collector(ast.NodeVisitor):
                 cls_kwargs.update(_decorator_kwargs(d))
         methods: list[dict[str, Any]] = []
         enter: dict[str, Any] | None = None
+        exit_: dict[str, Any] | None = None
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 mdecos = [_decorator_name(dd) for dd in item.decorator_list]
                 desc = _describe_fn(self.src, item)  # type: ignore[arg-type]
                 if any(dd.endswith("enter") for dd in mdecos):
                     enter = desc
+                elif any(dd.endswith("exit") for dd in mdecos):
+                    # calque#86: @modal.exit() runs ONCE at container shutdown —
+                    # the documented pair to @enter. Previously fell into the
+                    # generic "plain method" bucket below and would have been
+                    # invoked on EVERY item if ever picked as a per-item method.
+                    exit_ = desc
                 elif any(dd.endswith("method") for dd in mdecos):
                     methods.append(desc)
                 else:
@@ -360,6 +367,7 @@ class Collector(ast.NodeVisitor):
                 "lineno": node.lineno,
                 "cls_kwargs": cls_kwargs,
                 "enter": enter,
+                "exit": exit_,
                 "methods": methods,
             }
         )

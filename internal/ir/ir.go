@@ -95,6 +95,7 @@ type Class struct {
 	Timeout   int
 	Config    Config     // portable decorator config (§B)
 	EnterBody string     // @modal.enter body — runs ONCE in the warm runner (§6)
+	HasExit   bool       // @modal.exit() present (calque#86); teardown is not reproduced
 	Methods   []Function // @modal.method bodies
 	Line      int
 }

@@ -80,6 +80,7 @@ type pyClass struct {
 	Lineno    int                        `json:"lineno"`
 	ClsKwargs map[string]json.RawMessage `json:"cls_kwargs"`
 	Enter     *pyFunc                    `json:"enter"`
+	Exit      *pyFunc                    `json:"exit"` // @modal.exit(); calque#86
 	Methods   []pyFunc                   `json:"methods"`
 }
 
@@ -425,6 +426,15 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 		// don't apply — worth noting since it changes the amortization story.
 		rep.Addf(leak.PrimEnter, leak.KindUnhandledCase, script, c.Lineno,
 			"@cls %q has no @enter; no warm load-once body to run", c.Name)
+	}
+	if c.Exit != nil {
+		// calque#86: @modal.exit() runs ONCE at container shutdown — the warm
+		// supervisor has no shutdown-hook concept, so this is not reproduced.
+		// Excluded from cls.Methods (unlike before the fix, where it fell into
+		// the generic "plain method" bucket and could be invoked per-item).
+		cls.HasExit = true
+		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, script, c.Exit.Lineno,
+			"@cls %q has @modal.exit(); container-shutdown teardown is not reproduced by the warm supervisor", c.Name)
 	}
 	for _, m := range c.Methods {
 		method := buildFn(m, script, rep, invokes)

@@ -314,3 +314,43 @@ func TestParseVolumeCommitLeaksWriteback(t *testing.T) {
 		t.Errorf("volume write-back not leaked (commit=%v reload=%v); leaks=%+v", sawCommit, sawReload, rep.Leaks)
 	}
 }
+
+// TestParseExitHookExcludedFromMethods (calque#86): @modal.exit() is the
+// documented pair to @enter — it must NOT be mistaken for a per-item @method.
+// Before the fix, it fell into the same untagged bucket as a plain method and
+// could be picked as the warm unit's sole callable, running teardown on every
+// item instead of once at shutdown.
+func TestParseExitHookExcludedFromMethods(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/exit_hook.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(app.Classes) != 1 {
+		t.Fatalf("classes = %d, want 1", len(app.Classes))
+	}
+	cls := app.Classes[0]
+	if !cls.HasExit {
+		t.Error("HasExit = false, want true (Batcher has @modal.exit())")
+	}
+	for _, m := range cls.Methods {
+		if m.Name == "cleanup" {
+			t.Errorf("cleanup (@modal.exit()) must be excluded from Methods, got %+v", cls.Methods)
+		}
+	}
+	if len(cls.Methods) != 1 || cls.Methods[0].Name != "generate" {
+		t.Errorf("Methods = %+v, want exactly [generate]", cls.Methods)
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "@modal.exit()") && strings.Contains(l.Detail, "not reproduced") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("@modal.exit() should leak that teardown isn't reproduced; leaks=%+v", rep.Leaks)
+	}
+}
