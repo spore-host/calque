@@ -76,6 +76,13 @@ func run(o runOpts) error {
 		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
 			"%s: plain @app.function, no @cls+@enter — no warm-reuse economics to amortize across items; K here measures a different thing than a @cls+@enter warm unit's K", unit.method.Name)
 	}
+	// calque#83: the warm runner only binds ONE positional arg per item (§6
+	// protocol) and always collects+returns a result. .starmap/.for_each are
+	// classified at the IR layer but were silently run as if .map'd — check
+	// explicitly rather than let the mismatch surface as a mystery failure.
+	if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
+		return err
+	}
 
 	// 2a. route-away gate (§11, G3): before recommend/acquire, check whether this
 	// model is already an exact Bedrock API call. If so, renting a GPU is the wrong
@@ -253,6 +260,27 @@ func swapLegal(glog *gpu.Log, owner string) bool {
 		}
 	}
 	return false
+}
+
+// checkInvokeSupport reports whether the warm runner's single-arg,
+// always-collects-a-result protocol (§6) can faithfully drive fn's invocation
+// idiom (calque#83). .starmap needs tuple-splat (multiple positional args per
+// item) — running it as .map would bind only the first and crash every item
+// (confirmed via a live repro: a raw NameError for the unbound second+ arg,
+// with nothing pointing at the real cause) — so this returns a hard error
+// naming the mismatch instead. .for_each shares .map's single-arg signature
+// and runs correctly; the only difference is Modal discards the return value
+// where calque collects+reports it — a leak, not a refusal, since nothing
+// crashes and the mismatch is honest but minor.
+func checkInvokeSupport(script string, fn ir.Function, rep *leak.Report) error {
+	switch fn.Invoke {
+	case ir.InvokeStarmap:
+		return fmt.Errorf("%s is .starmap()'d (tuple-splat args); the warm runner only binds one positional arg per item (§6) and would crash every item — not yet supported, see leak report", fn.Name)
+	case ir.InvokeForEach:
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, fn.Line,
+			"%s is .for_each()'d (side-effects only, no result collection in real Modal); calque collects+reports a result per item anyway — harmless but not a faithful .for_each", fn.Name)
+	}
+	return nil
 }
 
 // dryRunWarm drives the real warmd supervisor + runner.py LOCALLY over a small

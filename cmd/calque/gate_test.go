@@ -1,10 +1,12 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/spore-host/calque/internal/gate"
 	"github.com/spore-host/calque/internal/ir"
+	"github.com/spore-host/calque/internal/leak"
 )
 
 // TestPrintOffersAndStop locks the G3 short-circuit contract: an exact offer means
@@ -94,5 +96,52 @@ func TestPickWarmUnitPrefersClassOverPlainFunction(t *testing.T) {
 	}
 	if unit.class.Name != "Batcher" || unit.method.Name != "generate" {
 		t.Errorf("unit = %+v, want the Batcher class's generate method", unit)
+	}
+}
+
+// TestCheckInvokeSupportStarmapRefuses (calque#83): the warm runner only binds
+// one positional arg per item — a .starmap'd unit (tuple-splat) would crash
+// every item if run silently as .map. Must refuse with a clear reason.
+func TestCheckInvokeSupportStarmapRefuses(t *testing.T) {
+	rep := &leak.Report{}
+	fn := ir.Function{Name: "combine", Invoke: ir.InvokeStarmap}
+	if err := checkInvokeSupport("script.py", fn, rep); err == nil {
+		t.Fatal("expected an error refusing a .starmap'd warm unit, got nil")
+	}
+}
+
+// TestCheckInvokeSupportForEachLeaksNotRefuses (calque#83): .for_each shares
+// .map's single-arg signature and runs correctly — the mismatch (Modal
+// discards the result, calque collects it) is a leak, not a crash, so this
+// must NOT error.
+func TestCheckInvokeSupportForEachLeaksNotRefuses(t *testing.T) {
+	rep := &leak.Report{}
+	fn := ir.Function{Name: "notify", Invoke: ir.InvokeForEach, Line: 7}
+	if err := checkInvokeSupport("script.py", fn, rep); err != nil {
+		t.Fatalf("checkInvokeSupport(.for_each) must not error, got: %v", err)
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "notify") && strings.Contains(l.Detail, ".for_each()") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf(".for_each mismatch should be leaked; leaks=%+v", rep.Leaks)
+	}
+}
+
+// TestCheckInvokeSupportMapAndRemoteAreFine: .map and .remote share the warm
+// runner's single-arg, collect-a-result shape exactly — no error, no leak.
+func TestCheckInvokeSupportMapAndRemoteAreFine(t *testing.T) {
+	rep := &leak.Report{}
+	for _, kind := range []ir.InvokeKind{ir.InvokeMap, ir.InvokeRemote, ir.InvokeNone} {
+		fn := ir.Function{Name: "f", Invoke: kind}
+		if err := checkInvokeSupport("script.py", fn, rep); err != nil {
+			t.Errorf("checkInvokeSupport(%q) must not error, got: %v", kind, err)
+		}
+	}
+	if len(rep.Leaks) != 0 {
+		t.Errorf("map/remote/none must not leak; leaks=%+v", rep.Leaks)
 	}
 }
