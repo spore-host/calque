@@ -470,6 +470,18 @@ func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner
 		case "gpu":
 			if s, ok := decodeString(raw); ok {
 				gpu = s
+			} else if lst, ok := decodeStringList(raw); ok && len(lst) > 0 {
+				// calque#85: gpu=["H100", "A100-40GB:2"] is Modal's fallback-list
+				// syntax — try each type in list order until one has capacity.
+				// calque has no live-availability probe at parse time, so it can't
+				// reproduce the fallback itself; take the FIRST (highest-preference)
+				// entry as the single gpu= value and leak the rest as unreproduced,
+				// rather than hit the generic "not a plain string literal" message.
+				gpu = lst[0]
+				if len(lst) > 1 {
+					rep.Addf(leak.PrimGPU, leak.KindSemanticGap, script, line,
+						"%s: gpu=%v fallback-list — using first preference %q; the list's try-in-order-until-available semantic is not reproduced (no live availability probe at parse time)", owner, lst, lst[0])
+				}
 			} else {
 				rep.Addf(leak.PrimGPU, leak.KindUnsupportedArg, script, line,
 					"%s: gpu= is not a plain string literal (%s); cannot apply rewrite rule", owner, string(raw))
@@ -595,6 +607,17 @@ func decodeIntList(raw json.RawMessage) ([]int, bool) {
 
 func decodeFloatList(raw json.RawMessage) ([]float64, bool) {
 	var xs []float64
+	if err := json.Unmarshal(raw, &xs); err == nil {
+		return xs, true
+	}
+	return nil, false
+}
+
+// decodeStringList decodes a strict []string — unlike decodeStringListBestEffort,
+// it does NOT treat a bare string as a 1-element list (callers checking gpu=
+// already try decodeString first; this is only reached for the list case).
+func decodeStringList(raw json.RawMessage) ([]string, bool) {
+	var xs []string
 	if err := json.Unmarshal(raw, &xs); err == nil {
 		return xs, true
 	}

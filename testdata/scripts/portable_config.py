@@ -22,6 +22,10 @@ warm unit.
 standalone decorator on a plain function (calque#82) — both must route
 through the SAME dedicated "behind the seam" leak as the older spellings
 (`keep_warm` etc. on `transform`), not the generic unmodeled-arg fallback.
+
+`gpu_fallback` exercises Modal's gpu=[...] fallback-list syntax (calque#85)
+— calque has no live-availability probe, so it picks the first preference
+and leaks that the try-in-order semantic isn't reproduced.
 """
 
 import modal
@@ -52,6 +56,11 @@ def scaled(x):
     return x
 
 
+@app.function(gpu=["H100", "A100-40GB:2"])
+def gpu_fallback(x):
+    return x
+
+
 @app.local_entrypoint()
 def main():
     # .map — items -> results (already supported)
@@ -68,3 +77,4 @@ def main():
 def secondary():
     bin_pack.remote(1)
     scaled.remote(1)
+    gpu_fallback.remote(1)

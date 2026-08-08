@@ -68,9 +68,11 @@ dropped/buggy (a real gap — should not stay this way) · ⬜ not present at al
 | Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
 |---|---|---|---|---|---|
 | `gpu=` (single string, e.g. `"H100"`) | Card selection. | 🔥 | ✅ drives the actual clean-swap/flag-multi/flag-couple decision. | — | — |
-| `gpu=` newer type strings: `L40S`, `RTX-PRO-6000`, `H200`, `B200`/`B200+`, `B300` | Card types added since calque's `gpu.go` was written. | 🟡 (growing as newer hardware ships) | ❌ `internal/gpu/gpu.go`'s card vocabulary predates these — a script using them would still parse (card is a bare string, not validated against a known list) but truffle instance-resolution may fail to map them. | Needs verification against current truffle card vocabulary, not just calque's gpu.go. | [#85](https://github.com/spore-host/calque/issues/85) |
+| `gpu=` newer type strings: `L40S`, `H200`, `B200`, `B300` (space-separated forms) | Card types added since calque's `gpu.go` was written. | 🟡 (growing as newer hardware ships) | ✅ verified 2026-08-07 (calque#85) — `internal/gpu/gpu.go`'s card field is an opaque string by design (no local validation), and truffle's `find.ResolveCard` already resolves all four to correct instance families (`H200`→p5e, `L40S`→g6e, `B200`→p6-b200/p6e-gb200, `B300`→p6-b300) — confirmed live, no gap here. | — | closed (no fix needed) |
+| `gpu=` **hyphenated/suffixed** spec strings: `RTX-PRO-6000`, `RTX-PRO-4500`, `A100-80GB`, `H100!`, `B200+` | Modal's own documented spec-string convention uses hyphens for multi-word names and `!`/`+` suffixes for upgrade-pin/opt-in behavior. | 🟡 | ❌ **upstream truffle bug, not calque's.** Confirmed live: `find.ResolveCard("RTX-PRO-6000")` and `("A100-80GB")` both fail to resolve (`resolved to no GPU`) even though the space-separated forms (`"RTX PRO 6000"`, `"A100 80GB"`) work — truffle's tokenizer splits on whitespace only, so a hyphenated multi-word card arrives as one unmatched token. Notably affects calque's OWN default target card: calque's `StubRecommender` defaults to RTX PRO 6000, but a real script spelling it Modal's actual way (`gpu="RTX-PRO-6000"`) would fail to resolve. | Filed upstream: [truffle#130](https://github.com/spore-host/truffle/issues/130). | tracked upstream |
+| `gpu="L40"` (distinct from `L40S`) | L40 (plain) and L40S are physically distinct NVIDIA chips — AWS's `g6` (L40) vs `g6e` (L40S) instance families reflect the distinction directly, not a naming variant. | ⚪ | ❌ **upstream truffle bug, not calque's.** Confirmed live: `find.ResolveCard("L40")` incorrectly resolves to `g6e.*` (L40S's family) via an alias (`"l40": "l40s"`) — a caller asking for the cheaper/different L40 chip silently gets routed to L40S instead, with no signal anything was substituted. | Filed upstream: [truffle#129](https://github.com/spore-host/truffle/issues/129). | tracked upstream |
 | `gpu="H100:8"` (multi-GPU) | >1 card, same physical machine (NVLink-class). | ⚪ | ✅ `FlagMulti` → refuses (by design, §7 guard). | — | — |
-| `gpu=["H100", "A100-40GB:2"]` (fallback-list syntax) | Modal tries types in list order. | 🧊 | ❌ **Not present at all** — `internal/gpu/gpu.go`'s `ParseSpec` assumes a single string; a list would fail `decodeString` and hit the "gpu= is not a plain string literal" leak, losing the whole fallback-list semantic. | Real scripts using this get a generic leak, not a specific one naming the actual construct. | [#85](https://github.com/spore-host/calque/issues/85) |
+| `gpu=["H100", "A100-40GB:2"]` (fallback-list syntax) | Modal tries types in list order. | 🧊 | ✅ (fixed 2026-08-07, calque#85) `readConfigKwargs` now decodes the list, takes the first (highest-preference) entry as `gpu=`, and leaks that the try-in-order-until-available semantic isn't reproduced (no live availability probe at parse time) — instead of the generic "not a plain string literal" message. | calque picks statically; it doesn't probe live availability the way Modal's real fallback does. | closed |
 | `cpu=` (plain number or `(request, limit)` tuple) | Physical cores; tuple limit is a throttle, not OOM-kill. | 🔥 | ✅ (fixed 2026-08-07, calque#77 — tuple form now leaks the dropped limit, mirroring `memory=`) | Recorded but not used for instance sizing (deliberate, behind the seam). | closed |
 | `memory=` (plain int MB or tuple) | MiB; tuple limit is a **hard OOM-kill** ceiling (different failure mode than CPU's throttle). | 🔥 | ✅ recorded+leaked correctly. | Same sizing-deferred caveat as `cpu=`. | — |
 | `retries=` (plain int or `modal.Retries(...)`) | Per-input retry cap; plain int = fixed delay, object = exponential backoff. | ⚪ | ✅ (plain int) wired into the warm supervisor's crash-restart cap — a genuine reliability knob that's honored. `Retries(...)` object form: recognized+leaked (falls back to default cap). | Exponential-backoff semantics not reproduced even when leaked — acceptable per behind-the-seam scope. | — |
@@ -254,9 +256,14 @@ a generic "unmodeled arg" message.
    [#93](https://github.com/spore-host/calque/issues/93).
 5. ~~**`Image.micromamba()`/`from_dockerfile()` base-resolution bug**~~ — closed.
    [#84](https://github.com/spore-host/calque/issues/84) (closed 2026-08-07)
-6. **GPU spec string + fallback-list coverage** — `L40S`, `RTX-PRO-6000`,
-   `H200`, `B200`/`B200+`, `B300`, `gpu=[...]` list syntax.
-   [#85](https://github.com/spore-host/calque/issues/85)
+6. ~~**GPU spec string + fallback-list coverage**~~ — closed.
+   [#85](https://github.com/spore-host/calque/issues/85) (closed 2026-08-07).
+   `gpu=[...]` list syntax fixed in calque; space-separated newer type
+   strings (`L40S`/`H200`/`B200`/`B300`) already worked via truffle. Found
+   two real upstream truffle bugs along the way (hyphenated/suffixed spec
+   strings failing entirely; `L40`/`L40S` conflation) — filed as
+   [truffle#129](https://github.com/spore-host/truffle/issues/129) and
+   [truffle#130](https://github.com/spore-host/truffle/issues/130).
 7. **`@modal.exit()` recognition** — currently invisible, silently merged
    into the untagged-method bucket. [#86](https://github.com/spore-host/calque/issues/86)
 8. **`Function.from_name`/`Cls.from_name` cross-app invocation** — real

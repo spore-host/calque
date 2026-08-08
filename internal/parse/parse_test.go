@@ -191,6 +191,22 @@ func TestParsePortableConfig(t *testing.T) {
 	if len(wantAutoscale) != 0 {
 		t.Errorf("missing dedicated autoscaling leaks for %v; leaks=%+v", wantAutoscale, rep.Leaks)
 	}
+	// gpu=[...] fallback-list syntax: the first preference becomes GPU, and the
+	// try-in-order semantic must be leaked as unreproduced, not hit the generic
+	// "not a plain string literal" message (calque#85).
+	gf := app.Functions[byName["gpu_fallback"]]
+	if gf.GPU != "H100" {
+		t.Errorf("gpu_fallback.GPU = %q, want %q (first preference of gpu=[H100, A100-40GB:2])", gf.GPU, "H100")
+	}
+	foundGPUListLeak := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "fallback-list") && strings.Contains(l.Detail, "H100") {
+			foundGPUListLeak = true
+		}
+	}
+	if !foundGPUListLeak {
+		t.Errorf("gpu=[...] fallback-list should leak the unreproduced try-in-order semantic; leaks=%+v", rep.Leaks)
+	}
 }
 
 // TestParseConcurrentDecoratorMergesIntoClsKwargs (calque#82): @modal.concurrent
