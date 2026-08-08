@@ -50,7 +50,7 @@ dropped/buggy (a real gap — should not stay this way) · ⬜ not present at al
 
 | Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
 |---|---|---|---|---|---|
-| `@app.function(...)` on a plain function | The base serverless unit. | 🔥 (2x as prevalent as `@app.cls`, 118 vs 57 files in modal-examples) | ❌ **`cmd/calque/run.go` `pickWarmUnit` only accepts a `@cls` with `@enter` — a plain `@app.function` is refused entirely** ("no mapped @cls+@enter warm unit found"). This blocks 100% of the real scripts surveyed (AI-Almanac) and, per earth-mover/forecast-datacube-demo, a whole class of scheduled-pipeline apps that use nothing else. | **Highest-priority gap.** [#80](https://github.com/spore-host/calque/issues/80) |
+| `@app.function(...)` on a plain function | The base serverless unit. | 🔥 (2x as prevalent as `@app.cls`, 118 vs 57 files in modal-examples) | ✅ (fixed 2026-08-07, calque#80 — `pickWarmUnit` now selects a plain function, preferring a `.map()`'d one, else the first, when no `@cls`+`@enter` unit exists; leaks that no warm-reuse economics exist to amortize; verified end-to-end against all three real AI-Almanac scripts, which previously refused outright) | Was blocking 100% of real scripts surveyed; now runs (leaks surface the OTHER already-tracked gaps instead — image resolution, cpu/memory sizing, secrets, etc.). | closed |
 | `@app.cls(...)` + `@modal.enter()` (no `.map()`) | Holds loaded state (model, DB connection) for `.remote()`-called or web-endpoint-served inference. | 🟡 (very common in GPU-serving apps, frequently paired with `@asgi_app` rather than `.map()`) | ✅ recognized, but `pickWarmUnit` only *selects* it as the runnable shape when a `.map()`'d method exists or falls back to "first method" — a `@cls`+`@enter` used purely for `.remote()` calls (no `.map()` at all) is still selected via the fallback, so this mostly works today. | — | — |
 | `@app.cls` + `@modal.enter()` + `.map()` (calque's ONLY currently-runnable shape) | "Load model once, batch-score many." | ⚪ (~5-10% of files; plain-function `.map()` is at least as common even among `.map()` users — 16/26 vs 10/26 files) | ✅ | This is not the dominant shape it was built around — see §A row above. | — |
 | `@modal.enter(snap=False)` | Runs once per container at startup, before any input. `snap=True` marks pre-snapshot code (see §I memory snapshots). | 🔥 (wherever `@cls` is used) | ✅ body carried as `ir.Class.EnterBody`, actually run once by `warmd`. `snap=` kwarg itself unrecognized (falls through to generic "unmodeled arg"). | Memory-snapshot semantics (`snap=True` vs default) aren't distinguished — low-risk since calque doesn't do container snapshotting at all. | — |
@@ -140,7 +140,7 @@ dropped/buggy (a real gap — should not stay this way) · ⬜ not present at al
 | `@cls`+`@enter`+`.map()`'d method | The only shape `pickWarmUnit` (`cmd/calque/run.go`) selects without a fallback heuristic. | ⚪ minority (~5-10% of real scripts) | Working as designed, but the design targets a minority shape. |
 | `@cls`+`@enter`, no `.map()`'d method | Falls back to "first method" — runnable, but an arbitrary pick if there's real ambiguity; no leak for this specific fallback. | 🟡 common | Acceptable for now; could use a leak noting the fallback was used. |
 | `@cls`, no `@enter` | Skipped entirely as a warm-unit candidate; separately leaked ("@cls has no @enter"). | 🧊 | Correct — a class with no warm-load-once body genuinely doesn't fit the model. |
-| Plain `@app.function`, no `@cls` anywhere | **Refused outright** — `run()` returns `fmt.Errorf("no mapped @cls+@enter warm unit found")`. No leak recorded for this top-level "nothing runnable" case (a Go error, not a `leak.Report` entry — wouldn't show up in a leak-census aggregation). | 🔥 **the most common real shape**, and the one blocking every AI-Almanac script | **The headline gap this session's code change addresses.** |
+| Plain `@app.function`, no `@cls` anywhere | ✅ (closed, calque#80) `pickWarmUnit` selects the `.map()`'d function if any, else the first, wrapping it in a synthesized zero-value `ir.Class` so `dryRunWarm`'s existing `unit.class.*` reads need no changes. Also fixed `swapLegal` to accept `gpu.NoGPU` (a plain CPU function) — it previously treated "no gpu= declared" as an illegal swap, identical to a flagged multi-GPU/coupled one, invisible until a GPU-free plain function became reachable. | 🔥 **the most common real shape**, and the one that was blocking every AI-Almanac script | Verified against `testdata/scripts/plain_function.py` and a fresh clone of all three real AI-Almanac scripts — all now run past warm-unit selection. |
 | Serve-shaped app, no batch warm unit | Detected, leaked as deferred, Bedrock route-away still runs, returns cleanly (no error). | 🟡 | Working as designed — documented non-goal (`docs/serve-architecture.md`). |
 
 ---
@@ -240,9 +240,8 @@ a generic "unmodeled arg" message.
 
 ## Prioritized backlog (sequenced by Pass 3 frequency, highest-leverage first)
 
-1. **Plain `@app.function` as a runnable warm unit** — closes the actual
-   blocker in calque#79. [#80](https://github.com/spore-host/calque/issues/80)
-   *(this session's code change)*
+1. ~~**Plain `@app.function` as a runnable warm unit**~~ — closed the actual
+   blocker in calque#79. [#80](https://github.com/spore-host/calque/issues/80) (closed 2026-08-07)
 2. **`.local()` recognition** — currently zero trace; small once (1) lands.
    [#81](https://github.com/spore-host/calque/issues/81)
 3. **Newer autoscaling-kwarg spellings + `@modal.concurrent`** — extend the

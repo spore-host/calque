@@ -68,6 +68,14 @@ func run(o runOpts) error {
 		return fmt.Errorf("no mapped @cls+@enter warm unit found in %s (spike targets map_batch shape)", o.script)
 	}
 	fmt.Printf("warm unit: class %q, method %q, gpu asked-for %q\n", unit.class.Name, unit.method.Name, unit.class.GPU)
+	if unit.plainFunction {
+		// calque#80: a plain @app.function has no @enter — no once-per-container
+		// load to amortize across items. Any K computed against it measures
+		// something different than a warm @cls+@enter unit's reuse economics;
+		// say so rather than silently reporting a K that reads the same as one.
+		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"%s: plain @app.function, no @cls+@enter — no warm-reuse economics to amortize across items; K here measures a different thing than a @cls+@enter warm unit's K", unit.method.Name)
+	}
 
 	// 2a. route-away gate (§11, G3): before recommend/acquire, check whether this
 	// model is already an exact Bedrock API call. If so, renting a GPU is the wrong
@@ -163,10 +171,20 @@ func run(o runOpts) error {
 	return nil
 }
 
-// warmUnit is a @cls with an @enter and a .map'd @method — the spike's target shape.
+// warmUnit is the callable calque actually drives through the warm supervisor:
+// either a @cls with @enter and a .map'd @method (the spike's original target
+// shape), or — calque#79/#80 — a plain @app.function with no @cls at all, which
+// real-world Modal code uses roughly 2x as often (Pass 3 frequency survey,
+// docs/modal-compatibility-matrix.md §B/§G). A plain function has no once-per-
+// container load, so `class` is a synthesized zero-value ir.Class (EnterBody ""
+// — Runner.enter() treats an empty body as a no-op) wrapping the function as its
+// sole "method". plainFunction records this so callers can leak the missing
+// warm-reuse economics rather than silently reporting a K that means something
+// different than it does for a real warm unit.
 type warmUnit struct {
-	class  ir.Class
-	method ir.Function
+	class         ir.Class
+	method        ir.Function
+	plainFunction bool
 }
 
 func pickWarmUnit(app ir.App) (warmUnit, bool) {
@@ -184,7 +202,26 @@ func pickWarmUnit(app ir.App) (warmUnit, bool) {
 			return warmUnit{class: c, method: c.Methods[0]}, true
 		}
 	}
+	// No @cls+@enter unit — prefer a plain function that's .map'd (closest
+	// analog to the class-based shape: many items through one warm process),
+	// else fall back to the first plain function (single-call replay, §G).
+	for _, f := range app.Functions {
+		if f.IsMap {
+			return warmUnit{class: syntheticClass(f), method: f, plainFunction: true}, true
+		}
+	}
+	if len(app.Functions) > 0 {
+		f := app.Functions[0]
+		return warmUnit{class: syntheticClass(f), method: f, plainFunction: true}, true
+	}
 	return warmUnit{}, false
+}
+
+// syntheticClass wraps a plain @app.function's config in a zero-value ir.Class
+// so the rest of run.go (which reads unit.class.* throughout) doesn't need a
+// separate code path for the plain-function case.
+func syntheticClass(f ir.Function) ir.Class {
+	return ir.Class{Name: f.Name, GPU: f.GPU, Config: f.Config, Line: f.Line}
 }
 
 // serveApp reports whether the app has any serve-shaped entrypoint (§F). Serve is
@@ -203,10 +240,16 @@ func serveApp(app ir.App) bool {
 	return false
 }
 
+// swapLegal reports whether owner's gpu= site is safe to proceed with: a clean
+// substitution, or no gpu= at all (a plain CPU function — legal, not a swap).
+// Only FlagMulti/FlagCouple (an actually-flagged swap) refuses. calque#80: this
+// used to implicitly require gpu.CleanSwap, which rejected every no-GPU plain
+// function — invisible while every @cls fixture declared gpu=, surfaced once
+// plain @app.functions (commonly GPU-free pipeline steps) became runnable.
 func swapLegal(glog *gpu.Log, owner string) bool {
 	for _, s := range glog.Subs {
 		if s.Owner == owner {
-			return s.Disposition == gpu.CleanSwap
+			return s.Disposition == gpu.CleanSwap || s.Disposition == gpu.NoGPU
 		}
 	}
 	return false
