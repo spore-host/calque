@@ -26,6 +26,22 @@ type Measured struct {
 	// for before any work) + any warm-idle; part of the AWS rectangle (§8).
 	AcquireSeconds float64
 	EnterSeconds   float64 // one-time warm @enter load (amortized across items)
+
+	// WarmHit is true when THIS run's AcquireSeconds/EnterSeconds reflect a
+	// shared-pool warm hit (calque#100/#101's pool worker was already resident
+	// and loaded — the caller reports near-zero fixed cost for this run) rather
+	// than a dedicated acquire-and-load (the pool/session/real default: this run
+	// paid the FULL fixed cost alone, per docs/pool-queue-contract.md). It does
+	// not change how the model computes anything — AcquireSeconds/EnterSeconds
+	// are used exactly as given either way — it only changes what the verdict
+	// SAYS about what those numbers mean, so a reader doesn't assume a hit's
+	// near-zero fixed cost is the STEADY STATE for every run against a shared
+	// pool (most runs might hit; the one that triggers a cold load pays the
+	// whole fixed cost alone, and reporting every run's K as if it were that one
+	// misattributes cost, exactly as reporting every run's K as if it always hit
+	// warm would understate it). Zero-value (false) is today's existing
+	// dedicated-acquisition behavior — no change for any pre-#102 caller.
+	WarmHit bool
 }
 
 // SideCost is one side's total dollars at a given item count.
@@ -256,7 +272,22 @@ func (m *Model) Verdict(atItems int) (string, error) {
 		fmt.Fprintf(&b, "NOTE: occupancy is a WHOLE-RUN mean (includes %s), so it\n"+
 			"      understates steady-state GPU fill and makes this K pessimistic for AWS.\n", load)
 	}
+	fmt.Fprintf(&b, "%s\n", m.warmHitLabel())
 	return b.String(), nil
+}
+
+// warmHitLabel names WHICH fixed-cost regime this K's AcquireSeconds/EnterSeconds
+// came from (calque#102), mirroring occScopeLabel's discipline: an amortized-cost
+// number is only auditable if the reader is told which regime produced it, not
+// left to assume every run against a shared pool costs the same as this one.
+func (m *Model) warmHitLabel() string {
+	if m.M.WarmHit {
+		return "Fixed cost regime: WARM HIT — this run reused an already-loaded pool worker " +
+			"(near-zero acquire+enter); most runs against a healthy pool look like this, but the " +
+			"run that triggers a cold load pays the full fixed cost alone (see a non-warm-hit K for that number)."
+	}
+	return "Fixed cost regime: DEDICATED ACQUISITION — this run paid the full acquire+enter cost alone " +
+		"(today's default outside a shared pool; calque#100/#101)."
 }
 
 // occScopeLabel renders the occupancy window for the verdict line.

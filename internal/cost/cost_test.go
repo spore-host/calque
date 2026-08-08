@@ -179,3 +179,44 @@ func TestVerdictLabelsOccupancyScope(t *testing.T) {
 		t.Errorf("unlabeled occupancy must warn like whole_run does, got:\n%s", v3)
 	}
 }
+
+// TestVerdictLabelsFixedCostRegime proves K declares WHETHER its
+// AcquireSeconds/EnterSeconds came from a shared-pool warm hit or a dedicated
+// acquisition (calque#102) — the same near-zero fixed cost means two very
+// different things (steady state for most pool runs vs. this SPECIFIC run's
+// full cost) depending on which regime produced it, mirroring
+// TestVerdictLabelsOccupancyScope's occupancy-scope discipline.
+func TestVerdictLabelsFixedCostRegime(t *testing.T) {
+	r := loadTestRates(t)
+	base := Measured{
+		CardAskedFor: "H100", InstanceUsed: "g7e.2xlarge",
+		SecPerItem: 0.5, Occupancy: 0.95, SampleItems: 100,
+	}
+
+	dedicated := base
+	dedicated.AcquireSeconds, dedicated.EnterSeconds = 120, 30
+	v, err := (&Model{Rates: r, M: dedicated}).Verdict(100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(v, "DEDICATED ACQUISITION") {
+		t.Errorf("default (WarmHit=false) K must label itself DEDICATED ACQUISITION, got:\n%s", v)
+	}
+	if strings.Contains(v, "WARM HIT") {
+		t.Errorf("dedicated-acquisition K must NOT claim a warm hit, got:\n%s", v)
+	}
+
+	warmHit := base
+	warmHit.AcquireSeconds, warmHit.EnterSeconds = 0, 0 // this run reused an already-loaded worker
+	warmHit.WarmHit = true
+	v2, err := (&Model{Rates: r, M: warmHit}).Verdict(100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(v2, "WARM HIT") {
+		t.Errorf("WarmHit=true K must label itself WARM HIT, got:\n%s", v2)
+	}
+	if strings.Contains(v2, "DEDICATED ACQUISITION") {
+		t.Errorf("warm-hit K must NOT claim a dedicated acquisition, got:\n%s", v2)
+	}
+}

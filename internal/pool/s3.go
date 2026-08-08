@@ -54,16 +54,21 @@ func (r *S3Results) Sink(man calexec.Manifest) warm.Sink {
 }
 
 // poolSummary is the completion record a pool claim writes — deliberately
-// smaller than cmd/warmd's full Summary (no occupancy/enter-seconds
-// bookkeeping here; those belong to the AMORTIZED cost-attribution work,
-// calque#102, tracked separately so this issue doesn't grow to cover it).
+// smaller than cmd/warmd's full Summary (no occupancy bookkeeping here). It
+// carries just enough for a submitter to feed cost.Measured honestly
+// (calque#102): WarmHit tells the submitter whether THIS claim's
+// AcquireSeconds/EnterSeconds should be reported as near-zero (a pool hit)
+// or the pool's own dedicated first-load cost (a miss) — the submitter,
+// not the worker, ultimately builds the cost.Model, since only the
+// submitter knows the run's item count and card-asked-for.
 type poolSummary struct {
-	Failed []int `json:"failed"`
+	Failed  []int `json:"failed"`
+	WarmHit bool  `json:"warm_hit"`
 }
 
 // WriteSummary implements ResultWriter.
-func (r *S3Results) WriteSummary(ctx context.Context, man calexec.Manifest, failed []int) error {
-	body, err := json.Marshal(poolSummary{Failed: failed})
+func (r *S3Results) WriteSummary(ctx context.Context, man calexec.Manifest, failed []int, warmHit bool) error {
+	body, err := json.Marshal(poolSummary{Failed: failed, WarmHit: warmHit})
 	if err != nil {
 		return err
 	}

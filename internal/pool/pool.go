@@ -72,10 +72,13 @@ type ResultWriter interface {
 	// batch — implementations key it by the manifest's own Bucket/ResultPrefix
 	// so concurrent claims' results never collide.
 	Sink(man calexec.Manifest) warm.Sink
-	// WriteSummary persists the claim's completion record (failed indices) so
-	// a submitter polling man.SummaryKey (via calexec.WaitForSummary, reused
-	// unmodified) observes the claim as done.
-	WriteSummary(ctx context.Context, man calexec.Manifest, failed []int) error
+	// WriteSummary persists the claim's completion record (failed indices,
+	// plus warmHit — calque#102: was the resident runner already warm and
+	// loaded when this claim was served, or did this claim pay a fresh
+	// acquire+@enter?) so a submitter polling man.SummaryKey (via
+	// calexec.WaitForSummary, reused unmodified) observes the claim as done
+	// AND knows which fixed-cost regime to feed cost.Measured.WarmHit with.
+	WriteSummary(ctx context.Context, man calexec.Manifest, failed []int, warmHit bool) error
 }
 
 // Queue is the slice of spawn's taskpool.Queue this package needs — an
@@ -201,7 +204,13 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 		return
 	}
 
-	if !w.Supervisor.IsWarm() {
+	// Capture BEFORE DrainBatch: this is "was the runner already warm when THIS
+	// claim arrived" (calque#102's WarmHit), not "is it warm now" (DrainBatch
+	// always leaves it warm on a clean drain, which would make every claim
+	// after the pool's first look like a hit regardless of whether IT paid a
+	// reload after a crash).
+	wasWarm := w.Supervisor.IsWarm()
+	if !wasWarm {
 		w.Supervisor.Config = warm.Config{EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg}
 	}
 	w.Supervisor.Sink = w.Results.Sink(man)
@@ -217,7 +226,7 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 		return
 	}
 
-	if serr := w.Results.WriteSummary(ctx, man, failed); serr != nil {
+	if serr := w.Results.WriteSummary(ctx, man, failed, wasWarm); serr != nil {
 		// Wrote results (if any landed before this point they're already in the
 		// sink) but couldn't signal completion. Leave un-acked: a redelivery
 		// re-drains against the (still warm, unaffected) resident runner and

@@ -115,8 +115,9 @@ type fakeResults struct {
 }
 
 type writtenSummary struct {
-	man    calexec.Manifest
-	failed []int
+	man     calexec.Manifest
+	failed  []int
+	warmHit bool
 }
 
 func (f *fakeResults) Sink(_ calexec.Manifest) warm.Sink {
@@ -127,13 +128,13 @@ func (f *fakeResults) Sink(_ calexec.Manifest) warm.Sink {
 	return s
 }
 
-func (f *fakeResults) WriteSummary(_ context.Context, man calexec.Manifest, failed []int) error {
+func (f *fakeResults) WriteSummary(_ context.Context, man calexec.Manifest, failed []int, warmHit bool) error {
 	if f.writeErr != nil {
 		return f.writeErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.summaries = append(f.summaries, writtenSummary{man: man, failed: failed})
+	f.summaries = append(f.summaries, writtenSummary{man: man, failed: failed, warmHit: warmHit})
 	return nil
 }
 
@@ -256,6 +257,15 @@ func TestWorker_StaysWarmAcrossClaims(t *testing.T) {
 	call := int(secondSinkResults[0].Result.(map[string]any)["call"].(float64))
 	if call != 2 {
 		t.Errorf("second claim's result call=%d, want 2 (runner state did not persist across claims)", call)
+	}
+	// calque#102: the first claim pays the cold load (warmHit=false); the
+	// second reuses the resident runner (warmHit=true) — this is the exact
+	// signal a submitter needs to report cost.Measured.WarmHit honestly.
+	if results.summaries[0].warmHit {
+		t.Error("first claim's summary reports warmHit=true, want false (it triggered the cold load)")
+	}
+	if !results.summaries[1].warmHit {
+		t.Error("second claim's summary reports warmHit=false, want true (it reused the resident runner)")
 	}
 }
 
