@@ -26,6 +26,9 @@ through the SAME dedicated "behind the seam" leak as the older spellings
 `gpu_fallback` exercises Modal's gpu=[...] fallback-list syntax (calque#85)
 — calque has no live-availability probe, so it picks the first preference
 and leaks that the try-in-order semantic isn't reproduced.
+
+`transform`'s cloud="aws" exercises cloud= recognition (calque#91) — mirrors
+region=, recorded but not honored (calque always targets AWS regardless).
 """
 
 import modal
@@ -35,7 +38,9 @@ app = modal.App("portable-config")
 image = modal.Image.debian_slim().pip_install("numpy")
 
 
-@app.function(cpu=4, memory=8192, retries=3, region="us-west-2", keep_warm=1, image=image)
+@app.function(
+    cpu=4, memory=8192, retries=3, region="us-west-2", cloud="aws", keep_warm=1, image=image
+)
 def transform(x):
     return x * 2
 

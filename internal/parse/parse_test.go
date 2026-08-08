@@ -116,8 +116,8 @@ func TestParsePortableConfig(t *testing.T) {
 		byName[f.Name] = i
 	}
 	tr := app.Functions[byName["transform"]]
-	if tr.Config.CPU != 4 || tr.Config.MemoryMB != 8192 || tr.Config.Retries != 3 || tr.Config.Region != "us-west-2" {
-		t.Errorf("transform.Config = %+v, want cpu4/mem8192/retries3/us-west-2", tr.Config)
+	if tr.Config.CPU != 4 || tr.Config.MemoryMB != 8192 || tr.Config.Retries != 3 || tr.Config.Region != "us-west-2" || tr.Config.Cloud != "aws" {
+		t.Errorf("transform.Config = %+v, want cpu4/mem8192/retries3/us-west-2/aws", tr.Config)
 	}
 	// Invocation idioms: transform is both .map and .for_each -> map wins (precedence).
 	if tr.Invoke != ir.InvokeMap {
@@ -206,6 +206,17 @@ func TestParsePortableConfig(t *testing.T) {
 	}
 	if !foundGPUListLeak {
 		t.Errorf("gpu=[...] fallback-list should leak the unreproduced try-in-order semantic; leaks=%+v", rep.Leaks)
+	}
+	// cloud= (calque#91): recorded (checked above via Config.Cloud) and leaked
+	// as unhonored, mirroring region=.
+	foundCloudLeak := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "cloud=") && strings.Contains(l.Detail, "NOT honored") {
+			foundCloudLeak = true
+		}
+	}
+	if !foundCloudLeak {
+		t.Errorf("cloud= should leak that it's recorded but not honored; leaks=%+v", rep.Leaks)
 	}
 }
 

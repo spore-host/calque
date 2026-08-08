@@ -334,6 +334,9 @@ func mergeConfig(dst, src ir.Config) ir.Config {
 	if src.Region != "" {
 		dst.Region = src.Region
 	}
+	if src.Cloud != "" {
+		dst.Cloud = src.Cloud
+	}
 	return dst
 }
 
@@ -605,6 +608,16 @@ func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner
 			}
 			rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, script, line,
 				"%s: region= placement hint recorded but NOT honored (acquisition sweeps offered AZs)", owner)
+		case "cloud":
+			// calque#91: cloud= picks AWS/GCP/OCI/auto — directly relevant to
+			// calque's own translation story (a script already saying
+			// cloud="aws" is telling you something calque should probably read),
+			// but calque only ever targets AWS regardless of this value.
+			if s, ok := decodeString(raw); ok {
+				cfg.Cloud = s
+			}
+			rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, script, line,
+				"%s: cloud= recorded but NOT honored (calque always targets AWS)", owner)
 		case "image":
 			// image=var reference; recorded structurally, resolution is at app level.
 		case "__splat__":

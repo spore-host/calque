@@ -69,6 +69,7 @@ type Config struct {
 	Secrets  []string // secret names referenced (recorded; not honored in the spike)
 	Schedule string   // schedule= (e.g. "0 * * * *"); recorded, not honored
 	Region   string   // region= placement hint; recorded, not honored
+	Cloud    string   // cloud= ("aws"/"gcp"/"oci"/"auto"); recorded, not honored (calque#91)
 }
 
 // Function is an @app.function (or, when embedded in a Class, an @method).
