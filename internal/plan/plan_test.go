@@ -1,18 +1,16 @@
 package plan
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"testing"
-	"time"
 
 	"github.com/aws/smithy-go"
 
-	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/target"
 )
 
-// apiErr is a fake smithy.APIError with a chosen code, to drive classify().
+// apiErr is a fake smithy.APIError with a chosen code, to drive errorCode().
 type apiErr struct{ code string }
 
 func (e apiErr) Error() string                 { return e.code }
@@ -22,184 +20,35 @@ func (e apiErr) ErrorFault() smithy.ErrorFault { return smithy.FaultServer }
 
 var _ smithy.APIError = apiErr{}
 
-// scriptedLauncher returns the queued errors in order, then succeeds.
-type scriptedLauncher struct {
-	errs  []error
-	calls int
-}
-
-func (s *scriptedLauncher) Provision(_ context.Context, instanceType, region, az, subnet string) (LaunchOutcome, error) {
-	i := s.calls
-	s.calls++
-	if i < len(s.errs) {
-		return LaunchOutcome{}, s.errs[i]
-	}
-	landedAZ := az
-	if landedAZ == "" {
-		landedAZ = region + "a"
-	}
-	return LaunchOutcome{InstanceID: "i-abc123", AvailabilityZone: landedAZ, PublicIP: "1.2.3.4", State: "pending"}, nil
-}
-
-// noSleep makes retries instant so tests don't wait.
-func noSleep(_ context.Context, _ time.Duration) error { return nil }
-
-func TestClassify(t *testing.T) {
+// TestErrorCodeExtractsThroughWrapping proves errorCode unwraps to the
+// underlying smithy.APIError the same way the old local classify() did —
+// this is the one piece of Acquirer's own logic (calque#106's migration to
+// lagotto/pkg/snipe.Snipe) that stays LOCAL and pure enough to test offline;
+// Snipe's own retry/backoff/AZ-sweep/deadline/classify behavior is covered by
+// lagotto/pkg/snipe's own test suite (TestSnipe_AcquiresAfterCapacityRetries,
+// TestSnipe_TerminalStopsImmediately, TestSnipe_UnknownFailureCappedThenGivesUp,
+// TestSnipe_DeadlineReached, TestSnipe_SubnetPerPlacement, etc. — 16 tests,
+// confirmed by inspection to cover the equivalent guarantees calque's own
+// now-deleted TestAcquireRetriesThenLands/TestAcquireSweepsAZs/
+// TestAcquireDeadline/TestAcquireUnknownFailsFast/TestAcquireTerminalFailsFast
+// exercised), not re-tested here — the same trust boundary calque already
+// extends to spawn.launcher.Provision itself.
+func TestErrorCodeExtractsThroughWrapping(t *testing.T) {
 	cases := []struct {
-		err  error
-		want failureKind
+		err    error
+		wantOK bool
+		want   string
 	}{
-		{nil, failureNone},
-		{apiErr{"InsufficientInstanceCapacity"}, failureCapacity},
-		{apiErr{"Server.InsufficientInstanceCapacity"}, failureCapacity},
-		{apiErr{"VcpuLimitExceeded"}, failureTerminal},
-		{apiErr{"UnauthorizedOperation"}, failureTerminal},
-		{apiErr{"ParameterNotFound"}, failureTerminal},              // spawn AMI/SSM misconfig -> fail fast
-		{apiErr{"SomeNovelCode"}, failureUnknown},                   // unknown AWS -> bounded retry
-		{errors.New("connection reset"), failureUnknown},            // non-AWS -> bounded retry
-		{apiErr{"WeirdInsufficientCapacityThing"}, failureCapacity}, // substring fallback
+		{nil, false, ""},
+		{apiErr{"InsufficientInstanceCapacity"}, true, "InsufficientInstanceCapacity"},
+		{fmt.Errorf("wrapped: %w", apiErr{"VcpuLimitExceeded"}), true, "VcpuLimitExceeded"},
+		{errors.New("connection reset"), false, ""},
 	}
 	for _, c := range cases {
-		if got, _ := classify(c.err); got != c.want {
-			t.Errorf("classify(%v) = %v, want %v", c.err, got, c.want)
+		got, ok := errorCode(c.err)
+		if ok != c.wantOK || got != c.want {
+			t.Errorf("errorCode(%v) = (%q, %v), want (%q, %v)", c.err, got, ok, c.want, c.wantOK)
 		}
-	}
-}
-
-func TestAcquireRetriesThenLands(t *testing.T) {
-	rep := &leak.Report{}
-	var progress []string
-	acq := &Acquirer{
-		Launcher: &scriptedLauncher{errs: []error{
-			apiErr{"InsufficientInstanceCapacity"},
-			apiErr{"InsufficientInstanceCapacity"},
-		}},
-		Report:       rep,
-		PollInterval: time.Millisecond,
-		OnProgress:   func(a int, code, detail string, w time.Duration) { progress = append(progress, code) },
-		sleep:        noSleep,
-	}
-	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g7e.2xlarge"}
-	got, err := acq.Acquire(context.Background(), tgt, "us-west-2")
-	if err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	if got.InstanceID != "i-abc123" {
-		t.Errorf("instance = %q", got.InstanceID)
-	}
-	if tgt.Region != "us-west-2" {
-		t.Errorf("target region not filled: %q", tgt.Region)
-	}
-	if len(progress) != 2 {
-		t.Errorf("expected 2 capacity-wait progress events, got %d", len(progress))
-	}
-	// time-to-acquire after retries should be logged as free ground truth (§5).
-	if rep.Len() == 0 {
-		t.Error("expected a time-to-acquire leak after retries")
-	}
-}
-
-func TestAcquireTerminalFailsFast(t *testing.T) {
-	acq := &Acquirer{
-		Launcher: &scriptedLauncher{errs: []error{apiErr{"VcpuLimitExceeded"}}},
-		sleep:    noSleep,
-	}
-	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g7e.2xlarge"}
-	_, err := acq.Acquire(context.Background(), tgt, "us-west-2")
-	if err == nil {
-		t.Fatal("expected terminal failure to abort, got success")
-	}
-	// A quota error must NOT be retried into the deadline.
-	if l := acq.Launcher.(*scriptedLauncher); l.calls != 1 {
-		t.Errorf("terminal error should stop after 1 attempt, got %d", l.calls)
-	}
-}
-
-func TestAcquireDeadline(t *testing.T) {
-	// Always-capacity launcher + a deadline in the past-ish: should give up.
-	base := time.Unix(1_700_000_000, 0)
-	steps := 0
-	acq := &Acquirer{
-		Launcher:     &scriptedLauncher{errs: []error{apiErr{"InsufficientInstanceCapacity"}, apiErr{"InsufficientInstanceCapacity"}, apiErr{"InsufficientInstanceCapacity"}, apiErr{"InsufficientInstanceCapacity"}, apiErr{"InsufficientInstanceCapacity"}}},
-		PollInterval: time.Second,
-		Deadline:     3 * time.Second,
-		sleep:        noSleep,
-		now: func() time.Time {
-			// advance 2s per call so the deadline trips after a couple of tries
-			t := base.Add(time.Duration(steps) * 2 * time.Second)
-			steps++
-			return t
-		},
-	}
-	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g7e.2xlarge"}
-	_, err := acq.Acquire(context.Background(), tgt, "us-west-2")
-	if err == nil {
-		t.Fatal("expected deadline give-up, got success")
-	}
-}
-
-// azTrackingLauncher records the AZ of each Provision call and lands on a target AZ.
-type azTrackingLauncher struct {
-	landOn string   // AZ that succeeds; others return capacity failure
-	seen   []string // AZs tried, in order
-}
-
-func (l *azTrackingLauncher) Provision(_ context.Context, instanceType, region, az, subnet string) (LaunchOutcome, error) {
-	l.seen = append(l.seen, az)
-	if az == l.landOn {
-		return LaunchOutcome{InstanceID: "i-az", AvailabilityZone: az, State: "pending"}, nil
-	}
-	return LaunchOutcome{}, apiErr{"InsufficientInstanceCapacity"}
-}
-
-// TestAcquireSweepsAZs: capacity failures fall through to the next AZ within the
-// SAME round (no sleep), mirroring lagotto's launchAcrossAZs. Landing on the 3rd
-// AZ should require zero backoff sleeps.
-func TestAcquireSweepsAZs(t *testing.T) {
-	l := &azTrackingLauncher{landOn: "us-west-2c"}
-	sleeps := 0
-	acq := &Acquirer{
-		Launcher: l,
-		Placements: []Placement{
-			{AZ: "us-west-2a", Subnet: "subnet-a"}, {AZ: "us-west-2b", Subnet: "subnet-b"},
-			{AZ: "us-west-2c", Subnet: "subnet-c"}, {AZ: "us-west-2d", Subnet: "subnet-d"},
-		},
-		sleep: func(_ context.Context, _ time.Duration) error { sleeps++; return nil },
-	}
-	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g6.2xlarge"}
-	got, err := acq.Acquire(context.Background(), tgt, "us-west-2")
-	if err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	if got.AvailabilityZone != "us-west-2c" {
-		t.Errorf("landed AZ = %q, want us-west-2c", got.AvailabilityZone)
-	}
-	if len(l.seen) != 3 || l.seen[0] != "us-west-2a" || l.seen[2] != "us-west-2c" {
-		t.Errorf("AZ sweep order = %v, want [2a 2b 2c]", l.seen)
-	}
-	if sleeps != 0 {
-		t.Errorf("landing within the first sweep should need 0 backoff sleeps, got %d", sleeps)
-	}
-}
-
-// TestAcquireUnknownFailsFast: an unrecognized error must NOT loop to the
-// deadline (the ParameterNotFound lesson — a config bug masqueraded as capacity
-// for 18 min). It should bail after a few consecutive unknowns.
-func TestAcquireUnknownFailsFast(t *testing.T) {
-	// 100 unknown errors queued, but we should stop after maxUnknown (3) + 1.
-	errs := make([]error, 100)
-	for i := range errs {
-		errs[i] = apiErr{"ParameterNotFoundLikeButUnclassified"}
-	}
-	l := &scriptedLauncher{errs: errs}
-	acq := &Acquirer{Launcher: l, PollInterval: time.Millisecond, Deadline: time.Hour, sleep: noSleep}
-	tgt := &target.Target{Card: "RTX PRO 6000", Instance: "g7e.2xlarge"}
-	_, err := acq.Acquire(context.Background(), tgt, "us-west-2")
-	if err == nil {
-		t.Fatal("expected fail-fast on repeated unknown errors")
-	}
-	if l.calls > 5 { // maxUnknown=3, so ~4 calls; certainly not 100 or deadline-bound
-		t.Errorf("unknown errors should fail fast, but made %d attempts", l.calls)
 	}
 }
 

@@ -111,14 +111,14 @@ func probe(instanceType, region, ami, ttl string, deadline time.Duration, spot b
 		}
 	}
 
-	launcher := &plan.SpawnLauncher{
-		Client: spawnClient, TTL: ttl, OnComplete: "terminate",
-		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: ami, Spot: spot,
+	launchCfg := plan.SpawnLauncher{
+		TTL: ttl, OnComplete: "terminate",
+		Username: "ubuntu", AMI: ami, Spot: spot,
 		// No RunCmd: boot plain, no docker/GPU job — this probe runs over SSM
 		// after the instance is up, not via user-data.
-	}
+	}.Build()
 	acq := &plan.Acquirer{
-		Launcher: launcher, Report: rep, Deadline: deadline, Placements: places,
+		LaunchConfig: launchCfg, Report: rep, Deadline: deadline, Placements: places,
 		OnProgress: func(attempt int, code, detail string, waited time.Duration) {
 			fmt.Printf("      ...swept %d attempt(s), no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 		},

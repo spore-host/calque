@@ -14,7 +14,7 @@ require (
 	github.com/aws/smithy-go v1.27.3
 	github.com/scttfrdmn/substrate v0.94.0
 	github.com/spore-host/cohort v0.2.0
-	github.com/spore-host/lagotto v0.52.0
+	github.com/spore-host/lagotto v0.52.1
 	github.com/spore-host/spawn v0.98.0
 	github.com/spore-host/truffle v0.48.1
 )

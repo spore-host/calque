@@ -1,15 +1,45 @@
 # Design note: Substrate as calque's offline AWS test tier (calque#114)
 
-**Status:** shipped, with one documented scope reduction from the original
-issue text. `github.com/scttfrdmn/substrate/emulator` (Scott's event-sourced
-AWS emulator) is now calque's middle test tier: hand-written fakes (today's
-`plan_test.go` `fakeResolver`/`scriptedLauncher` pattern, unchanged) at one
-end, real-`AWS_PROFILE=aws` spend at the other, and Substrate in between —
-real request/response wire round-trips, no billing.
+**Status:** shipped, then PARTIALLY REGRESSED by calque#106's later
+`Acquirer` → `lagotto/pkg/snipe.Snipe` migration — see "Regression" below.
+`github.com/scttfrdmn/substrate/emulator` (Scott's event-sourced AWS
+emulator) was calque's middle test tier: hand-written fakes at one end,
+real-`AWS_PROFILE=aws` spend at the other, Substrate in between — real
+request/response wire round-trips, no billing. That middle tier for
+`Acquirer` specifically no longer exists as of the `Snipe` migration; see
+below for why and what's tracked to restore it.
 
-## What shipped
+## Regression: the Acquirer↔Substrate tests were deleted (calque#106 migration)
 
-`internal/plan/substrate_test.go`:
+`internal/plan/substrate_test.go` (originally `TestAcquireAgainstSubstrate`/
+`TestAcquireAgainstSubstrateInjectedFailure`, both described below in their
+original, now-historical form) was DELETED when `Acquirer.Acquire` was
+migrated to delegate to `lagotto/pkg/snipe.Snipe` (lagotto#106/#111,
+calque commit history — the same migration that deleted calque's own
+hand-rolled retry/backoff/AZ-sweep/classify loop and its 5 local tests,
+per `internal/plan/plan_test.go`'s own updated comments).
+
+The reason: `Snipe` builds its own `*spawnaws.Client` internally via
+`spawnaws.NewClientWithRegion` (region-pinned as of lagotto#111), which
+loads AWS config through the default credential chain with NO way to
+point at a custom endpoint. The only constructor that supports a custom
+endpoint, `spawnaws.NewClientFromConfig`, is unreachable from `Snipe` —
+its internal `clientFor` is unexported and `Options`/`Target` have no
+field for injecting a client or a custom `aws.Config`. Filed upstream:
+[lagotto#113](https://github.com/spore-host/lagotto/issues/113).
+
+Until that lands, `Acquirer`'s real request-building/response-parsing
+code has NO offline test tier at all — only real `AWS_PROFILE=aws` runs
+exercise it (as they already did for the retry/backoff logic before
+`Snipe`, and as `fleetrun.go`'s own historical untested-without-spend
+precedent already established for this exact code path). This is a real,
+acknowledged loss of coverage, accepted as the cost of deleting ~180 lines
+of hand-rolled retry logic in favor of a well-tested (16 tests) upstream
+leaf — re-evaluate once lagotto#113 lands.
+
+## What shipped (historical — describes the NOW-DELETED tests, kept for context)
+
+`internal/plan/substrate_test.go` (deleted, see above):
 
 - **`TestAcquireAgainstSubstrate`** — points the REAL `plan.SpawnLauncher`
   (wrapping spawn's real `*spawnaws.Client`/`launcher.Provision`) at a
@@ -26,7 +56,7 @@ real request/response wire round-trips, no billing.
   is handled by the bounded-retry-then-fail-fast path — never an infinite
   loop on an unclassifiable error.
 
-Both tests run with `PricePerHour` pinned on the launcher (skips spawn's own
+Both tests ran with `PricePerHour` pinned on the launcher (skips spawn's own
 live AWS Pricing API call — a real network dependency separate from EC2 that
 would otherwise sneak into an "offline" test) and a pinned `AMI` (skips AMI
 auto-detection's SSM round-trip, which Substrate would need separately

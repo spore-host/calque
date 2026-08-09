@@ -107,13 +107,13 @@ func runSession(o sessionOpts) (err error) {
 		}
 	}
 
-	launcher := &plan.SpawnLauncher{
-		Client: spawnClient, RunCmd: prep.PrepCommand(artifactPfx), TTL: o.ttl,
+	launchCfg := plan.SpawnLauncher{
+		RunCmd: prep.PrepCommand(artifactPfx), TTL: o.ttl,
 		OnComplete: "", // do NOT terminate on command completion — we hold the box
-		Username:   "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami, PricePerHour: pricePerHr,
+		Username:   "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
-	}
+	}.Build()
 	if o.spot {
 		// Honesty (§9/§10): a spot ramp measures K against a SPOT R_a, and the box
 		// can be reclaimed mid-ramp. Say so loudly and leak it, so the resulting K
@@ -130,7 +130,7 @@ func runSession(o sessionOpts) (err error) {
 	round := 0
 	lastDetail := ""
 	acq := &plan.Acquirer{
-		Launcher: launcher, Report: rep, Deadline: o.acquireDeadline, Placements: places,
+		LaunchConfig: launchCfg, Report: rep, Deadline: o.acquireDeadline, Placements: places,
 		OnProgress: func(attempt int, code, detail string, waited time.Duration) {
 			// Print the full AWS message on the first round, whenever it CHANGES, and
 			// every 10th round — so a capacity opening (message names an AZ) or a

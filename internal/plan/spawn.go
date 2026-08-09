@@ -1,28 +1,25 @@
 package plan
 
 import (
-	"context"
-	"time"
-
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
-	"github.com/spore-host/spawn/pkg/launcher"
 )
 
-// SpawnLauncher is the real Launcher, wrapping spawn.launcher.Provision — the
-// acquire+bring-up primitive confirmed in spawn#351 (spawn owns RunInstances).
+// SpawnLauncher is calque's own launch-config BUILDER — the fields calque's
+// callers already assemble per run, translated into a spawnaws.LaunchConfig
+// for lagotto/pkg/snipe.Snipe to drive (calque#75/lagotto#106). It no longer
+// owns a *spawnaws.Client or a Provision method: Snipe resolves its own
+// region-pinned client internally (lagotto#111), so calque never needs to
+// build or hold one just to acquire an instance.
 //
 // The command the instance runs is built by calque (spawn#351: there is no
 // exported ECR/container primitive yet, tracked in spawn#353). We inject a
 // docker-run bootstrap via LaunchConfig.JobArrayCommand and set a TTL so a
 // runaway can't survive — spawn enforces a TTL floor regardless.
 type SpawnLauncher struct {
-	Client     *spawnaws.Client
-	Image      string        // ECR image ref to run
-	RunCmd     string        // full command run on the instance (docker login/pull/run ...)
-	TTL        string        // e.g. "2h" — hard lifetime cap
-	OnComplete string        // "terminate" (default) so the instance dies when the job signals done
-	Username   string        // primary linux user (for pre-stop hook $HOME resolution)
-	Timeout    time.Duration // per-Provision call timeout
+	RunCmd     string // full command run on the instance (docker login/pull/run ...)
+	TTL        string // e.g. "2h" — hard lifetime cap
+	OnComplete string // "terminate" (default) so the instance dies when the job signals done
+	Username   string // primary linux user (for pre-stop hook $HOME resolution)
 	// AMI pins the machine image. Empty lets spawn auto-select (GetRecommendedAMI
 	// -> GetAL2023AMI, resolving the "Deep Learning Base OSS Nvidia Driver GPU
 	// AMI" SSM parameter for GPU instance types). spawn#356 (GPU AL2023 SSM
@@ -63,15 +60,10 @@ type SpawnLauncher struct {
 	SpotMaxPrice string
 }
 
-// Provision launches one instance of instanceType in region and returns the
-// live handle fields calque needs. A capacity failure surfaces as a
-// *spawnaws.LaunchError, which the Acquirer's classify() reads via smithy.
-func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region, az, subnet string) (LaunchOutcome, error) {
-	if s.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
-		defer cancel()
-	}
+// Build translates SpawnLauncher's fields into a spawnaws.LaunchConfig for
+// Acquirer.LaunchConfig. InstanceType/Region/AvailabilityZone/SubnetID are
+// deliberately NOT set here — Acquirer/Snipe overrides those per attempt.
+func (s SpawnLauncher) Build() spawnaws.LaunchConfig {
 	onComplete := s.OnComplete
 	if onComplete == "" {
 		onComplete = "terminate"
@@ -80,12 +72,8 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region, az,
 	if ttl == "" {
 		ttl = "2h"
 	}
-	cfg := spawnaws.LaunchConfig{
-		InstanceType:      instanceType,
-		Region:            region,
-		AvailabilityZone:  az,     // "" => EC2 chooses; set by the Acquirer's AZ sweep
-		SubnetID:          subnet, // default subnet for the AZ; avoids InvalidInput in AZs w/o one
-		AMI:               s.AMI,  // empty => spawn auto-selects (broken for GPU; pin for GPU)
+	return spawnaws.LaunchConfig{
+		AMI:               s.AMI, // empty => spawn auto-selects (calque#75: verified live on g6/g6e/g7/g7e)
 		TTL:               ttl,
 		OnComplete:        onComplete,
 		Username:          s.Username,
@@ -98,21 +86,4 @@ func (s *SpawnLauncher) Provision(ctx context.Context, instanceType, region, az,
 		Spot:         s.Spot,         // Spot market: different capacity pool than on-demand
 		SpotMaxPrice: s.SpotMaxPrice, // "" => spawn caps at on-demand price
 	}
-	res, err := launcher.Provision(ctx, s.Client, cfg, launcher.Options{})
-	if err != nil {
-		return LaunchOutcome{}, err // *spawnaws.LaunchError; classified upstream
-	}
-	return LaunchOutcome{
-		InstanceID:       res.InstanceID,
-		Region:           region, // res.Region also available since spawn#352; ours is authoritative here
-		AvailabilityZone: res.AvailabilityZone,
-		PublicIP:         res.PublicIP,
-		State:            res.State,
-	}, nil
-}
-
-// NewSpawnClient builds a region-pinned spawn client (spawn#351: use
-// NewClientWithRegion so AMI/AZ/RunInstances resolve consistently).
-func NewSpawnClient(ctx context.Context, region string) (*spawnaws.Client, error) {
-	return spawnaws.NewClientWithRegion(ctx, region)
 }

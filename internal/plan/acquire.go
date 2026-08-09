@@ -8,7 +8,8 @@ import (
 
 	"github.com/aws/smithy-go"
 
-	"github.com/spore-host/lagotto/pkg/failure"
+	"github.com/spore-host/lagotto/pkg/snipe"
+	spawnaws "github.com/spore-host/spawn/pkg/aws"
 
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/target"
@@ -21,8 +22,6 @@ type Acquired struct {
 	InstanceID       string
 	Region           string
 	AvailabilityZone string
-	PublicIP         string
-	State            string
 	RequestedAt      time.Time // when we started trying to acquire
 	AcquiredAt       time.Time // when a live instance landed
 }
@@ -31,252 +30,147 @@ type Acquired struct {
 // real brain will need (§5). Logged per (card, region).
 func (a Acquired) TimeToAcquire() time.Duration { return a.AcquiredAt.Sub(a.RequestedAt) }
 
-// Launcher is the one-shot acquire+bring-up primitive. This is the seam confirmed
-// in spawn#351: spawn OWNS RunInstances (there is no pre-acquired-instance
-// bring-up). The real implementation wraps spawn.launcher.Provision; a fake drives
-// tests offline. Returns a *LaunchOutcome or an error whose code we classify.
-// az selects a specific Availability Zone ("" lets EC2 choose); subnet is the
-// subnet to launch into for that AZ ("" lets spawn/EC2 pick a default).
-type Launcher interface {
-	Provision(ctx context.Context, instanceType, region, az, subnet string) (LaunchOutcome, error)
-}
-
 // Placement is one (AZ, subnet) the Acquirer will try in its sweep. Passing the
 // subnet explicitly avoids the InvalidInput that occurs when an AZ has no default
-// subnet (observed: us-west-2d for g7e).
+// subnet (observed: us-west-2d for g7e). Kept as calque's own type (rather than a
+// direct alias of snipe.Placement) so callers building calque's Placement slice
+// don't need to import lagotto/pkg/snipe themselves — Acquire converts internally.
 type Placement struct {
 	AZ     string
 	Subnet string
 }
 
-// LaunchOutcome mirrors the fields calque needs from spawn's *aws.LaunchResult.
-type LaunchOutcome struct {
-	InstanceID       string
-	Region           string
-	AvailabilityZone string
-	PublicIP         string
-	State            string
-}
-
-// Progress receives status updates for the live "waiting for capacity…" line
-// (§5: lagotto/acquisition exposes no push channel, so the Acquirer emits its own).
+// Progress receives status updates for the live "waiting for capacity…" line.
 // detail is the FULL verbatim error message from AWS (not just the code) — so a
 // changed error (capacity opening in an AZ, or a non-capacity failure the code
 // classifier would otherwise swallow) is visible in the log.
 type Progress func(attempt int, code, detail string, waited time.Duration)
 
-// Acquirer snipes a single resolved target: it calls Provision and, on a capacity
-// failure, retries with backoff until it lands or the deadline passes — the
-// block-and-wait posture (§5). This is the lean path the spore.host owner blessed
-// in lagotto#73 (Provision + ClassifyFailure), avoiding lagotto's DynamoDB
-// dependency.
+// Acquirer snipes a single resolved target — the block-and-wait posture (§5).
 //
-// lagotto's own leaf extraction of this exact shape now exists —
-// lagotto/pkg/snipe.Snipe, shipped in v0.52.0 (lagotto#106) — but is not yet a
-// drop-in replacement: Snipe hardcodes spawnaws.NewClient(ctx) (default
-// credential-chain region) with no way to inject a region-pinned client, which
-// every one of calque's 7 Acquirer call sites needs (spawn#276: using the
-// wrong region can resolve AMIs/AZs/identity incorrectly). Filed upstream as
-// lagotto#111. Re-evaluate deleting this whole type once that's fixed — this
-// is the largest remaining deletion opportunity in this package (~100 lines),
-// but per the original audit's own guidance, do not attempt piecemeal.
+// This is a thin adapter over lagotto/pkg/snipe.Snipe (shipped in v0.52.0,
+// lagotto#106; region-pinned client resolution fixed in v0.52.1, lagotto#111)
+// rather than a hand-rolled retry/backoff/AZ-sweep/classify loop — that loop,
+// and the local capacityCodes/terminalCodes table it used to carry, are gone
+// (calque#75/lagotto#105/lagotto#106's own audit named this the largest
+// deletion opportunity in this package, ~180 lines). Snipe owns retry/backoff/
+// AZ-sweep/placement-fallback/deadline/classify entirely; Acquirer's own job is
+// now just: build the spawnaws.LaunchConfig calque's callers already assemble
+// via LaunchConfig, adapt Placements/Progress to Snipe's shapes, and translate
+// snipe.Result back into calque's own Acquired (which every downstream cost-
+// model/measure consumer already depends on — kept stable so none of them
+// needed to change).
 //
-// classify() below (the failure-taxonomy half of this file) HAS already been
-// migrated to delegate to lagotto/pkg/failure directly (lagotto#105, fixed in
-// v0.52.0/#108) — that swap needed no client-injection story, since
-// ClassifyFailure takes only an error.
+// Test coverage: this package's own retry/backoff/AZ-sweep/deadline/classify
+// tests were deleted alongside the loop they tested — lagotto/pkg/snipe's own
+// test suite (16 tests: TestSnipe_AcquiresAfterCapacityRetries,
+// TestSnipe_SubnetPerPlacement, TestSnipe_TerminalStopsImmediately,
+// TestSnipe_UnknownFailureCappedThenGivesUp, TestSnipe_DeadlineReached, etc.)
+// covers the equivalent behavior directly against Snipe's real implementation,
+// confirmed by inspection before this migration — this package no longer needs
+// its own copy of those guarantees, the same trust boundary calque already
+// extends to spawn.launcher.Provision itself.
+//
+// REGRESSION (calque#106/docs/substrate-offline-test-tier.md): this migration
+// also deleted internal/plan/substrate_test.go's Substrate-backed offline
+// tests for Acquire's request-building/response-parsing path — Snipe builds
+// its own *spawnaws.Client internally with no way to point it at a custom
+// endpoint (spawnaws.NewClientFromConfig, which Substrate needs, is
+// unreachable from Snipe). Filed upstream: lagotto#113. Until that lands,
+// Acquire has NO offline test tier at all beyond errorCode's own pure-logic
+// test — only real AWS_PROFILE=aws runs exercise the actual RunInstances
+// round-trip.
 type Acquirer struct {
-	Launcher     Launcher
-	Report       *leak.Report
-	OnProgress   Progress
-	PollInterval time.Duration // backoff between capacity retries (default 15s)
+	Report     *leak.Report
+	OnProgress Progress
+	// PollInterval is the initial backoff between capacity-failed rounds (it
+	// doubles each round up to a 5-minute cap, per snipe.DefaultMaxInterval).
+	// 0 => snipe.DefaultRetryInterval (30s).
+	PollInterval time.Duration
 	Deadline     time.Duration // give up after this (default 30m); 0 => default
 	// Placements to sweep within the region before backing off, in preference
-	// order. On a capacity failure the Acquirer tries the next placement immediately
-	// (AZ breadth within a region is free — mirrors lagotto's launchAcrossAZs).
-	// Empty => a single attempt letting EC2 choose. Only after the whole sweep
-	// returns capacity failures does the Acquirer sleep and retry the sweep.
+	// order. Empty => a single attempt letting EC2 choose.
 	Placements []Placement
-	// now is injectable so tests don't sleep in real time.
-	now   func() time.Time
-	sleep func(context.Context, time.Duration) error
+	// LaunchConfig is the base launch config for this acquire — every caller
+	// already builds one of these (formerly wrapped in the now-deleted
+	// SpawnLauncher). InstanceType/Region/Spot/AvailabilityZone/SubnetID are
+	// overridden per attempt by Acquire/Snipe; every other field (AMI, TTL,
+	// OnComplete, Username, JobArrayCommand, IMDSv2HopLimit, RootVolumeGiB,
+	// PricePerHour, SpotMaxPrice, ...) passes through as given.
+	LaunchConfig spawnaws.LaunchConfig
 }
 
 // Acquire blocks until the target lands or the deadline passes. It fills the
 // Target's Region on success (§4: acquisition fills Region).
 func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string) (Acquired, error) {
-	now := a.now
-	if now == nil {
-		now = time.Now
-	}
-	sleep := a.sleep
-	if sleep == nil {
-		sleep = sleepCtx
-	}
-	poll := a.PollInterval
-	if poll == 0 {
-		poll = 15 * time.Second
-	}
 	deadline := a.Deadline
 	if deadline == 0 {
 		deadline = 30 * time.Minute
 	}
 
-	// Sweep list: each round tries every placement (in order) before backing off.
-	// Empty => one attempt per round letting EC2 choose. AZ breadth within a region
-	// is free — mirrors lagotto's launchAcrossAZs (spawner.go:167).
-	places := a.Placements
-	if len(places) == 0 {
-		places = []Placement{{}}
+	places := make([]snipe.Placement, len(a.Placements))
+	for i, p := range a.Placements {
+		places[i] = snipe.Placement{AZ: p.AZ, Subnet: p.Subnet}
 	}
 
-	start := now()
-	giveUp := start.Add(deadline)
-	attempt := 0
-	unknownStreak := 0
-	const maxUnknown = 3 // tolerate a few transient/unknown blips, then fail fast
-	for {
-		var lastCode, lastDetail string
-		// One round = a full sweep across placements. A capacity failure in one AZ
-		// falls through to the next immediately (no sleep); only a fully-failed
-		// sweep sleeps.
-		for _, pl := range places {
-			attempt++
-			out, err := a.Launcher.Provision(ctx, t.Instance, region, pl.AZ, pl.Subnet)
-			if err == nil {
-				acq := Acquired{
-					InstanceID: out.InstanceID, Region: out.Region, AvailabilityZone: out.AvailabilityZone,
-					PublicIP: out.PublicIP, State: out.State, RequestedAt: start, AcquiredAt: now(),
-				}
-				if acq.Region == "" {
-					acq.Region = region // spawn#351: LaunchResult has no Region; carry ours
-				}
-				if acq.AvailabilityZone == "" {
-					acq.AvailabilityZone = pl.AZ
-				}
-				t.Region = acq.Region
-				// Free ground truth: time-to-acquire per (card, region, AZ) (§5).
-				if a.Report != nil && attempt > 1 {
-					a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
-						"acquired %s in %s/%s after %d attempts / %s waiting for capacity",
-						t.Instance, acq.Region, acq.AvailabilityZone, attempt, acq.TimeToAcquire().Round(time.Second))
-				}
-				return acq, nil
+	cfg := a.LaunchConfig
+	requestedAt := time.Now()
+	// failedAttempts counts only Status reports carrying a LastErr — Snipe
+	// also reports a pre-attempt Status (LastErr==nil) before each placement
+	// try and a pre-backoff Status after a whole round fails; calque's own
+	// Progress contract (and the leak line below) means "how many failed
+	// attempts so far," so only count the ones that actually failed.
+	failedAttempts := 0
+	result, err := snipe.Snipe(ctx, snipe.Target{
+		InstanceType: t.Instance,
+		Region:       region,
+		Placements:   places,
+		Spot:         a.LaunchConfig.Spot,
+		LaunchConfig: cfg,
+	}, snipe.Options{
+		Deadline:      requestedAt.Add(deadline),
+		RetryInterval: a.PollInterval,
+		Progress: func(s snipe.Status) {
+			if s.LastErr == nil {
+				return // pre-attempt report; nothing failed yet
 			}
-
-			kind, code := classify(err)
-			lastCode = code
-			lastDetail = err.Error() // full verbatim AWS message, not just the code
-			if kind == failureTerminal {
-				return Acquired{}, fmt.Errorf("acquire %s/%s: terminal failure %q: %w", t.Instance, region, code, err)
+			failedAttempts++
+			code, _ := errorCode(s.LastErr)
+			if a.OnProgress != nil {
+				a.OnProgress(failedAttempts, code, s.LastErr.Error(), time.Since(requestedAt))
 			}
-			if kind == failureUnknown {
-				unknownStreak++
-				if unknownStreak > maxUnknown {
-					return Acquired{}, fmt.Errorf("acquire %s/%s: %d consecutive unrecognized errors (last %q); failing fast rather than looping on a likely misconfig: %w",
-						t.Instance, region, unknownStreak, code, err)
-				}
-			} else {
-				unknownStreak = 0 // a real capacity signal resets the unknown counter
-			}
+		},
+	})
+	if err != nil {
+		if a.Report != nil {
+			a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
+				"gave up acquiring %s in %s after %s: %v", t.Instance, region, deadline, err)
 		}
-
-		// The whole AZ sweep returned capacity failures. Back off, unless the
-		// deadline has passed. This wait is what lagotto's warm pool hides on Modal.
-		if a.OnProgress != nil {
-			a.OnProgress(attempt, lastCode, lastDetail, now().Sub(start))
-		}
-		if now().After(giveUp) {
-			if a.Report != nil {
-				a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
-					"gave up acquiring %s in %s after %s (%d attempts across %d AZ(s)); last code %q",
-					t.Instance, region, deadline, attempt, len(places), lastCode)
-			}
-			return Acquired{}, fmt.Errorf("acquire %s/%s: no capacity after %s (%d attempts, %d AZ(s))", t.Instance, region, deadline, attempt, len(places))
-		}
-		if err := sleep(ctx, poll); err != nil {
-			return Acquired{}, err
-		}
+		return Acquired{}, fmt.Errorf("acquire %s/%s: %w", t.Instance, region, err)
 	}
+
+	acquiredAt := time.Now()
+	acq := Acquired{
+		InstanceID: result.InstanceID, Region: result.Region, AvailabilityZone: result.AvailabilityZone,
+		RequestedAt: requestedAt, AcquiredAt: acquiredAt,
+	}
+	t.Region = acq.Region
+	// Free ground truth: time-to-acquire per (card, region, AZ) (§5).
+	if a.Report != nil && failedAttempts > 0 {
+		a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
+			"acquired %s in %s/%s after %s waiting for capacity",
+			t.Instance, acq.Region, acq.AvailabilityZone, acq.TimeToAcquire().Round(time.Second))
+	}
+	return acq, nil
 }
 
-// --- failure classification (delegates to lagotto/pkg/failure) ---
-//
-// Previously calque MIRRORED lagotto's taxonomy locally rather than importing
-// it, reasoning that importing pkg/failure would drag in the poller's
-// DynamoDB/S3/SageMaker/SSM dependency tree. That reasoning no longer holds:
-// pkg/failure was extracted as a genuinely dependency-light leaf in lagotto
-// v0.49.0 (imports only smithy-go + spawn/pkg/launchererr), confirmed via
-// `go list -deps` — and since calque already imports spawn (which transitively
-// pulls in nearly everything pkg/failure's own module would add), adopting it
-// here adds exactly ZERO new third-party dependency weight beyond the leaf
-// package itself. lagotto#105 (the 5-code gap this file used to carry as a
-// "superset" caveat) shipped in lagotto v0.52.0 (#108) — calque's local table
-// and lagotto's are now byte-for-byte identical, so the caveat no longer
-// applies either. Source of truth is now lagotto/pkg/failure/failure.go
-// directly, not a local mirror.
-//
-// Adopting pkg/failure is also a real bug fix, not just deduplication: its
-// ClassifyFailure additionally recognizes spawn#220's post-launch-teardown
-// case (errors.Is(err, launchererr.ErrPostLaunch) → terminal), which calque's
-// old local classify() never handled — a RunInstances call that SUCCEEDED but
-// was torn back down by a downstream step (e.g. ephemeral FSx setup failing)
-// used to fall through to the AWS-error-code switch and misclassify.
-//
-// failureKind stays a local type (test-facing, per-call-site readable names)
-// mapped 1:1 from failure.FailureKind, so acquire.go's own callers/tests are
-// unaffected by the swap.
-
-type failureKind int
-
-const (
-	failureNone failureKind = iota
-	failureCapacity
-	failureTerminal
-	failureUnknown // unrecognized code: retry, but only a bounded number of times
-)
-
-// fromLagottoKind maps lagotto/pkg/failure's FailureKind onto calque's own
-// failureKind — a straight 1:1 translation, kept as a named function (not
-// inlined at the one call site) so a future FailureKind addition upstream is
-// a compile error here, not a silent fallthrough to failureUnknown.
-func fromLagottoKind(k failure.FailureKind) failureKind {
-	switch k {
-	case failure.FailureNone:
-		return failureNone
-	case failure.FailureCapacity:
-		return failureCapacity
-	case failure.FailureTerminal:
-		return failureTerminal
-	case failure.FailureUnknown:
-		return failureUnknown
-	default:
-		return failureUnknown
-	}
-}
-
-// classify returns the failure kind and the AWS error code (for status/logging).
-// Delegates entirely to lagotto/pkg/failure.ClassifyFailure; code extraction
-// (for logging) is kept here since ClassifyFailure returns only the kind.
-func classify(err error) (failureKind, string) {
-	kind := fromLagottoKind(failure.ClassifyFailure(err))
-	if err == nil {
-		return kind, ""
-	}
+// errorCode extracts the AWS error code from err for logging, if it wraps one
+// — mirrors the errors.As(err, &apiErr) pattern the old local classify() used,
+// unwrapping through spawnaws.LaunchError to the underlying smithy.APIError.
+func errorCode(err error) (string, bool) {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
-		return kind, apiErr.ErrorCode()
+		return apiErr.ErrorCode(), true
 	}
-	return kind, ""
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
+	return "", false
 }

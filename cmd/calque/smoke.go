@@ -121,12 +121,12 @@ func smoke(o smokeOpts) (err error) {
 	if err != nil {
 		return fmt.Errorf("spawn client: %w", err)
 	}
-	launcher := &plan.SpawnLauncher{
-		Client: spawnClient, RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
-		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami, PricePerHour: pricePerHr,
-	}
+	launchCfg := plan.SpawnLauncher{
+		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
+		Username: "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
+	}.Build()
 	acq := &plan.Acquirer{
-		Launcher: launcher, Report: rep, Deadline: o.deadline, Placements: places,
+		LaunchConfig: launchCfg, Report: rep, Deadline: o.deadline, Placements: places,
 		OnProgress: func(attempt int, code, detail string, waited time.Duration) {
 			fmt.Printf("      ...swept %d attempt(s), still no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 		},

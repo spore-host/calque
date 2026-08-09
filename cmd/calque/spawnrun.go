@@ -175,11 +175,11 @@ func runSpawnShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Cl
 		Bucket: o.bucket, ArtifactPrefix: shardLayout.ArtifactPfx, ManifestKey: shardLayout.ManifestKey,
 		WorkerDir: hostWorkerDir, Region: o.region, LogKey: shardLayout.LogKey, HostMode: true,
 	}
-	launcher := &plan.SpawnLauncher{
-		Client: spawnClient, RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
-		Username: "ubuntu", Timeout: 5 * time.Minute, AMI: o.ami,
-	}
-	acq := &plan.Acquirer{Launcher: launcher, Report: rep.rep, Deadline: o.deadline, Placements: places}
+	launchCfg := plan.SpawnLauncher{
+		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
+		Username: "ubuntu", AMI: o.ami,
+	}.Build()
+	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
 	tgt := &target.Target{Card: target.DefaultCard, Instance: o.instance}
 	acquired, err := acq.Acquire(ctx, tgt, o.region)
 	if err != nil {
