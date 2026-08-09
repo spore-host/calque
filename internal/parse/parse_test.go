@@ -790,3 +790,63 @@ func TestParseMapIterables(t *testing.T) {
 		t.Errorf("lit_unresolvable.Items = %#v, want nil (variable reference is not statically resolvable)", litUnresolvable.Items)
 	}
 }
+
+// TestParseProgressiveImageMergesAcrossStatements (calque#140): an image built
+// across MULTIPLE statements that reassign the same variable name — a real
+// pattern (found in caru-ini/modal-comfyui) for conditionally/progressively
+// appended build steps — must chain-extend the earlier statement's resolved
+// base+steps, not have each later `image = image.step(...)` statement
+// overwrite the whole record with a base-less one and discard everything
+// already captured. testdata/scripts/progressive_image.py has 4 reassignments
+// of `image`: one fully-resolved base statement, then three more
+// `image = image.<step>(...)` statements (one of them nested inside an `if`,
+// proving the merge isn't scoped to only module-top-level assigns).
+func TestParseProgressiveImageMergesAcrossStatements(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/progressive_image.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// The ORIGINAL base (from statement 1) must survive every later reassignment.
+	if app.Image.Base != "debian_slim" {
+		t.Errorf("app.Image.Base = %q, want debian_slim (from the first statement, must survive later reassignments)", app.Image.Base)
+	}
+	if app.Image.Unresolved {
+		t.Error("app.Image.Unresolved = true, want false — base was resolved in statement 1 and must not be clobbered by later image=image.step(...) statements")
+	}
+
+	// Every step from every statement must be present, IN ORDER: statement 1's
+	// debian_slim/pip_install/apt_install, then statement 2's env, then the
+	// conditional statement 3's add_local_file, then statement 4's run_commands.
+	wantMethods := []string{
+		"debian_slim", "pip_install", "apt_install", "env", "add_local_file", "run_commands",
+	}
+	gotMethods := make([]string, len(app.Image.Steps))
+	for i, s := range app.Image.Steps {
+		gotMethods[i] = s.Method
+	}
+	if !reflect.DeepEqual(gotMethods, wantMethods) {
+		t.Errorf("image.Steps methods = %v, want %v (steps from every statement, in order)", gotMethods, wantMethods)
+	}
+
+	wantPip := map[string]bool{"torch": true, "vllm": true}
+	for _, p := range app.Image.Pip {
+		delete(wantPip, p)
+	}
+	if len(wantPip) != 0 {
+		t.Errorf("image pip missing: %v (got %v) — statement 1's pip_install must survive", wantPip, app.Image.Pip)
+	}
+
+	// This is exactly the case the pre-fix code mishandled: no "image chain not
+	// rooted at a known base constructor" leak should fire, since the base DID
+	// resolve (in statement 1) — it must not be lost by the later reassignments.
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "image chain not rooted at a known base constructor") {
+			t.Errorf("unexpected base_unresolved leak: %+v (base was resolved in statement 1 and should have been preserved across reassignments)", l)
+		}
+	}
+}

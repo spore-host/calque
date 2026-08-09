@@ -343,10 +343,23 @@ _IMAGE_STEPS = frozenset(
 def _walk_image_chain(node: ast.AST) -> dict[str, Any] | None:
     """Flatten a `modal.Image.debian_slim().pip_install(...).uv_pip_install(...)` chain.
 
-    Returns {base, steps:[{method, args}], base_unresolved: bool} or None if this
-    isn't an Image chain. A chain counts as an image only if it contains a known base
-    constructor or at least one known build step — otherwise `App(...)` / `Volume.from_name(...)`
-    would be misread as images. We resolve the chain structurally; we never execute it.
+    Returns {base, steps:[{method, args}], base_unresolved: bool, root_name: str|None}
+    or None if this isn't an Image chain. A chain counts as an image only if it
+    contains a known base constructor or at least one known build step —
+    otherwise `App(...)` / `Volume.from_name(...)` would be misread as images.
+    We resolve the chain structurally; we never execute it.
+
+    calque#140: `root_name` is the bare variable name the chain's root climbed
+    to when it did NOT bottom out at a real base-constructor call (i.e. only
+    populated when `base_unresolved` is True) — e.g. for `image.env(...)`,
+    root_name is "image". This lets the caller (`visit_Assign`) distinguish
+    "this reassignment's RHS is itself rooted at a PRE-EXISTING image
+    variable, so its steps should chain-extend that variable's already-
+    recorded steps" from "this chain's root is some other/unknown name, so
+    base truly cannot be resolved" — without this, EVERY `x = x.step(...)`
+    reassignment (a natural pattern for progressively/conditionally built
+    images across multiple statements) silently overwrote and discarded
+    whatever base+steps the earlier statement(s) had already resolved.
     """
     steps: list[dict[str, Any]] = []
     cur = node
@@ -375,7 +388,8 @@ def _walk_image_chain(node: ast.AST) -> dict[str, Any] | None:
     steps.reverse()
     # base_unresolved: image-like chain rooted at a variable, not a known constructor.
     # Recorded as a helper_leak by the caller so the Go side can log it (§10).
-    return {"base": base, "steps": steps, "base_unresolved": base is None}
+    root_name = cur.id if base is None and isinstance(cur, ast.Name) else None
+    return {"base": base, "steps": steps, "base_unresolved": base is None, "root_name": root_name}
 
 
 class Collector(ast.NodeVisitor):
@@ -423,7 +437,43 @@ class Collector(ast.NodeVisitor):
         if chain is not None:
             for t in node.targets:
                 if isinstance(t, ast.Name):
-                    self.images[t.id] = chain
+                    # calque#140: a real-world image is frequently built across
+                    # MULTIPLE statements that reassign the same variable name,
+                    # e.g. `image = image.env(...).run_function(...)` following
+                    # an earlier `image = modal.Image.debian_slim()...` — this
+                    # new chain's own root climbs to a bare Name (base=None,
+                    # root_name="image") rather than a real base constructor.
+                    # If that root name is itself an ALREADY-KNOWN image var,
+                    # this is a chain-extension of it, not a fresh unrelated
+                    # image — merge by keeping the prior record's resolved
+                    # base and appending this statement's own steps onto the
+                    # end of its steps list, rather than overwriting the whole
+                    # record with a base-less one and losing every earlier
+                    # layer. The prior record is looked up by root_name (not
+                    # necessarily t.id — in the common `image = image.env(...)`
+                    # shape they're the same name, but this also correctly
+                    # handles a rename-while-chaining like
+                    # `new_image = image.env(...)`). A root name that is NOT
+                    # already a known image var (a genuinely unresolved/
+                    # external reference) stays base_unresolved, unchanged
+                    # from today.
+                    prior = self.images.get(chain["root_name"]) if chain["root_name"] is not None else None
+                    if chain["base_unresolved"] and prior is not None:
+                        merged = {
+                            "base": prior["base"],
+                            "steps": prior["steps"] + chain["steps"],
+                            "base_unresolved": prior["base_unresolved"],
+                        }
+                        self.images[t.id] = merged
+                    else:
+                        # Drop the internal root_name key from the public record —
+                        # it's plumbing for this merge decision, not part of the
+                        # wire contract the Go side reads.
+                        self.images[t.id] = {
+                            "base": chain["base"],
+                            "steps": chain["steps"],
+                            "base_unresolved": chain["base_unresolved"],
+                        }
         # vol = modal.Volume.from_name("weights")
         if isinstance(val, ast.Call) and _attr_chain(val.func)[-2:] == ["Volume", "from_name"]:
             name = _const_str(val.args[0]) if val.args else None
