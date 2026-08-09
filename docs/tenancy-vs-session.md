@@ -1,4 +1,4 @@
-# Design note: disambiguating "session" — interactive tenancy vs. today's K-ramp (calque#106)
+# Design note: disambiguating "session" — interactive tenancy vs. today's N-item ramp (calque#106)
 
 **Status:** decision record, design-only (no code). Settles terminology and
 lifecycle for M13's institutional-sharing primitive before any implementation
@@ -13,37 +13,36 @@ one instance is acquired patiently (acquisition is the slow, expensive part),
 held for an entire N-item ramp (`sessionOpts.rungs`), and terminated only at
 the end (`session.go:39-48`'s doc comment: "amortizes the painful acquisition
 across every test instead of re-acquiring per test"). It is single-tenant —
-one `calque session` invocation, one user, one instance, for the whole
-K-measurement ramp.
+one `calque session` invocation, one user, one instance, for the whole ramp.
 
 M13's institutional-sharing design needs a **different** thing: one
 university user's bounded interactive occupancy of a MIG slice or MPS
 client-slot on an instance that may be serving several such users
 *concurrently*. Both are naturally called "a session" in everyday English —
-"my session on the shared GPU," "run the K-ramp session" — and would collide
+"my session on the shared GPU," "run the ramp session" — and would collide
 in docs, the CLI, and support conversations if left undisambiguated.
 
 ## Decision: rename the existing verb, keep "session" for the new concept
 
-**`cmd/calque session` (today's K-ramp verb) is renamed `calque ramp`.**
+**`cmd/calque session` (today's N-item ramp verb) is renamed `calque ramp`.**
 "Session" is freed for M13's interactive-tenancy primitive, because:
 
 1. **"Session" is the term university users will actually reach for.** The
    primary audience for M13 (per the project's institutional-university
    pivot) thinks in terms of "starting a session on the GPU," matching how
    interactive HPC/Slurm allocations and Jupyter/notebook servers already use
-   the word. Overloading it for calque's internal K-measurement ramp — a
-   spike-only benchmarking tool most end users never invoke — is the
+   the word. Overloading it for calque's internal N-item ramp — a
+   spike-only verification tool most end users never invoke — is the
    avoidable collision.
 2. **"Ramp" already describes the existing verb's actual behavior precisely.**
    `sessionOpts.rungs` IS a ramp (a comma-separated N-item ramp:
    `--rungs 1,100,1000`, `session.go:167`) — the rename doesn't require
    inventing new vocabulary, it surfaces vocabulary the code already uses
    internally.
-3. **The K-ramp verb is a lower-traffic, more spike-internal tool.** It exists
-   to produce a measured crossover K for the project's own benchmarking
-   (§8/§9), not as an end-user workflow. Renaming the less-user-facing verb is
-   the smaller disruption.
+3. **The ramp verb is a lower-traffic, more spike-internal tool.** It exists
+   to acquire once and run a script's unchanged execution shape over a
+   ramp of item counts for verification, not as an end-user workflow.
+   Renaming the less-user-facing verb is the smaller disruption.
 
 This is a rename ONLY — `cmd/calque/session.go`'s behavior, flags, and
 acquire-once/hold/run-many contract are UNCHANGED. Renaming the file and CLI
@@ -88,7 +87,7 @@ check-out  →  interactive use (bounded TTL)  →  check-in / release
 | Tenancy | Single-tenant: one instance, one user | Multi-tenant: N slices, N concurrent users |
 | Acquires from AWS? | Yes — `Acquirer.Acquire` directly | No — consumes an already-acquired `Instance` |
 | Terminates the instance? | Yes, at the end of the ramp | No — releasing a slice never terminates the host instance |
-| Purpose | K-measurement (spec §8/§9) | Institutional interactive GPU access |
+| Purpose | Verification over an N-item ramp | Institutional interactive GPU access |
 
 ## Boundary with M12 (idle fleet)
 

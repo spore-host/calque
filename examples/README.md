@@ -53,36 +53,37 @@ Bedrock check honestly reports it **cannot** run rather than guessing.
 
 ---
 
-## 2. Dry-run and inspect the crossover K
+## 2. Dry-run the full pipeline — the unchanged script, end to end
 
-`run` defaults to `--dry-run`: it exercises every stage locally over a synthetic
-sample and produces the crossover K — **without launching a billable instance.**
-
-```
-./calque run --n 100 --dry-run examples/map_batch_inference.py
-```
+`run` defaults to `--dry-run`: it exercises every stage — parse, gate, plan, warm
+execution, collect — against the unchanged script, **without launching a billable
+instance.**
 
 ```
+./calque run --n 20 --dry-run examples/map_batch_inference.py
+```
+
+```
+parsed "map-batch-inference": 1 classes, 0 functions
+entrypoint: main (selected)
+warm unit: class "Batcher", method "generate", gpu asked-for "H100"
 recommend+resolve: card="RTX PRO 6000" -> instance="g7e.2xlarge"
 image: Dockerfile rendered, digest=ae6b11f861e02f4b (tag for ECR cache)
 
 [DRY-RUN] not launching a billable instance; driving warm worker locally on a synthetic sample
-[DRY-RUN] warm unit ran 50 items, 0 failed; @enter x1 (0.305s), mean 0.0543s/item
-
---- crossover K (§9) ---
-Your workload:   map-batch (asked for H100 -> substituted g7e.2xlarge), 100 items, ...
-  ...
-Verdict:    you are running 100.  100 >= K(0) -> CROSS. Code is unchanged; here's the bill.
-AWS side of K: [measured]
-
-*** DRY-RUN K IS NOT DEFENSIBLE ***
-Per-item seconds and occupancy are SYNTHETIC (stand-in body, no GPU). A K that
-survives a hostile read requires the real payload on an acquired RTX PRO 6000 (§16.1).
+[DRY-RUN] warm unit ran 20 items, 0 failed; @enter x1 (0.305s), mean 0.0531s/item
+...
+--- leak report (§10) ---
+LEAKS: 2 emitted across 2 primitives
+  volume (1):
+    - [semantic_gap] Batcher: model identity obscured (loaded from a path/mount, not a repo id); Bedrock identity check cannot run
 ```
 
-What to notice: calque **refuses to pretend**. The dry-run K is stamped NOT
-DEFENSIBLE because the per-item timings are synthetic — a real K needs a real GPU.
-This is the "phase detector, not a sales funnel" discipline in action.
+What to notice: the SAME script — same `@cls`, same `@enter`, same `.map()` — ran
+through every real pipeline stage (parse → gate → plan → warm-execute → collect)
+with zero code changes, using only a stand-in body locally since no GPU is involved.
+`calque real`/`calque session` run this identical script's real body on a real
+acquired instance.
 
 ---
 

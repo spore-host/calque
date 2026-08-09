@@ -1,11 +1,10 @@
 # Behind-the-seam register (M10 — what calque deliberately does NOT port)
 
 **Status:** living decision record (§1/§4/§18). The spike proves Modal-shaped GPU
-code runs unchanged on AWS and produces a measured crossover K. Everything below is
-**explicitly out of scope** — not because it's hard, but because porting it would
-mean building the "brain" the seam (§4) exists to defer. Each entry names the
-attach point a future build would touch, so "won't-port" stays a documented
-decision rather than a silent gap.
+code runs unchanged on AWS. Everything below is **explicitly out of scope** — not
+because it's hard, but because porting it would mean building the "brain" the seam
+(§4) exists to defer. Each entry names the attach point a future build would touch,
+so "won't-port" stays a documented decision rather than a silent gap.
 
 The discipline throughout: **recognize and leak, never silently drop.** If a script
 uses one of these, calque emits a `semantic_gap`/`scope:behind-seam` leak (§10) so
@@ -28,11 +27,11 @@ the census stays honest.
   single constant by design (§4). Real phase-detection / right-sizing is the whole
   point of the seam and is deferred. Attach point: swap `StubRecommender` for a real
   `Recommender` — the plumbing never notices.
-- **Cost/latency frontier optimization.** The spike reports one K at measured
-  occupancy; it does not search the price/latency Pareto frontier. Attach point:
-  `internal/cost`.
+- **Cost/latency frontier optimization.** The spike does not search the
+  price/latency Pareto frontier or otherwise optimize instance choice on cost.
+  Attach point: `internal/cost`.
 - **MIG partitioning / fractional GPUs (institutional, M13).** UPDATED
-  (calque#107): no longer a non-goal for the batch/K spike's own scope, but a
+  (calque#107): no longer a non-goal for the spike's own scope, but a
   real primitive now exists behind `internal/mig` (fixed-layout profile
   picker + boot-time provisioning script, live-hardware-verified profiles per
   `docs/gpu-sharing-support-matrix.md`) and `internal/tenancy` (check-out/

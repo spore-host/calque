@@ -1,9 +1,8 @@
 # Modal compatibility matrix
 
 **Status:** living reference document. calque's goal is broad enough Modal-idiom
-mimicry that real Modal code ports to AWS **unchanged** — not the crossover-K
-measurement (README §9), which is secondary. K is a report to emit when it's
-meaningful, not the gate on whether an idiom is worth supporting.
+mimicry that real Modal code ports to AWS **unchanged**. This document is the
+single most direct answer to "does calque support my script."
 
 This document merges three research passes (2026-08-07):
 

@@ -138,7 +138,7 @@ check needed.
   pool, not a fleet acquisition); `--ami` is not required in `--pool` mode
   (the pool's workers already have one baked in at `calque pool create`
   time). Occupancy sampling in pool mode is explicitly out of scope for this
-  pass — flagged in the emitted K's notes, not silently omitted.
+  pass — flagged in the run's notes, not silently omitted.
 
 ## Explicitly deferred (not blocking M12)
 

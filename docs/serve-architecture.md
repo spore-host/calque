@@ -1,8 +1,8 @@
 # Design note: serve entrypoints on AWS (F3 — build deferred)
 
 **Status:** decision record. Serve is DETECTED + gated/leaked in the spike (M9/F1,
-F2), but the long-lived server is **not built** — §16 success is batch + a measured
-crossover K, and serve is a fundamentally different execution shape. This note
+F2), but the long-lived server is **not built** — the spike targets batch `.map()`
+execution, and serve is a fundamentally different execution shape. This note
 captures the architecture delta so the deferral is documented, not forgotten.
 
 ## What serve is
@@ -14,19 +14,17 @@ answers HTTP requests until scaled down. There is no fixed item set and no "done
 
 ## Why it doesn't fit the spike's batch model
 
-| Axis | Batch `.map` (what calque measures) | Serve (deferred) |
+| Axis | Batch `.map` (what calque runs today) | Serve (deferred) |
 |---|---|---|
 | Work set | Fixed N items, known up front | Open-ended request stream |
 | Lifecycle | Acquire → warm `@enter` → drain N → **terminate** | Acquire → warm → **stay up** → scale down on idle |
 | Collection | S3, keyed by input index, ordered | Per-request response over the wire; no index collect |
 | Termination | Deterministic (last item settles) | Autoscaling / idle-timeout driven |
-| K | rectangle-seconds ÷ items → $/item crossover | throughput × latency SLO; a different cost model |
 
-The batch cost model (§9) folds acquire + `@enter` + compute/occupancy into a
-rectangle billed against a **fixed N**. A server has no N — its economics are
-requests/sec against a latency SLO, and its "rectangle" is however long you keep it
-up, which is an autoscaling decision (behind the seam, §4). Forcing serve into the
-batch K would produce a meaningless number.
+A server has no fixed N — its economics are requests/sec against a latency SLO, and
+however long you keep it up is an autoscaling decision (behind the seam, §4). The
+batch warm-runner's whole shape (drain a manifest, terminate when done) simply
+doesn't apply to an open-ended request stream.
 
 ## What a future build would touch (attach points)
 
@@ -42,8 +40,6 @@ batch K would produce a meaningless number.
 - **Autoscaling.** min/max containers, keep-warm, concurrency — exactly the
   behind-the-seam kwargs M10/S1 recognizes and leaks. The real scaling brain lives
   behind the Recommender seam (§4).
-- **Cost model.** A serve K is throughput/SLO-based, not rectangle-÷-items — a new
-  model in `internal/cost`, not a tweak to the batch one.
 
 ## What the spike DOES do today (F1/F2)
 

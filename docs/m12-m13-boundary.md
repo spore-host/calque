@@ -67,7 +67,7 @@ casing:
 2. **Tenancy under a dedicated acquisition** (the simpler case, and the one
    M13's issues #107/#108 actually built and tested against): Layer 0
    acquires ONE instance directly (e.g. via `calque session`, per
-   `docs/tenancy-vs-session.md`'s renamed-to-`ramp` K-measurement path, or a
+   `docs/tenancy-vs-session.md`'s renamed-to-`ramp` N-item ramp path, or a
    future dedicated interactive-session command), and Layer 2 subdivides
    that single instance's GPU across concurrent users — no pool involved at
    all.
@@ -117,7 +117,7 @@ Reasoning:
 runs a tenancy-subdivided instance through `cost.Model`):
 `leak.Addf(leak.PrimAcquire, leak.KindSemanticGap, ..., "N concurrent
 tenancy slices shared 1 instance-hour; per-user cost apportionment is NOT
-computed (calque#109) — this K/cost reflects the WHOLE instance, not this
+computed (calque#109) — this cost reflects the WHOLE instance, not this
 user's share of it")`.
 
 ## Compounding blast radius: cross-link #94 and #95

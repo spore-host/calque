@@ -138,12 +138,11 @@ The per-capability detail follows; nothing is removed, only sequenced under the 
 - **full pipeline** — `calque run --dry-run` runs every stage locally; `calque session` acquires one
   GPU and runs an N-ramp on it; `calque real --shards N` fans out across a fleet.
 
-**Real inference, verified on live GPUs.** Getting real inference end-to-end across the runs
-in [`docs/measured-runs/`](docs/measured-runs/README.md) surfaced five genuine deployment
-findings, each caught fast and fixed: worker dir `/opt`→`/tmp`, docker needs `sudo`, IMDSv2
-hop-limit 2 for container creds, 200 GiB root volume for the vLLM image, and vLLM's stdout
-logs colliding with the warm-worker JSON protocol (the §6 "socket draws blood" edge — now
-isolated + regression-tested).
+**Real inference, verified on live GPUs.** Getting real inference end-to-end surfaced
+five genuine deployment findings, each caught fast and fixed: worker dir `/opt`→`/tmp`,
+docker needs `sudo`, IMDSv2 hop-limit 2 for container creds, 200 GiB root volume for the
+vLLM image, and vLLM's stdout logs colliding with the warm-worker JSON protocol (the §6
+"socket draws blood" edge — now isolated + regression-tested).
 
 **Corpus census (§16.4)** across the test scripts: Bedrock 1 exact-eligible / 1 self-hosted / 4
 identity-hidden; gpu guard 4 clean-swaps / 1 multi-GPU flag / 1 coupled flag / 1 no-gpu.
@@ -155,7 +154,7 @@ script.py
  └─ parse      decorators → IR         (shallow AST; bodies extracted verbatim)
    └─ gate     Bedrock exact match?    (route away: print offer & stop BEFORE any GPU)
      └─ recommend  IR → Target         (STUB: constant behind Recommender interface)
-       └─ plan   truffle: Card → candidate g7e instances (+ live price = R_a)
+       └─ plan   truffle: Card → candidate g7e instances (+ live price)
                  acquire: block-and-wait retry over spawn.Provision until landed
                  image:   .image DSL → Dockerfile → ECR (cache by digest)
          └─ exec   spawn.Provision launches + brings up the instance(s)
