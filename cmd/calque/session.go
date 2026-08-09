@@ -36,6 +36,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/mig"
 	"github.com/spore-host/calque/internal/mps"
 	"github.com/spore-host/calque/internal/tenancy"
@@ -78,6 +79,7 @@ func sessionCheckoutCmd(args []string) error {
 	instanceType := fs.String("instance-type", "g7e.2xlarge", "instance type; used ONLY to size the MIG layout via internal/mig's live-verified profile catalog when --backend mig")
 	slots := fs.Int("slots", 4, "number of MPS client-slots to model on this instance when --backend mps (MPS has no fixed hardware layout; this is an operator choice, see internal/mps's package doc)")
 	confirm := fs.Bool(mps.OptInFlagName, false, "required when --backend mps: MPS gives no per-client isolation (see internal/mps package doc); NOT required for --backend mig")
+	spot := fs.Bool("spot", false, "the underlying instance was acquired on the Spot market — surfaces the compounding blast-radius risk to concurrent tenants at checkout time (calque#119)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -107,6 +109,26 @@ func sessionCheckoutCmd(args []string) error {
 	fmt.Printf("checked out slice %s for user %q on instance %s (backend=%s, ttl=%s)\n", sliceID, *user, *instanceID, *backend, ttl)
 	fmt.Printf("session-token: %s\n", token)
 	fmt.Printf("release with: calque session checkin --slice %s --session-token %s\n", sliceID, token)
+
+	// calque#119: --spot is operator-supplied (checkout deliberately never
+	// calls EC2 describe, per this file's own scope boundary, so it has no
+	// other way to know the instance's market type). If the instance IS
+	// spot AND at least one other tenant already holds a slice here, a
+	// reclaim ends every one of those sessions at once, not just this new
+	// one — the existing per-RUN spot leak (ramp.go/realrun.go/smoke.go/
+	// fleetrun.go) assumes single-tenant framing and can't say this, since
+	// tenancy checkout necessarily happens later, as a separate invocation.
+	if *spot {
+		held, _, serr := sessionStatus(sessionStateDir(), *instanceID)
+		if serr == nil && held > 1 {
+			others := held - 1
+			fmt.Printf("[spot] WARNING: this instance was acquired on spot — a reclaim would end %d other concurrent tenant session(s) on this instance, not just this one\n", others)
+			rep := &leak.Report{}
+			rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "session", 0,
+				"spot acquisition: this instance was acquired on spot — a reclaim would end %d other concurrent tenant session(s) on this instance, not just this one", others)
+			rep.Summary(os.Stdout)
+		}
+	}
 	return nil
 }
 

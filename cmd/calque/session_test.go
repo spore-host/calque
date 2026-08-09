@@ -2,8 +2,11 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/spore-host/calque/internal/mps"
 )
 
 // TestCheckoutReturnsValidSliceAndToken proves checkoutSlice hands back a
@@ -231,6 +234,97 @@ func TestCheckoutNoFreeSliceErrors(t *testing.T) {
 	}
 	if _, _, err := checkoutSlice(dir, "i-abc123", "bob", "mps", time.Hour, "g7e.2xlarge", 1); err == nil {
 		t.Fatal("checkout on a fully-occupied 1-slot instance succeeded, want ErrNoFreeSlice")
+	}
+}
+
+// TestSessionCheckoutSpotWarnsWhenOtherTenantsHeld proves calque#119: when
+// --spot is set and a SECOND user checks out a slice on an instance that
+// already has one held, sessionCheckoutCmd prints the compounding
+// blast-radius warning naming the other concurrent tenant(s).
+func TestSessionCheckoutSpotWarnsWhenOtherTenantsHeld(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CALQUE_SESSION_STATE_DIR", dir)
+
+	// alice checks out first (no other tenants yet, so no warning expected
+	// regardless of --spot).
+	out := captureStdout(t, func() {
+		if err := sessionCheckoutCmd([]string{
+			"--instance-id", "i-abc123", "--user", "alice", "--backend", "mps", "--slots", "4", "--spot",
+			"--" + mps.OptInFlagName,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Contains(out, "WARNING") {
+		t.Errorf("alice's checkout (first tenant) warned about other tenants, want no warning:\n%s", out)
+	}
+
+	// bob checks out second, with --spot set: alice's slice is now an
+	// "other" concurrent tenant, so the warning must fire.
+	out = captureStdout(t, func() {
+		if err := sessionCheckoutCmd([]string{
+			"--instance-id", "i-abc123", "--user", "bob", "--backend", "mps", "--slots", "4", "--spot",
+			"--" + mps.OptInFlagName,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "spot") {
+		t.Errorf("bob's checkout (second tenant, --spot) did not warn, want a spot blast-radius warning:\n%s", out)
+	}
+	if !strings.Contains(out, "1 other concurrent tenant session") {
+		t.Errorf("warning did not name the other-tenant count (want 1 other), got:\n%s", out)
+	}
+	if !strings.Contains(out, "LEAKS:") {
+		t.Errorf("warning did not include an emitted leak.Report summary, got:\n%s", out)
+	}
+}
+
+// TestSessionCheckoutSpotNoWarningForSoleTenant proves the common case —
+// only one tenant holds a slice on the instance — never fires the warning,
+// even with --spot set (there is no "other" tenant to name yet).
+func TestSessionCheckoutSpotNoWarningForSoleTenant(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CALQUE_SESSION_STATE_DIR", dir)
+
+	out := captureStdout(t, func() {
+		if err := sessionCheckoutCmd([]string{
+			"--instance-id", "i-solo", "--user", "alice", "--backend", "mps", "--slots", "4", "--spot",
+			"--" + mps.OptInFlagName,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Contains(out, "WARNING") {
+		t.Errorf("sole-tenant checkout with --spot warned about other tenants, want none:\n%s", out)
+	}
+}
+
+// TestSessionCheckoutNoSpotFlagNeverWarns proves that without --spot, the
+// warning never fires even when a second tenant is present — checkout has
+// no other way to know the instance's market type, so it must not guess.
+func TestSessionCheckoutNoSpotFlagNeverWarns(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CALQUE_SESSION_STATE_DIR", dir)
+
+	captureStdout(t, func() {
+		if err := sessionCheckoutCmd([]string{
+			"--instance-id", "i-nospot", "--user", "alice", "--backend", "mps", "--slots", "4",
+			"--" + mps.OptInFlagName,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	out := captureStdout(t, func() {
+		if err := sessionCheckoutCmd([]string{
+			"--instance-id", "i-nospot", "--user", "bob", "--backend", "mps", "--slots", "4",
+			"--" + mps.OptInFlagName,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Contains(out, "WARNING") {
+		t.Errorf("checkout without --spot warned about other tenants, want none:\n%s", out)
 	}
 }
 
