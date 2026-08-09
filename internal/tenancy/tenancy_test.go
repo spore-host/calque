@@ -125,6 +125,74 @@ func TestOccupancyReportsHeldVsTotal(t *testing.T) {
 	}
 }
 
+// TestExpiryHookFiresSynchronouslyOnSweep proves calque#128's fix: when
+// sweepExpiredLocked reclaims a TTL-expired slice, the configured
+// ExpiryHook has ALREADY been called by the time the CheckOut call that
+// triggered the sweep returns (i.e. it runs synchronously under the
+// Registry's lock, not fired-and-forgotten in a goroutine) — and it fires
+// exactly once per expired slice, not once per sweep pass.
+func TestExpiryHookFiresSynchronouslyOnSweep(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	type call struct {
+		slice  Slice
+		userID string
+	}
+	var calls []call
+	r := NewRegistryWithExpiryHook(slices("MIG-a"), 0, func(slice Slice, userID string) {
+		calls = append(calls, call{slice, userID})
+	})
+	r.now = func() time.Time { return now }
+
+	if _, err := r.CheckOut("alice", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(2 * time.Minute) // past alice's 1-minute TTL
+
+	// The hook must have fired by the time THIS CheckOut call returns.
+	s, err := r.CheckOut("bob", 0)
+	if err != nil {
+		t.Fatalf("bob should get alice's expired slice: %v", err)
+	}
+	if s.ID != "MIG-a" {
+		t.Errorf("bob got %q, want the expired slice MIG-a", s.ID)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("ExpiryHook fired %d times, want exactly 1", len(calls))
+	}
+	if calls[0].slice.ID != "MIG-a" || calls[0].userID != "alice" {
+		t.Errorf("ExpiryHook called with (%+v, %q), want (MIG-a slice, alice)", calls[0].slice, calls[0].userID)
+	}
+
+	// A subsequent sweep (e.g. via Occupancy) with nothing newly expired
+	// must not re-fire the hook for the already-reclaimed slice.
+	r.Occupancy()
+	if len(calls) != 1 {
+		t.Errorf("ExpiryHook fired again on a later sweep with nothing new expired: %d calls, want 1", len(calls))
+	}
+}
+
+// TestNilExpiryHookIsSafe proves NewRegistry (no hook) behaves exactly as
+// before calque#128 — a nil ExpiryHook must never be called and must not
+// change TTL-expiry sweep behavior.
+func TestNilExpiryHookIsSafe(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	r := NewRegistry(slices("MIG-a"), 0) // no hook, same as every pre-existing caller
+	r.now = func() time.Time { return now }
+
+	if _, err := r.CheckOut("alice", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	s, err := r.CheckOut("bob", 0)
+	if err != nil {
+		t.Fatalf("bob should get alice's expired slice: %v", err)
+	}
+	if s.ID != "MIG-a" {
+		t.Errorf("bob got %q, want the expired slice MIG-a", s.ID)
+	}
+}
+
 // TestHolderOfAttributesCorrectly proves a caller can look up which user
 // holds a given slice, and gets ok=false for a free one.
 func TestHolderOfAttributesCorrectly(t *testing.T) {

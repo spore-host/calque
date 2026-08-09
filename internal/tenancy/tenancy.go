@@ -50,6 +50,20 @@ var ErrNoFreeSlice = errors.New("tenancy: no free slice")
 // contention condition.
 var ErrSliceNotCheckedOut = errors.New("tenancy: slice not checked out")
 
+// ExpiryHook is called when sweepExpiredLocked reclaims a slice whose TTL
+// passed without an explicit CheckIn — the caller's chance to react to (in
+// principle: verify or wait for) the previous holder's actual workload
+// having stopped before the slice is handed to anyone else. It is invoked
+// SYNCHRONOUSLY, while Registry's internal lock is held, so by the time the
+// CheckOut/Occupancy/HolderOf call that triggered the sweep returns, the
+// hook has already run and the slice was not freed until it did.
+//
+// Kept as a narrow injected-function-type seam — mirroring
+// internal/mps.RestartFunc/CrashNotifier's own discipline — so Registry
+// never imports warmd/exec/AWS to learn whether a process actually died;
+// that knowledge lives entirely on the caller's side of this hook.
+type ExpiryHook func(slice Slice, userID string)
+
 // Registry tracks check-out/check-in state for one instance's fixed set of
 // slices (calque#107: the slice LAYOUT itself — how many slices, what size
 // each is — is chosen once at boot/prep time and does not change while the
@@ -61,13 +75,24 @@ type Registry struct {
 	held     map[string]checkout // keyed by Slice.ID
 	now      func() time.Time    // overridable for deterministic TTL-expiry tests
 	sweepTTL time.Duration       // 0 => no TTL enforcement (caller must CheckIn explicitly)
+	onExpire ExpiryHook          // nil => no-op; preserves pre-hook behavior exactly
 }
 
 // NewRegistry builds a Registry over a fixed set of slices. ttl is the
 // default check-out duration if a caller's CheckOut doesn't specify one
-// (0 => no expiry; CheckIn is required to free a slice).
+// (0 => no expiry; CheckIn is required to free a slice). Equivalent to
+// NewRegistryWithExpiryHook with a nil hook — existing callers get exactly
+// today's behavior, unchanged.
 func NewRegistry(slices []Slice, ttl time.Duration) *Registry {
-	return &Registry{slices: slices, held: map[string]checkout{}, now: time.Now, sweepTTL: ttl}
+	return NewRegistryWithExpiryHook(slices, ttl, nil)
+}
+
+// NewRegistryWithExpiryHook is NewRegistry plus an ExpiryHook the Registry
+// calls synchronously whenever it reclaims a TTL-expired slice (see
+// ExpiryHook's doc). Pass nil for onExpire to get NewRegistry's plain
+// behavior.
+func NewRegistryWithExpiryHook(slices []Slice, ttl time.Duration, onExpire ExpiryHook) *Registry {
+	return &Registry{slices: slices, held: map[string]checkout{}, now: time.Now, sweepTTL: ttl, onExpire: onExpire}
 }
 
 // CheckOut binds userID to one free slice for ttl (0 => use the Registry's
@@ -139,11 +164,18 @@ func (r *Registry) HolderOf(sliceID string) (userID string, ok bool) {
 }
 
 // sweepExpiredLocked removes every checkout whose TTL has passed. Caller
-// must hold r.mu.
+// must hold r.mu. If an ExpiryHook is configured, it is called for each
+// expired checkout BEFORE that checkout is deleted (see ExpiryHook's doc) —
+// note this means a hook that itself tries to call back into a Registry
+// method would deadlock on r.mu, so hooks must only touch the (slice,
+// userID) they're given, not the Registry.
 func (r *Registry) sweepExpiredLocked() {
 	now := r.now()
 	for id, c := range r.held {
 		if !c.expiresAt.IsZero() && now.After(c.expiresAt) {
+			if r.onExpire != nil {
+				r.onExpire(c.slice, c.userID)
+			}
 			delete(r.held, id)
 		}
 	}
