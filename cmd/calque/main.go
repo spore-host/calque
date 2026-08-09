@@ -77,6 +77,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "session":
+		if err := sessionCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -291,6 +296,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque ramp --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] [--rungs 1,100,1000] [--fallback-regions us-west-2,eu-central-1] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque pool create --model M --instance-type T --manifest-bucket B --results-bucket B --runner-path P [--workers N] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque spawn-run --bucket B --run-id ID --ami AMI [--instance m7i.large] <script.py> --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque session <checkout|checkin|status|list> ... (institutional MIG/MPS slice check-out/check-in, docs/tenancy-vs-session.md)")
 }
 
 // pyastDir locates the helper relative to the repo. We resolve it from this

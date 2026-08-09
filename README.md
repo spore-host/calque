@@ -219,9 +219,20 @@ divide one physical GPU across concurrent users:
   different kind than "this costs money."
 
 See [`docs/tenancy-vs-session.md`](docs/tenancy-vs-session.md) for the check-out/check-in
-lifecycle design. **Maturity note:** the primitives above are real, shipped, and tested — the
-end-to-end institutional CLI workflow (a `calque session` that checks out a slice, binds a
-workload, and enforces a TTL) is still in progress.
+lifecycle design.
+
+### `calque session`: check-out/check-in on an already-running instance
+
+`calque session checkout --instance-id ID --user U --backend mig|mps [--ttl 2h]` binds one
+user to one MIG slice or MPS client-slot on an instance someone else already acquired — it
+never launches or terminates EC2 instances itself, matching
+[`docs/tenancy-vs-session.md`](docs/tenancy-vs-session.md)'s explicit scope boundary. `mig`
+needs no extra confirmation (hardware-isolated); `mps` requires the same
+`--i-understand-shared-gpu-has-no-isolation` flag `internal/mps` already gates on. Checkout
+prints the checked-out slice ID and a session token; `calque session checkin --slice ID
+--session-token T` requires that exact token back and refuses (without releasing the slice)
+if it doesn't match. `calque session status --instance-id ID` and `calque session list
+--instance-id ID` report live occupancy and per-slice holders.
 
 ## Design notes
 
