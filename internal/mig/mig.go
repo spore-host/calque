@@ -70,23 +70,61 @@ func (e *ErrNoProfiles) Error() string {
 	return fmt.Sprintf("mig: no MIG profiles cataloged for family %q", e.Family)
 }
 
+// ErrNoProfileFits means the family has cataloged MIG profiles, but none of
+// them offers at least MinMemoryGiB of per-slice memory — i.e. every slice
+// this card can be carved into is too small for the caller's workload.
+type ErrNoProfileFits struct {
+	Family       string
+	MinMemoryGiB float64
+}
+
+func (e *ErrNoProfileFits) Error() string {
+	return fmt.Sprintf("mig: no MIG profile for family %q offers >= %.2f GiB per slice", e.Family, e.MinMemoryGiB)
+}
+
 // PickLayout chooses ONE fixed layout for the whole card, at boot/prep time
-// only (calque#107's own scope — no live reconfiguration). "Dumb" by design,
-// mirroring plan.PickSmallest's own "deliberately dumb" philosophy (spec
-// §1): it picks the profile with the MOST instances (maximizing the number
-// of concurrent tenants a card can serve), breaking ties by the SMALLEST
-// per-slice memory (the finer-grained split, since more/smaller slices is
-// the more conservative multi-tenant default — a user needing more memory
-// can be routed to a bigger, less-shared card by a future scheduler, which
-// is out of this issue's scope).
+// only (calque#107's own scope — no live reconfiguration).
+//
+// When minMemoryGiB is 0, it's "dumb" by design, mirroring
+// plan.PickSmallest's own "deliberately dumb" philosophy (spec §1): it picks
+// the profile with the MOST instances (maximizing the number of concurrent
+// tenants a card can serve), breaking ties by the SMALLEST per-slice memory
+// (the finer-grained split, since more/smaller slices is the more
+// conservative multi-tenant default).
+//
+// When minMemoryGiB is > 0, it instead picks the SMALLEST profile (by
+// MemoryGiB) that offers at least minMemoryGiB per slice — a memory-aware
+// override for workloads that need a memory floor the "most tenants wins"
+// default can't guarantee (e.g. a 30-40GB workload can't fit a 24GB slice
+// just because the scheduler maximized slice count). If no profile in the
+// family satisfies that floor, it returns *ErrNoProfileFits.
 //
 // Returns the profile plus the resulting slice count (== profile.MaxInstances,
 // named separately for callers that want it without re-reading the struct).
-func PickLayout(family string) (Profile, int, error) {
+func PickLayout(family string, minMemoryGiB float64) (Profile, int, error) {
 	profiles, ok := ProfilesFor(family)
 	if !ok || len(profiles) == 0 {
 		return Profile{}, 0, &ErrNoProfiles{Family: family}
 	}
+
+	if minMemoryGiB > 0 {
+		var best Profile
+		found := false
+		for _, p := range profiles {
+			if p.MemoryGiB < minMemoryGiB {
+				continue
+			}
+			if !found || p.MemoryGiB < best.MemoryGiB {
+				best = p
+				found = true
+			}
+		}
+		if !found {
+			return Profile{}, 0, &ErrNoProfileFits{Family: family, MinMemoryGiB: minMemoryGiB}
+		}
+		return best, best.MaxInstances, nil
+	}
+
 	best := profiles[0]
 	for _, p := range profiles[1:] {
 		switch {

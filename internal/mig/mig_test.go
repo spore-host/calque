@@ -40,7 +40,7 @@ func TestPickLayoutMaximizesInstanceCount(t *testing.T) {
 		{"g7e", "1g.24gb", 4}, // 4 instances beats 2g.48gb's 2 and 4g.96gb's 1
 	}
 	for _, c := range cases {
-		p, count, err := PickLayout(c.family)
+		p, count, err := PickLayout(c.family, 0)
 		if err != nil {
 			t.Fatalf("PickLayout(%q): %v", c.family, err)
 		}
@@ -50,10 +50,39 @@ func TestPickLayoutMaximizesInstanceCount(t *testing.T) {
 	}
 }
 
+// TestPickLayoutMemoryAwarePicksSmallestFitting proves that when a caller
+// passes a minMemoryGiB floor, PickLayout switches from "maximize tenant
+// count" to "smallest profile that still fits the workload" — e.g. a
+// 30GB-memory workload on g7e must land on 2g.48gb (47.38 GiB), not
+// 1g.24gb (23.62 GiB, too small) and not 4g.96gb (95.00 GiB, oversized).
+func TestPickLayoutMemoryAwarePicksSmallestFitting(t *testing.T) {
+	p, count, err := PickLayout("g7e", 30)
+	if err != nil {
+		t.Fatalf("PickLayout(g7e, 30): %v", err)
+	}
+	if p.Name != "2g.48gb" || count != 2 {
+		t.Errorf("PickLayout(g7e, 30) = (%q, %d), want (%q, %d)", p.Name, count, "2g.48gb", 2)
+	}
+}
+
+// TestPickLayoutMemoryAwareNoFitReturnsTypedError proves that when no
+// cataloged profile offers enough per-slice memory, PickLayout returns
+// *ErrNoProfileFits rather than silently picking an undersized profile.
+func TestPickLayoutMemoryAwareNoFitReturnsTypedError(t *testing.T) {
+	_, _, err := PickLayout("g7e", 200)
+	if err == nil {
+		t.Fatal("PickLayout(g7e, 200) = nil error, want ErrNoProfileFits (no g7e profile offers 200 GiB)")
+	}
+	var wantType *ErrNoProfileFits
+	if !errors.As(err, &wantType) {
+		t.Errorf("PickLayout(g7e, 200) error = %v (%T), want *ErrNoProfileFits", err, err)
+	}
+}
+
 // TestPickLayoutErrorsOnUnknownFamily proves an uncataloged family returns a
 // typed error rather than a zero-value Profile that looks like a valid pick.
 func TestPickLayoutErrorsOnUnknownFamily(t *testing.T) {
-	_, _, err := PickLayout("g6")
+	_, _, err := PickLayout("g6", 0)
 	if err == nil {
 		t.Fatal("PickLayout(g6) = nil error, want ErrNoProfiles (g6 has no MIG profiles)")
 	}
