@@ -96,6 +96,29 @@ def _volumes_map(node: ast.AST) -> dict[str, str] | None:
     return out
 
 
+def _schedule_marker(node: ast.AST) -> dict[str, Any] | None:
+    """Recognize `schedule=modal.Cron(...)` / `schedule=modal.Period(...)` object
+    forms (calque#91). Without this, the Call node falls through to `_literal`'s
+    generic `{"__unparsed__": ...}` marker, which the Go side cannot distinguish
+    from any other unparseable schedule= value.
+
+    Returns {"__schedule__": "Cron"|"Period", "args": [...], "kwargs": {...}} with
+    each positional/keyword arg individually literal-eval'd (never the whole Call
+    node — a Cron/Period call itself is never itself a literal). Returns None if
+    this isn't a Cron/Period call, so the caller falls through to the generic path.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    name = _attr_chain(node.func)[-1:]
+    if name not in (["Cron"], ["Period"]):
+        return None
+    return {
+        "__schedule__": name[0],
+        "args": [_literal(a) for a in node.args],
+        "kwargs": {kw.arg: _literal(kw.value) for kw in node.keywords if kw.arg is not None},
+    }
+
+
 def _decorator_kwargs(node: ast.AST) -> dict[str, Any]:
     """kwargs of a decorator call. `gpu=`, `timeout=`, `image=`, `volumes=` etc."""
     if not isinstance(node, ast.Call):
@@ -113,6 +136,11 @@ def _decorator_kwargs(node: ast.AST) -> dict[str, Any]:
             # image=image_var — record the referenced var name so IR can resolve it.
             out["image"] = {"__ref__": kw.value.id}
             continue
+        if kw.arg == "schedule":
+            sched = _schedule_marker(kw.value)
+            if sched is not None:
+                out["schedule"] = sched
+                continue
         out[kw.arg] = _literal(kw.value)
     return out
 

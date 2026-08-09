@@ -82,9 +82,15 @@ type Config struct {
 	MemoryMB int      // memory= in MB (0 if unset)
 	Retries  int      // retries= (re-drive cap; 0 if unset)
 	Secrets  []string // secret names referenced (recorded; not honored in the spike)
-	Schedule string   // schedule= (e.g. "0 * * * *"); recorded, not honored
-	Region   string   // region= placement hint; recorded, not honored
-	Cloud    string   // cloud= ("aws"/"gcp"/"oci"/"auto"); recorded, not honored (calque#91)
+	// schedule= (e.g. "0 * * * *"); recorded, not honored. Also recognizes the
+	// modal.Cron(cron_string, timezone=)/modal.Period(days=,hours=,minutes=,
+	// seconds=) object forms (calque#91): Cron's cron string lands here verbatim
+	// (timezone= is discarded, matching the bare-string form); Period's kwargs
+	// are additive and get normalized to a single "<n>d<n>h<n>m<n>s" string,
+	// omitting any zero/absent unit (e.g. days=1,hours=6 -> "1d6h").
+	Schedule string
+	Region   string // region= placement hint; recorded, not honored
+	Cloud    string // cloud= ("aws"/"gcp"/"oci"/"auto"); recorded, not honored (calque#91)
 }
 
 // Function is an @app.function (or, when embedded in a Class, an @method).

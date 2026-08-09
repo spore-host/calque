@@ -686,13 +686,20 @@ func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner
 			rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, script, line,
 				"%s: secrets=%s recorded but NOT injected in the spike; a payload needing them will fail", owner, string(raw))
 		case "schedule":
+			// calque#91: schedule=modal.Cron(...)/modal.Period(...) object forms —
+			// recognized structurally (via the __schedule__ marker pyast emits) rather
+			// than falling into the generic __unparsed__ string mangling below.
+			suffix := ""
 			if s, ok := decodeString(raw); ok {
 				cfg.Schedule = s
+			} else if sched, ok := decodeScheduleMarker(raw); ok {
+				cfg.Schedule = sched
+				suffix = " (recognized from modal.Cron/Period object form)"
 			} else {
 				cfg.Schedule = string(raw)
 			}
 			rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, script, line,
-				"%s: schedule= recorded but NOT honored (no scheduler in the spike)", owner)
+				"%s: schedule= recorded but NOT honored (no scheduler in the spike)%s", owner, suffix)
 		case "region":
 			if s, ok := decodeString(raw); ok {
 				cfg.Region = s
@@ -795,6 +802,68 @@ func decodeStringListBestEffort(raw json.RawMessage) []string {
 		return xs
 	}
 	return []string{string(raw)}
+}
+
+// decodeScheduleMarker decodes the {"__schedule__": "Cron"|"Period", "args": [...],
+// "kwargs": {...}} shape pyast emits for schedule=modal.Cron(...)/modal.Period(...)
+// object forms (calque#91; see _schedule_marker in tools/pyast/pyast.py). Returns
+// the normalized ir.Config.Schedule string, or ("", false) if raw isn't this shape
+// (the caller falls back to the pre-existing bare-string/stringify handling).
+//
+//   - Cron: the first positional arg (the cron string) becomes Schedule verbatim.
+//     timezone= (and any other kwarg) is discarded — the bare-string schedule= form
+//     never carried timezone info either, so this doesn't regress that posture.
+//   - Period: days=/hours=/minutes=/seconds= are ADDITIVE (Modal itself combines any
+//     subset, e.g. days=1, hours=6 means "every 1 day 6 hours"), so they're summed
+//     into one normalized string of the form "<n>d<n>h<n>m<n>s", omitting any unit
+//     that is zero/absent (see the doc comment on ir.Config.Schedule for the exact
+//     format contract). All-zero/absent kwargs (a malformed script) yield "".
+func decodeScheduleMarker(raw json.RawMessage) (string, bool) {
+	var m struct {
+		Kind   string         `json:"__schedule__"`
+		Args   []any          `json:"args"`
+		Kwargs map[string]any `json:"kwargs"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil || m.Kind == "" {
+		return "", false
+	}
+	switch m.Kind {
+	case "Cron":
+		if len(m.Args) == 0 {
+			return "", true
+		}
+		s, _ := m.Args[0].(string)
+		return s, true
+	case "Period":
+		num := func(k string) int {
+			v, ok := m.Kwargs[k]
+			if !ok {
+				return 0
+			}
+			f, ok := v.(float64) // JSON numbers decode to float64 in an `any`
+			if !ok {
+				return 0
+			}
+			return int(f)
+		}
+		days, hours, minutes, seconds := num("days"), num("hours"), num("minutes"), num("seconds")
+		var b strings.Builder
+		if days != 0 {
+			fmt.Fprintf(&b, "%dd", days)
+		}
+		if hours != 0 {
+			fmt.Fprintf(&b, "%dh", hours)
+		}
+		if minutes != 0 {
+			fmt.Fprintf(&b, "%dm", minutes)
+		}
+		if seconds != 0 {
+			fmt.Fprintf(&b, "%ds", seconds)
+		}
+		return b.String(), true
+	default:
+		return "", false
+	}
 }
 
 // decodeStringMap accepts {"/mnt":"vol"} but rejects a map whose values aren't

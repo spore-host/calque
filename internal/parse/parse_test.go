@@ -637,3 +637,69 @@ func TestLocalCallsPopulatedFromFixture(t *testing.T) {
 		t.Errorf("stage_two.LocalCalls = %v, want empty (it calls nothing via .local())", stageTwo.LocalCalls)
 	}
 }
+
+// TestParseScheduleObjectForms (calque#91): schedule=modal.Cron(...)/modal.Period(...)
+// object forms must be recognized structurally (via pyast's __schedule__ marker),
+// not fall into the generic __unparsed__ mangling that used to leave
+// ir.Config.Schedule holding stringified JSON garbage. Also guards the pre-existing
+// bare-string schedule= case against regression.
+func TestParseScheduleObjectForms(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/schedule_object.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	cronJob, ok := app.FindFunction("cron_job")
+	if !ok {
+		t.Fatal(`FindFunction("cron_job") = false, want true`)
+	}
+	if cronJob.Config.Schedule != "0 * * * *" {
+		t.Errorf("cron_job.Config.Schedule = %q, want %q", cronJob.Config.Schedule, "0 * * * *")
+	}
+
+	periodJob, ok := app.FindFunction("period_job")
+	if !ok {
+		t.Fatal(`FindFunction("period_job") = false, want true`)
+	}
+	if periodJob.Config.Schedule != "1d6h" {
+		t.Errorf("period_job.Config.Schedule = %q, want %q", periodJob.Config.Schedule, "1d6h")
+	}
+
+	// Regression guard: the pre-existing bare-string schedule= case must still work.
+	bareJob, ok := app.FindFunction("bare_string_job")
+	if !ok {
+		t.Fatal(`FindFunction("bare_string_job") = false, want true`)
+	}
+	if bareJob.Config.Schedule != "0 0 * * *" {
+		t.Errorf("bare_string_job.Config.Schedule = %q, want %q", bareJob.Config.Schedule, "0 0 * * *")
+	}
+
+	// All three must fire the dedicated schedule= leak (semantic gap: recorded but
+	// not honored) — the object-form cases must say so explicitly, and NONE of the
+	// three may instead fire the generic "unmodeled decorator arg" fallback leak.
+	wantScheduleLeak := map[string]bool{"cron_job": true, "period_job": true, "bare_string_job": true}
+	wantObjectFormNote := map[string]bool{"cron_job": true, "period_job": true}
+	for _, l := range rep.Leaks {
+		for name := range wantScheduleLeak {
+			if strings.Contains(l.Detail, name+":") && strings.Contains(l.Detail, "schedule=") && strings.Contains(l.Detail, "recorded but NOT honored") {
+				delete(wantScheduleLeak, name)
+				if strings.Contains(l.Detail, "recognized from modal.Cron/Period object form") {
+					delete(wantObjectFormNote, name)
+				}
+			}
+		}
+		if strings.Contains(l.Detail, "unmodeled decorator arg") && strings.Contains(l.Detail, "schedule") {
+			t.Errorf("schedule= must not hit the generic unmodeled-decorator-arg fallback; leak=%+v", l)
+		}
+	}
+	if len(wantScheduleLeak) != 0 {
+		t.Errorf("missing dedicated schedule= leak for %v; leaks=%+v", wantScheduleLeak, rep.Leaks)
+	}
+	if len(wantObjectFormNote) != 0 {
+		t.Errorf("object-form schedule= leaks must note recognition for %v; leaks=%+v", wantObjectFormNote, rep.Leaks)
+	}
+}
