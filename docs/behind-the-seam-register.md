@@ -20,6 +20,7 @@ the census stays honest.
 | `secrets=`, `schedule=`, `region=` | `readConfigKwargs` | recorded but NOT honored (§B); a payload that needs them fails visibly |
 | Serve entrypoints (§F/M9) | `pyast` `entry_kind` → `run.go` | "serve shape … execution shape deferred" (see [serve-architecture.md](serve-architecture.md)) |
 | Volume mid-run `reload()` (§E/M8) | `pyast` `volume_writes` → `parse` | "mid-run re-read of a mutated volume is not reproduced" |
+| `Function.from_name("other-app", "fn").remote(...)` — cross-app invocation (calque#87, decided non-goal calque#137) | `tools/pyast/pyast.py` `visit_Call` → `internal/parse/parse.go` (captures app name, object name, args) | recognized, never executed: calque runs exactly ONE script's `ir.App` per invocation, and has no path to locate/parse a SEPARATE deployed app's source — unlike `.spawn()` (calque#97), whose targets live inside the already-parsed `ir.App`. Building real orchestration would mean inventing a deployment-registry concept (name→script resolution) disproportionate to how rare this idiom is. Permanent non-goal, not a "needs design" gap. |
 
 ## Non-goals that carry NO code (would-be attach points)
 

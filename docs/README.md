@@ -7,6 +7,9 @@ guessing from filenames.
   calque support MY script? A construct-by-construct census of Modal's real
   API surface against calque's current behavior, sourced from Modal's own
   docs and a corpus of real-world usage, not a hand-picked list.
+- [`porting-modal-to-aws.md`](porting-modal-to-aws.md) — I have a working
+  Modal app, what do I change to run it on AWS? Task-oriented, built around
+  running `calque analyze` and reading its real output.
 - [`behind-the-seam-register.md`](behind-the-seam-register.md) — what calque
   deliberately does NOT port (autoscaling, async futures, secrets injection,
   mid-run volume reload, real card selection, ...) and the attach point a
@@ -17,7 +20,7 @@ guessing from filenames.
 - [`tenancy-vs-session.md`](tenancy-vs-session.md) — why `calque session`
   (the acquire-once/hold/run-many verb) was renamed `calque ramp` (shipped,
   #117), and what the new `calque session` (multi-tenant MIG/MPS slice
-  check-out, not yet built) will actually mean.
+  check-out/check-in, shipped) actually means.
 - [`gpu-sharing-support-matrix.md`](gpu-sharing-support-matrix.md) — which
   GPU families/generations actually support MIG vs. MPS, verified against
   live hardware rather than assumed from datasheets.
