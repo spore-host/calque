@@ -683,6 +683,63 @@ func TestLocalCallsPopulatedFromFixture(t *testing.T) {
 	}
 }
 
+// TestFreeRefsPopulatedFromFixture (calque#139): each function/method's own
+// FreeRefs carries the bare (non-.local()-suffixed) module-level names ITS
+// OWN body references — `load`'s @enter body bare-reads GREETING, `greet`'s
+// body bare-calls the plain (never-decorated) helper _format, and `stray`'s
+// body must NOT capture GREETING at all (its own comprehension shadows the
+// module constant with a same-named loop variable — proving this is real
+// scope tracking, not a naive name match). App.ModuleConsts/ModuleFuncs must
+// also carry the resolvable shapes.
+func TestFreeRefsPopulatedFromFixture(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/free_refs.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if len(app.Classes) != 1 {
+		t.Fatalf("app.Classes = %d, want 1", len(app.Classes))
+	}
+	cls := app.Classes[0]
+	if len(cls.EnterFreeRefs) != 1 || cls.EnterFreeRefs[0] != "GREETING" {
+		t.Errorf("cls.EnterFreeRefs = %v, want [GREETING]", cls.EnterFreeRefs)
+	}
+
+	var greet, stray ir.Function
+	for _, m := range cls.Methods {
+		switch m.Name {
+		case "greet":
+			greet = m
+		case "stray":
+			stray = m
+		}
+	}
+	if len(greet.FreeRefs) != 1 || greet.FreeRefs[0] != "_format" {
+		t.Errorf("greet.FreeRefs = %v, want [_format]", greet.FreeRefs)
+	}
+	if len(stray.FreeRefs) != 0 {
+		t.Errorf("stray.FreeRefs = %v, want empty (GREETING is shadowed by its own comprehension loop var)", stray.FreeRefs)
+	}
+
+	if src, ok := app.ModuleConsts["GREETING"]; !ok || !strings.Contains(src, `"hello"`) {
+		t.Errorf(`app.ModuleConsts["GREETING"] = %q, ok=%v, want a source line containing "hello"`, src, ok)
+	}
+	mf, ok := app.ModuleFuncs["_format"]
+	if !ok {
+		t.Fatal(`app.ModuleFuncs["_format"] missing — want the plain, undecorated helper captured`)
+	}
+	if len(mf.Args) != 1 || mf.Args[0] != "name" {
+		t.Errorf("ModuleFuncs[_format].Args = %v, want [name]", mf.Args)
+	}
+	if len(mf.FreeRefs) != 1 || mf.FreeRefs[0] != "GREETING" {
+		t.Errorf("ModuleFuncs[_format].FreeRefs = %v, want [GREETING] (the helper itself reads the module constant)", mf.FreeRefs)
+	}
+}
+
 // TestParseScheduleObjectForms (calque#91): schedule=modal.Cron(...)/modal.Period(...)
 // object forms must be recognized structurally (via pyast's __schedule__ marker),
 // not fall into the generic __unparsed__ mangling that used to leave

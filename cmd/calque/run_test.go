@@ -22,7 +22,10 @@ func TestCollectLocalExtrasTransitiveClosure(t *testing.T) {
 	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
 	rep := &leak.Report{}
 
-	extras := collectLocalExtras(app, unit, rep)
+	extras, consts := collectLocalExtras(app, unit, rep)
+	if len(consts) != 0 {
+		t.Errorf("consts = %+v, want none", consts)
+	}
 	if len(extras) != 2 {
 		t.Fatalf("collectLocalExtras returned %d extras, want 2; got %+v", len(extras), extras)
 	}
@@ -51,13 +54,13 @@ func TestCollectLocalExtrasSkipsClassMethodAndLeaksHonestly(t *testing.T) {
 	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
 	rep := &leak.Report{}
 
-	extras := collectLocalExtras(app, unit, rep)
-	if len(extras) != 0 {
-		t.Errorf("collectLocalExtras shipped %+v, want none (score is a @cls method)", extras)
+	extras, consts := collectLocalExtras(app, unit, rep)
+	if len(extras) != 0 || len(consts) != 0 {
+		t.Errorf("collectLocalExtras shipped extras=%+v consts=%+v, want none (score is a @cls method)", extras, consts)
 	}
 	found := false
 	for _, l := range rep.Leaks {
-		if strings.Contains(l.Detail, "score.local(...)") && strings.Contains(l.Detail, "not shipped") {
+		if strings.Contains(l.Detail, "score") && strings.Contains(l.Detail, "not shipped") {
 			found = true
 		}
 	}
@@ -78,7 +81,10 @@ func TestCollectLocalExtrasSelfReferenceTerminates(t *testing.T) {
 	rep := &leak.Report{}
 
 	done := make(chan []warm.ExtraFunc, 1)
-	go func() { done <- collectLocalExtras(app, unit, rep) }()
+	go func() {
+		extras, _ := collectLocalExtras(app, unit, rep)
+		done <- extras
+	}()
 	select {
 	case extras := <-done:
 		if len(extras) != 1 || extras[0].Name != "recur" {
@@ -101,7 +107,10 @@ func TestCollectLocalExtrasCycleTerminates(t *testing.T) {
 	rep := &leak.Report{}
 
 	done := make(chan []warm.ExtraFunc, 1)
-	go func() { done <- collectLocalExtras(app, unit, rep) }()
+	go func() {
+		extras, _ := collectLocalExtras(app, unit, rep)
+		done <- extras
+	}()
 	select {
 	case extras := <-done:
 		if len(extras) != 2 {

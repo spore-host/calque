@@ -52,22 +52,43 @@ type Config struct {
 	// payload is list/tuple-shaped. false (the default) reproduces the
 	// original single-arg bind path byte-for-byte.
 	Starmap bool `json:"starmap,omitempty"`
-	// Extras are sibling functions referenced via .local() from EnterBody or
-	// MethodBody (calque#92) — compiled into the runner's shared globals
-	// alongside @enter/@method so the verbatim calling body's helper(...) /
+	// Extras are sibling functions referenced via .local() (calque#92) OR a
+	// bare, non-.local() call/reference (calque#139) from EnterBody or
+	// MethodBody — compiled into the runner's shared globals alongside
+	// @enter/@method so the verbatim calling body's helper(...) /
 	// helper.local(...) text resolves, exactly as it would in the same Modal
 	// container process.
 	Extras []ExtraFunc `json:"extras,omitempty"`
+	// ExtraConsts are module-level CONSTANTS (calque#139) — a bare, non-call
+	// name reference like `self.prefix = GREETING` inside EnterBody/MethodBody,
+	// where GREETING is a plain `GREETING = "hello"` module-level assignment,
+	// never registered as an @app.function (so it can't be an ExtraFunc: it
+	// has no body-as-a-function shape, just a value). Compiled into the
+	// runner's shared globals via a verbatim exec of the assignment
+	// statement, same "ship the payload verbatim, never interpret it" trust
+	// model as everything else in this file.
+	ExtraConsts []ExtraConst `json:"extra_consts,omitempty"`
 }
 
-// ExtraFunc is one .local()-referenced sibling function's verbatim shape
-// (calque#92): its own parameter names (no self/cls — these are plain
-// @app.function bodies, not @cls methods) and its own body, shipped alongside
-// the picked warm unit's Config so the runner can compile and bind it.
+// ExtraFunc is one .local()-referenced (calque#92) or bare-referenced
+// (calque#139) sibling function's verbatim shape: its own parameter names
+// (no self/cls — these are plain @app.function bodies or module-level
+// helpers, never @cls methods) and its own body, shipped alongside the
+// picked warm unit's Config so the runner can compile and bind it.
 type ExtraFunc struct {
 	Name string   `json:"name"`
 	Args []string `json:"args"`
 	Body string   `json:"body"`
+}
+
+// ExtraConst is one bare-referenced (calque#139) module-level constant's
+// verbatim source: the whole `NAME = <literal-or-expression>` statement,
+// shipped alongside the picked warm unit's Config so the runner can exec it
+// into its shared globals, unchanged, exactly as it exists at module scope in
+// the original script.
+type ExtraConst struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
 }
 
 // Item is one unit of work, keyed by input index for ordered collection.
@@ -576,11 +597,19 @@ func (s *Supervisor) warmUp(rn *runner) error {
 	for i, e := range s.Config.Extras {
 		extras[i] = map[string]any{"name": e.Name, "args": e.Args, "body": e.Body}
 	}
+	// calque#139: module-level constants a bare free-name reference resolved
+	// to (e.g. `self.prefix = GREETING`) — a distinct shape from Extras
+	// (functions): each is exec'd verbatim as its own assignment statement,
+	// not compiled as a callable.
+	extraConsts := make([]map[string]any, len(s.Config.ExtraConsts))
+	for i, e := range s.Config.ExtraConsts {
+		extraConsts[i] = map[string]any{"name": e.Name, "source": e.Source}
+	}
 	if err := rn.send(map[string]any{
 		"kind": "config", "enter_body": s.Config.EnterBody,
 		"method_body": s.Config.MethodBody, "method_arg": s.Config.MethodArg,
 		"method_args": s.Config.MethodArgs, "starmap": s.Config.Starmap,
-		"concurrency": conc, "extras": extras,
+		"concurrency": conc, "extras": extras, "extra_consts": extraConsts,
 	}); err != nil {
 		return err
 	}

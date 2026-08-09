@@ -34,7 +34,29 @@ type pyOut struct {
 	InvokeCalls  []pyInvokeCall      `json:"invoke_calls"`
 	VolumeWrites []pyVolumeWrite     `json:"volume_writes"`
 	HelperLeaks  []map[string]any    `json:"helper_leaks"`
-	Error        string              `json:"error"`
+	// ModuleConsts is the verbatim source of every module-level `NAME = <literal-
+	// or-expression>` assignment, keyed by name (calque#139) — the shippable
+	// half of free-variable resolution besides Functions itself (a FreeRefs
+	// name may resolve to either this map or a plain @app.function in
+	// Functions; collectLocalExtras tries both, same as it already does for
+	// LocalCalls' @cls-method-vs-plain-function distinction).
+	ModuleConsts map[string]string `json:"module_consts"`
+	// ModuleFuncs is EVERY module-level function (calque#139), decorated or
+	// not — crucially including a plain, undecorated helper that never
+	// becomes an @app.function and so never appears in Functions above. The
+	// OTHER shippable free-reference target besides ModuleConsts.
+	ModuleFuncs map[string]pyModuleFunc `json:"module_funcs"`
+	Error       string                  `json:"error"`
+}
+
+// pyModuleFunc is one module-level function's shippable shape (calque#139):
+// mirrors the subset of pyFunc a plain helper needs (no decorators/entry_kind
+// — a bare helper has none of those by definition).
+type pyModuleFunc struct {
+	Args       []string `json:"args"`
+	Body       string   `json:"body"`
+	LocalCalls []string `json:"local_calls"`
+	FreeRefs   []string `json:"free_refs"`
 }
 
 // pyVolumeWrite is a volume.commit()/reload() call site (§E). Target is the var the
@@ -71,7 +93,18 @@ type pyFunc struct {
 	// this function/method's own body (calque#92) — dotted call targets, leaf-
 	// resolved the same way every other invoke target is (see leafName).
 	LocalCalls []string `json:"local_calls"`
-	Body       string   `json:"body"`
+	// FreeRefs are bare (non-.local()-suffixed) references to a module-level
+	// helper function or constant, found ANYWHERE inside this function/
+	// method's own body (calque#139) — real Modal code overwhelmingly
+	// references its own module globals this way, never via .local(), since
+	// the helper was never registered as an @app.function to begin with. Each
+	// name here is already resolved (by pyast's _free_refs, real scope
+	// tracking — params/locals/loop-vars/comprehension-vars/nested defs all
+	// shadow) to a genuine module-level def or simple assignment in the SAME
+	// script; already bare (no dotted chain, unlike LocalCalls), since a
+	// free-variable reference is never a call-site attribute chain.
+	FreeRefs []string `json:"free_refs"`
+	Body     string   `json:"body"`
 }
 
 type pyDecorator struct {
@@ -229,6 +262,29 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	}
 	for name, v := range out.Volumes {
 		app.Volumes[name] = v.FromName
+	}
+
+	// calque#139: module-level constants + module-level functions (incl.
+	// plain, undecorated helpers absent from out.Functions), the two
+	// resolution targets collectLocalExtras (cmd/calque/run.go) consults for
+	// each callable's FreeRefs/EnterFreeRefs alongside FindFunction.
+	if len(out.ModuleConsts) > 0 {
+		app.ModuleConsts = out.ModuleConsts
+	}
+	if len(out.ModuleFuncs) > 0 {
+		app.ModuleFuncs = make(map[string]ir.ModuleFunc, len(out.ModuleFuncs))
+		for name, mf := range out.ModuleFuncs {
+			localCalls := make([]string, 0, len(mf.LocalCalls))
+			for _, lc := range mf.LocalCalls {
+				localCalls = append(localCalls, leafName(lc))
+			}
+			app.ModuleFuncs[name] = ir.ModuleFunc{
+				Args:       mf.Args,
+				Body:       mf.Body,
+				LocalCalls: localCalls,
+				FreeRefs:   mf.FreeRefs,
+			}
+		}
 	}
 
 	// Resolve the app image. Modal scripts commonly define exactly one image var;
@@ -598,6 +654,9 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 	for _, lc := range f.LocalCalls {
 		fn.LocalCalls = append(fn.LocalCalls, leafName(lc))
 	}
+	// calque#139: FreeRefs are already bare names (never a dotted call-target
+	// chain, unlike LocalCalls), so no leafName resolution is needed here.
+	fn.FreeRefs = f.FreeRefs
 	fn.IsMap = fn.Invoke == ir.InvokeMap // back-compat: IsMap tracks the .map() idiom
 	// The function-config decorator is the one named "*.function" (or "*.method"
 	// for class methods); enter/method markers carry no gpu/volumes.
@@ -626,6 +685,7 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 		for _, lc := range c.Enter.LocalCalls {
 			cls.EnterLocalCalls = append(cls.EnterLocalCalls, leafName(lc))
 		}
+		cls.EnterFreeRefs = c.Enter.FreeRefs // calque#139: already bare names
 	} else {
 		// A @cls with no @enter still runs, but the warm-load-once economics (§6)
 		// don't apply — worth noting since it changes the amortization story.

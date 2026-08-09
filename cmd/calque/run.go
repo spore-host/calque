@@ -352,22 +352,35 @@ func syntheticClass(f ir.Function) ir.Class {
 	return ir.Class{Name: f.Name, GPU: f.GPU, Config: f.Config, Line: f.Line}
 }
 
-// collectLocalExtras resolves the transitive closure of sibling functions the
-// picked warm unit's own body references via .local() (calque#92) — real
-// idiomatic Modal code (confirmed on AI-Almanac's blending_app.py, calque#79)
-// chains plain @app.functions together this way, and calque previously shipped
-// only the picked unit's own body, guaranteeing a NameError.
+// collectLocalExtras resolves the transitive closure of sibling functions AND
+// constants the picked warm unit's own body references — via the explicit
+// .local() call syntax (calque#92; real idiomatic Modal code, confirmed on
+// AI-Almanac's blending_app.py, chains plain @app.functions together this
+// way) OR via a bare, non-.local() name reference (calque#139; the FAR more
+// common real-world shape: a plain module-level helper/constant that was
+// NEVER registered as an @app.function to begin with, so it's referenced
+// exactly the way any Python module references its own globals). calque
+// previously shipped only the picked unit's own body, guaranteeing a
+// NameError either way.
 //
-// Only plain @app.function targets are resolved and shipped. A .local() call
-// that resolves to a @cls METHOD is deliberately left unsupported (leaked, not
-// shipped): that method would need its own warm @enter state, a materially
-// bigger feature this pass doesn't attempt (see calque#92's own "approach 1 is
-// more robust... revisit if a real adopter needs it" framing).
+// Three resolution targets are tried per queued name, in order: a plain
+// @app.function (app.FindFunction — the pre-existing calque#92 path, still
+// how a .local()-suffixed call resolves, since .local() only exists on a
+// Modal-SDK-wrapped, i.e. decorated, callable), a plain module-level
+// function that was NEVER decorated at all (app.ModuleFuncs — calque#139's
+// new target, e.g. a bare `_format` helper), and a module-level constant
+// (app.ModuleConsts — calque#139's other new target, e.g. `GREETING =
+// "hello"`). A name that resolves to a @cls METHOD is deliberately left
+// unsupported (leaked, not shipped): that method would need its own warm
+// @enter state, a materially bigger feature this pass doesn't attempt (see
+// calque#92's own "approach 1 is more robust... revisit if a real adopter
+// needs it" framing).
 //
 // visited is checked (and set) BEFORE enqueueing a name, not just before
-// shipping — this is what bounds a self-referential (f calling f.local(...))
-// or cyclic (a->b->a) chain to one visit per name rather than looping forever.
-func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) []warm.ExtraFunc {
+// shipping — this is what bounds a self-referential (f calling f.local(...)
+// or f referencing itself) or cyclic (a->b->a) chain to one visit per name
+// rather than looping forever.
+func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) ([]warm.ExtraFunc, []warm.ExtraConst) {
 	visited := map[string]bool{}
 	var queue []string
 	enqueue := func(names []string) {
@@ -380,22 +393,36 @@ func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) []warm.Extr
 	}
 	enqueue(unit.method.LocalCalls)
 	enqueue(unit.class.EnterLocalCalls)
+	enqueue(unit.method.FreeRefs)
+	enqueue(unit.class.EnterFreeRefs)
 
 	var extras []warm.ExtraFunc
+	var consts []warm.ExtraConst
 	for len(queue) > 0 {
 		name := queue[0]
 		queue = queue[1:]
 		if fn, ok := app.FindFunction(name); ok {
 			extras = append(extras, warm.ExtraFunc{Name: fn.Name, Args: fn.Args, Body: fn.Body})
 			enqueue(fn.LocalCalls)
+			enqueue(fn.FreeRefs)
+			continue
+		}
+		if mf, ok := app.ModuleFuncs[name]; ok {
+			extras = append(extras, warm.ExtraFunc{Name: name, Args: mf.Args, Body: mf.Body})
+			enqueue(mf.LocalCalls)
+			enqueue(mf.FreeRefs)
+			continue
+		}
+		if src, ok := app.ModuleConsts[name]; ok {
+			consts = append(consts, warm.ExtraConst{Name: name, Source: src})
 			continue
 		}
 		if resolvesToClassMethod(app, name) {
 			rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, 0,
-				"%s.local(...): resolves to a @cls method — not shipped (no warm @enter state outside the picked unit); will NameError", name)
+				"%s: resolves to a @cls method — not shipped (no warm @enter state outside the picked unit); will NameError", name)
 		}
 	}
-	return extras
+	return extras, consts
 }
 
 // resolvesToClassMethod reports whether name matches any @cls method across
@@ -517,18 +544,31 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 		// only comes from the acquired-instance run; this K is plumbing proof only.
 		methodBody = "import time\ntime.sleep(0.05)\nself.calls += 1\nreturn {'dry_run': True, 'n': self.calls}"
 	}
-	// calque#92: ship any sibling functions the picked unit's body reaches via
-	// .local() — previously only leaked, now actually shipped so the dry-run
-	// doesn't NameError on real in-container pipeline chaining (confirmed
-	// blocking on AI-Almanac's blending_app.py, calque#79).
-	extras := collectLocalExtras(app, unit, rep)
+	// calque#92/#139: ship any sibling functions/constants the picked unit's
+	// body reaches — via .local() (calque#92) or a bare, non-.local() name
+	// reference (calque#139, the far more common real-world shape) —
+	// previously only leaked (or, for calque#139's bare shape, not even
+	// detected at all), now actually shipped so the dry-run doesn't NameError
+	// on real in-container pipeline chaining or a plain module-level
+	// helper/constant read (confirmed blocking on AI-Almanac's
+	// blending_app.py, calque#79, and on 3 of 7 real-world corpus scripts,
+	// calque#139).
+	extras, extraConsts := collectLocalExtras(app, unit, rep)
 	if len(extras) > 0 {
 		names := make([]string, len(extras))
 		for i, e := range extras {
 			names[i] = e.Name
 		}
 		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
-			"shipped %d sibling function(s) referenced via .local(): %s", len(extras), strings.Join(names, ", "))
+			"shipped %d sibling function(s): %s", len(extras), strings.Join(names, ", "))
+	}
+	if len(extraConsts) > 0 {
+		names := make([]string, len(extraConsts))
+		for i, e := range extraConsts {
+			names[i] = e.Name
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"shipped %d module-level constant(s) referenced via a bare name (calque#139): %s", len(extraConsts), strings.Join(names, ", "))
 	}
 
 	sink := warm.NewMemSink()
@@ -539,7 +579,8 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 		Leak:   leakAdapter{rep},
 		Config: warm.Config{
 			EnterBody: enterBody, MethodBody: methodBody, MethodArg: arg, Extras: extras,
-			MethodArgs: methodArgs, Starmap: isStarmap,
+			ExtraConsts: extraConsts,
+			MethodArgs:  methodArgs, Starmap: isStarmap,
 		},
 		// B3: retries= (portable config) caps the warm supervisor's crash re-drive.
 		// 0 leaves warmd's sane default.

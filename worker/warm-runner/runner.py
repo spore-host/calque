@@ -66,6 +66,7 @@ class Runner:
         extras: list[dict] | None = None,
         method_args: list[str] | None = None,
         starmap: bool = False,
+        extra_consts: list[dict] | None = None,
     ) -> None:
         self.enter_body = enter_body
         self.method_body = method_body
@@ -80,6 +81,12 @@ class Runner:
         # is the original single-arg bind path, byte-for-byte unchanged.
         self.starmap = starmap
         self.extras = extras or []  # .local()-referenced sibling functions (calque#92)
+        # extra_consts (calque#139): module-level CONSTANTS a bare (non-.local())
+        # free-name reference resolved to, e.g. `self.prefix = GREETING` inside
+        # @enter with GREETING a plain `GREETING = "hello"` module assignment.
+        # Distinct from extras (functions): each entry is exec'd verbatim as
+        # its own assignment statement, not compiled as a callable.
+        self.extra_consts = extra_consts or []
         self.entered = False
         # The warm namespace: a stand-in for the @cls instance `self`. Bodies see
         # it as `self`; whatever @enter assigns (self.llm = ...) lives here and is
@@ -96,10 +103,12 @@ class Runner:
             # refuse rather than silently reload (which would destroy the economics).
             raise RuntimeError("enter called twice; model would reload (see spec §6)")
         t0 = time.perf_counter()
-        # Extras go into self.globals FIRST — before @enter itself runs — so an
-        # @enter body that .local()-calls a sibling (calque#92) can resolve it too,
-        # not just @method.
+        # Extras/extra_consts go into self.globals FIRST — before @enter itself
+        # runs — so an @enter body that .local()-calls a sibling (calque#92) or
+        # bare-references a sibling helper/constant (calque#139) can resolve it
+        # too, not just @method.
         self._compile_extras()
+        self._compile_extra_consts()
         self._exec_body(self.enter_body, extra_locals={})
         # Compile the @method body once, AFTER @enter (so any imports @enter added to
         # self.globals are in scope for the method). Reused for every item, incl.
@@ -214,6 +223,23 @@ class Runner:
             code = compile(src, f"<calque-extra:{name}>", "exec")
             exec(code, self.globals)
             self.globals[name] = _LocalCallable(self.globals[fn_name])
+
+    def _compile_extra_consts(self) -> None:
+        """Exec every bare-referenced module-level CONSTANT (calque#139) into
+        self.globals, so a verbatim `self.prefix = GREETING` (or any other bare
+        read) resolves unmodified. Unlike _compile_extras, there is no function
+        signature to wrap — `source` is the ENTIRE original `NAME = <expr>`
+        assignment statement, exec'd exactly as it appears at module scope in
+        the original script (same "ship the payload verbatim, never interpret
+        it" trust model as an @enter/@method body or a .local()-referenced
+        sibling function's own body).
+        """
+        for extra in self.extra_consts:
+            source = extra.get("source") or ""
+            if not source:
+                continue
+            code = compile(source, f"<calque-const:{extra.get('name', '?')}>", "exec")
+            exec(code, self.globals)
 
 
 class _Namespace:
@@ -334,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
                     extras=msg.get("extras") or [],
                     method_args=msg.get("method_args") or None,
                     starmap=bool(msg.get("starmap", False)),
+                    extra_consts=msg.get("extra_consts") or [],
                 )
                 # concurrency=C>1 => items run in a C-wide thread pool so inference
                 # overlaps (vLLM batches in-flight requests). Absent/1 => the serial

@@ -285,6 +285,265 @@ def _local_calls(node: ast.FunctionDef) -> list[str]:
     return sorted(targets)
 
 
+# ---- calque#139: free-variable references (bare names, no .local() suffix) ----
+#
+# Real Modal code overwhelmingly references module-level helpers/constants via a
+# plain, undecorated name — not `.local(...)` — because they're ordinary Python
+# globals, never registered as an @app.function at all. _local_calls above only
+# ever sees the explicit `.local()` idiom; this is its free-name counterpart,
+# needing REAL scope tracking (params/locals/loop-vars/comprehension-vars/nested
+# defs and lambdas all shadow an outer name of the same spelling) rather than a
+# naive regex/flat scan.
+
+
+def _arg_id_set(args: ast.arguments) -> set[str]:
+    """Bare parameter names bound by a function/lambda signature (no */**
+    markers, unlike _arg_names — those markers would break scope membership
+    tests, since the body refers to the vararg by its bare name)."""
+    names = {p.arg for p in (args.posonlyargs + args.args + args.kwonlyargs)}
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _comp_target_names(target: ast.AST) -> list[str]:
+    """Flatten a (possibly nested/starred) `for` or comprehension target into
+    the bare names it binds — `for a, (b, *c) in ...` binds a/b/c."""
+    out: list[str] = []
+
+    def rec(t: ast.AST) -> None:
+        if isinstance(t, ast.Name):
+            out.append(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                rec(e)
+        elif isinstance(t, ast.Starred):
+            rec(t.value)
+
+    rec(target)
+    return out
+
+
+def _bound_names_in_block(stmts: list[ast.stmt]) -> set[str]:
+    """Every name bound directly within this block's OWN statements — Python
+    hoists a function-local's "local-ness" across the WHOLE function body
+    regardless of textual order (unlike e.g. JS `let`), so this is a
+    non-recursive-into-nested-scopes scan, not a sequential one: assignment
+    targets (incl. tuple/list/starred unpacking), augmented/annotated assign,
+    `for`/`with`/`except` bound names, walrus (`:=`) targets, imports, and a
+    nested def/class's own NAME (the `def foo():` statement binds `foo` in
+    THIS scope even though foo's body is a separate one). Does NOT descend
+    into a nested function/lambda/comprehension's own body — those get their
+    own call from _FreeRefFinder when it recurses into them."""
+    bound: set[str] = set()
+
+    def add_target(t: ast.AST) -> None:
+        if isinstance(t, ast.Name):
+            bound.add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                add_target(e)
+        elif isinstance(t, ast.Starred):
+            add_target(t.value)
+
+    class _Walker(ast.NodeVisitor):
+        def visit_FunctionDef(self, n: ast.FunctionDef) -> None:
+            bound.add(n.name)  # binds the name here; body is a separate scope
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, n: ast.ClassDef) -> None:
+            bound.add(n.name)
+
+        def visit_Lambda(self, n: ast.Lambda) -> None:
+            return  # separate scope, no name bound in THIS one
+
+        def visit_ListComp(self, n: ast.AST) -> None:
+            return  # separate scope (Python 3: comprehensions don't leak vars)
+
+        visit_SetComp = visit_ListComp
+        visit_DictComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
+        def visit_Assign(self, n: ast.Assign) -> None:
+            for t in n.targets:
+                add_target(t)
+            self.generic_visit(n)
+
+        def visit_AugAssign(self, n: ast.AugAssign) -> None:
+            add_target(n.target)
+            self.generic_visit(n)
+
+        def visit_AnnAssign(self, n: ast.AnnAssign) -> None:
+            add_target(n.target)
+            self.generic_visit(n)
+
+        def visit_NamedExpr(self, n: ast.NamedExpr) -> None:  # walrus :=
+            add_target(n.target)
+            self.generic_visit(n)
+
+        def visit_For(self, n: ast.For) -> None:
+            add_target(n.target)
+            self.generic_visit(n)
+
+        visit_AsyncFor = visit_For
+
+        def visit_With(self, n: ast.With) -> None:
+            for item in n.items:
+                if item.optional_vars is not None:
+                    add_target(item.optional_vars)
+            self.generic_visit(n)
+
+        visit_AsyncWith = visit_With
+
+        def visit_ExceptHandler(self, n: ast.ExceptHandler) -> None:
+            if n.name:
+                bound.add(n.name)
+            self.generic_visit(n)
+
+        def visit_Import(self, n: ast.Import) -> None:
+            for alias in n.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+
+        def visit_ImportFrom(self, n: ast.ImportFrom) -> None:
+            for alias in n.names:
+                bound.add(alias.asname or alias.name)
+
+    w = _Walker()
+    for s in stmts:
+        w.visit(s)
+    return bound
+
+
+class _FreeRefFinder(ast.NodeVisitor):
+    """Scope-aware free-`Name`-Load collector (calque#139). Maintains a stack
+    of bound-name sets (innermost last) and records every `ast.Name` Load
+    that isn't bound in ANY enclosing scope. A nested def/lambda/comprehension
+    pushes its OWN scope (params + its own hoisted locals) before descending,
+    so it correctly SHADOWS an outer name of the same spelling rather than
+    conflating the two — real Python scoping, not a flat/naive scan.
+    """
+
+    def __init__(self, top_params: set[str], top_body: list[ast.stmt]) -> None:
+        self.scopes: list[set[str]] = [top_params | _bound_names_in_block(top_body)]
+        self.free: set[str] = set()
+
+    def _bound(self, name: str) -> bool:
+        return any(name in s for s in self.scopes)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and not self._bound(node.id):
+            self.free.add(node.id)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # The def's own NAME is already bound in the CURRENT scope (folded
+        # into that scope's _bound_names_in_block); only its BODY gets a
+        # fresh one.
+        params = _arg_id_set(node.args)
+        self.scopes.append(params | _bound_names_in_block(node.body))
+        for stmt in node.body:
+            self.visit(stmt)
+        self.scopes.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self.scopes.append(_arg_id_set(node.args))
+        self.visit(node.body)
+        self.scopes.pop()
+
+    def _visit_comprehension(self, node: ast.AST, exprs: list[ast.AST]) -> None:
+        scope: set[str] = set()
+        for gen in node.generators:  # type: ignore[attr-defined]
+            for n in _comp_target_names(gen.target):
+                scope.add(n)
+        self.scopes.append(scope)
+        for e in exprs:
+            self.visit(e)
+        for gen in node.generators:  # type: ignore[attr-defined]
+            self.visit(gen.iter)
+            for cond in gen.ifs:
+                self.visit(cond)
+        self.scopes.pop()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node, [node.key, node.value])
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # The name is already bound (folded into the enclosing scope's
+        # hoisted set); a nested class's own body is a rare shape this pass
+        # doesn't attempt to resolve free names inside.
+        return
+
+
+def _arg_names_raw(args: ast.arguments) -> list[str]:
+    """Bare parameter names in signature order (no */** markers, unlike
+    _arg_names) — used to seed _FreeRefFinder's top scope."""
+    names = [p.arg for p in (args.posonlyargs + args.args + args.kwonlyargs)]
+    if args.vararg:
+        names.append(args.vararg.arg)
+    if args.kwarg:
+        names.append(args.kwarg.arg)
+    return names
+
+
+def _free_refs(node: ast.FunctionDef, module_names: frozenset[str]) -> list[str]:
+    """Free-variable references inside node's own body (calque#139): every
+    `ast.Name` Load that resolves to neither a parameter nor a local (assigned
+    anywhere in node's own scope, including loop/comprehension/nested-def
+    shadowing) AND matches the name of a real module-level `FunctionDef`/
+    simple `Assign` (module_names) in the SAME script. This is the non-
+    `.local()`-suffixed counterpart to _local_calls — a plain call like
+    `_format(name)` or a bare read like `GREETING` never goes through
+    `.local`, so _local_calls' Call-node scan never sees it."""
+    finder = _FreeRefFinder(set(_arg_names_raw(node.args)), node.body)
+    for stmt in node.body:
+        finder.visit(stmt)
+    return sorted(n for n in finder.free if n in module_names)
+
+
+def _module_bindings(tree: ast.Module) -> tuple[dict[str, ast.AST], dict[str, ast.Assign]]:
+    """Top-level-only scan (tree.body, NOT ast.walk) for calque#139's two
+    shippable free-reference targets: every module-level `def`/`async def`
+    (decorated or not — a bare helper like `_format` is never decorated) and
+    every module-level SIMPLE assignment (`NAME = <expr>`, single ast.Name
+    target only — `A = B = 5` and tuple-unpacking assigns are deliberately
+    excluded, matching the issue's "simple Assign target" scope). Scanning
+    only tree.body (not the whole tree) is what makes this "module-level":
+    the same node types nested inside a function/class body are a different
+    binding entirely and must not be captured here."""
+    funcs: dict[str, ast.AST] = {}
+    consts: dict[str, ast.Assign] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs[stmt.name] = stmt
+        elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            consts[stmt.targets[0].id] = stmt
+    return funcs, consts
+
+
+def _assign_source(src: str, node: ast.Assign) -> str:
+    """Verbatim source text of a top-level `NAME = <expr>` assignment
+    statement (calque#139) — analogous to _body_source but for a whole
+    statement rather than a function body. Ships a module-level CONSTANT's
+    exact source line(s) so the runner can exec it into globals unchanged;
+    same "ship the payload verbatim, never interpret it" trust model this
+    file already applies to every @enter/@method body."""
+    lines = src.splitlines()[node.lineno - 1 : node.end_lineno]
+    return "\n".join(lines)
+
+
 # Serve decorators (§F): long-lived request-driven entrypoints. Detected so the Go
 # side can gate/leak them (build is deferred — §16 success is batch+K), never
 # silently treated as batch. Matched by the trailing decorator name.
@@ -301,7 +560,12 @@ def _entry_kind(decos: list[str]) -> str:
     return ""
 
 
-def _describe_fn(src: str, node: ast.FunctionDef, leaks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _describe_fn(
+    src: str,
+    node: ast.FunctionDef,
+    leaks: list[dict[str, Any]] | None = None,
+    module_names: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     decos = []
     for d in node.decorator_list:
         decos.append(
@@ -318,6 +582,14 @@ def _describe_fn(src: str, node: ast.FunctionDef, leaks: list[dict[str, Any]] | 
         "decorators": decos,
         "entry_kind": _entry_kind([d["name"] for d in decos]),
         "local_calls": _local_calls(node),
+        # calque#139: bare (non-.local()-suffixed) references to a module-level
+        # helper function or constant, found ANYWHERE inside this function/
+        # method's own body — real scope-tracked, see _free_refs/_FreeRefFinder.
+        # module_names is the set of names _free_refs is allowed to resolve
+        # against (every module-level def/simple-assign in the script);
+        # defaults to empty so a caller that doesn't pass it (none currently
+        # do, but keeps this function safely callable standalone) gets [].
+        "free_refs": _free_refs(node, module_names),
         # PAYLOAD — verbatim, never interpreted:
         "body": _body_source(src, node),
     }
@@ -393,8 +665,12 @@ def _walk_image_chain(node: ast.AST) -> dict[str, Any] | None:
 
 
 class Collector(ast.NodeVisitor):
-    def __init__(self, src: str) -> None:
+    def __init__(self, src: str, module_names: frozenset[str] = frozenset()) -> None:
         self.src = src
+        # calque#139: names of every module-level def/simple-assign in the
+        # script — the resolution universe _free_refs is allowed to match
+        # against when walking each function/method body (see _describe_fn).
+        self._module_names = module_names
         self.app_name: str | None = None
         self.functions: list[dict[str, Any]] = []
         self.classes: list[dict[str, Any]] = []
@@ -608,11 +884,11 @@ class Collector(ast.NodeVisitor):
         leaves = {d.rsplit(".", 1)[-1] for d in decos}
         is_entrypoint = any(d.endswith("local_entrypoint") for d in decos)
         if is_entrypoint:
-            self.entrypoints.append(_describe_fn(self.src, node, self.leaks))
+            self.entrypoints.append(_describe_fn(self.src, node, self.leaks, self._module_names))
         elif any(d.endswith("function") for d in decos) or (leaves & _SERVE_DECOS):
             # A serve entrypoint (§F) may carry @app.function too, or only the serve
             # decorator — collect it either way so its entry_kind reaches the IR.
-            self.functions.append(_describe_fn(self.src, node, self.leaks))
+            self.functions.append(_describe_fn(self.src, node, self.leaks, self._module_names))
         # methods handled inside ClassDef; free functions with neither decorator are ignored
         if is_entrypoint:
             # calque#98: push this entrypoint's name so every call site visited
@@ -659,7 +935,7 @@ class Collector(ast.NodeVisitor):
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 mdecos = [_decorator_name(dd) for dd in item.decorator_list]
-                desc = _describe_fn(self.src, item, self.leaks)  # type: ignore[arg-type]
+                desc = _describe_fn(self.src, item, self.leaks, self._module_names)  # type: ignore[arg-type]
                 if any(dd.endswith("enter") for dd in mdecos):
                     enter = desc
                 elif any(dd.endswith("exit") for dd in mdecos):
@@ -709,7 +985,30 @@ def analyze(path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         src = f.read()
     tree = ast.parse(src, filename=path)
-    c = Collector(src)
+    # calque#139: module-level def/simple-assign names, computed ONCE up front
+    # so every function/method's _free_refs walk (inside Collector, via
+    # _describe_fn) resolves against the same universe.
+    module_func_nodes, module_const_nodes = _module_bindings(tree)
+    module_names = frozenset(module_func_nodes) | frozenset(module_const_nodes)
+    module_consts = {name: _assign_source(src, node) for name, node in module_const_nodes.items()}
+    # module_funcs: EVERY module-level function, decorated or not — crucially
+    # INCLUDING a plain, undecorated helper like `_format` that never becomes
+    # an @app.function and so never lands in c.functions below. This is the
+    # shippable shape a bare (non-.local()) call site resolves against; a
+    # helper's own body may itself reference a sibling helper/constant, so it
+    # carries its OWN local_calls/free_refs too (recursive resolution, mirrors
+    # how a plain @app.function's LocalCalls already chains).
+    module_funcs = {
+        name: {
+            "args": _arg_names(node),
+            "body": _body_source(src, node),
+            "local_calls": _local_calls(node),
+            "free_refs": _free_refs(node, module_names),
+        }
+        for name, node in module_func_nodes.items()
+    }
+
+    c = Collector(src, module_names)
     c.visit(tree)
     return {
         "script": path,
@@ -723,6 +1022,16 @@ def analyze(path: str) -> dict[str, Any]:
         "invoke_calls": c.invoke_calls,
         "volume_writes": c.volume_writes,
         "helper_leaks": c.leaks,
+        # calque#139: verbatim source of every module-level `NAME = <literal-
+        # or-expression>` assignment, keyed by name — one of the two shippable
+        # free-reference targets (see module_funcs for the other).
+        "module_consts": module_consts,
+        # calque#139: every module-level function (decorated or not), keyed by
+        # name — the OTHER shippable free-reference target. A plain,
+        # undecorated helper (never an @app.function, so absent from
+        # `functions` above) is exactly the shape the issue's `_format`
+        # repro needs resolved.
+        "module_funcs": module_funcs,
     }
 
 

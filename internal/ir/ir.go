@@ -30,6 +30,34 @@ type App struct {
 	// script with no entrypoints, or an entrypoint with no recognized call
 	// sites of its own.
 	EntrypointInvokes map[string]map[string]InvokeKind
+	// ModuleConsts is the verbatim source of every module-level `NAME =
+	// <literal-or-expression>` assignment, keyed by name (calque#139) — real
+	// Modal code commonly reads a bare module-level constant from inside an
+	// @enter/@method body (e.g. `self.prefix = GREETING`) with no .local()
+	// in sight, since it's never registered as an @app.function to begin
+	// with. collectLocalExtras (cmd/calque/run.go) resolves a Function's/
+	// Class's FreeRefs/EnterFreeRefs against this map (and ModuleFuncs below)
+	// the same way it already resolves LocalCalls against FindFunction.
+	ModuleConsts map[string]string
+	// ModuleFuncs carries every module-level function/method, keyed by name
+	// (calque#139) — INCLUDING a plain, undecorated helper like `_format`
+	// that is never an @app.function and so never appears in Functions.
+	// Real Modal scripts overwhelmingly reference such helpers via a bare
+	// call, not `.local()`; FreeRefs/EnterFreeRefs may name one of these
+	// instead of (or in addition to) an entry in Functions.
+	ModuleFuncs map[string]ModuleFunc
+}
+
+// ModuleFunc is one module-level function's shippable shape (calque#139):
+// its own parameter names and verbatim body, plus its OWN LocalCalls/
+// FreeRefs (a bare helper can itself reference a sibling helper/constant),
+// so collectLocalExtras' transitive-closure walk can enqueue through it
+// exactly as it already does through a plain @app.function's LocalCalls.
+type ModuleFunc struct {
+	Args       []string
+	Body       string
+	LocalCalls []string
+	FreeRefs   []string
 }
 
 // FindFunction looks up a plain @app.function by name (calque#88: correlating
@@ -110,7 +138,14 @@ type Function struct {
 	// body references via .local() (calque#92) — a property of the body, not
 	// of how this function itself is invoked (distinct from Invoke/IsMap).
 	LocalCalls []string
-	Line       int // source line of the def, for leak attribution
+	// FreeRefs are bare (non-.local()-suffixed) references to a module-level
+	// helper function or constant THIS function's own body reads/calls
+	// (calque#139) — the .local()-free counterpart to LocalCalls; resolved
+	// against App.ModuleFuncs/App.ModuleConsts by collectLocalExtras
+	// (cmd/calque/run.go), the same shipping mechanism LocalCalls already
+	// uses.
+	FreeRefs []string
+	Line     int // source line of the def, for leak attribution
 	// Items is the real .map()/.starmap() iterable this callable is invoked
 	// against, extracted at parse time from a literal list/tuple/str or a
 	// range(N) call site (calque#136) — nil if the script's iterable wasn't
@@ -163,7 +198,11 @@ type Class struct {
 	// via .local() (calque#92) — EnterBody is a bare string with no other Function
 	// to carry this on.
 	EnterLocalCalls []string
-	Line            int
+	// EnterFreeRefs mirrors EnterLocalCalls for calque#139's bare (non-
+	// .local()) free-variable references — e.g. `self.prefix = GREETING`
+	// inside @enter, with no .local() call in sight.
+	EnterFreeRefs []string
+	Line          int
 }
 
 // GPUSpec is the parsed form of a raw gpu= string: card plus requested count.
