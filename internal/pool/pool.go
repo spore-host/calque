@@ -23,20 +23,68 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	calexec "github.com/spore-host/calque/internal/exec"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
+// poolQueuePrefix is prepended to every slugged model to form the final SQS
+// queue name — kept as a named const so slugModel's length budget (queuePrefix
+// vs. the 80-char SQS cap) stays in lockstep with PoolQueueName's own prefix.
+const poolQueuePrefix = "calque-pool-"
+
 // PoolQueueName derives the SQS queue name for a pool, keyed by MODEL (not run
 // id, unlike spawn's taskpool.QueueName(runID)) — decision 2 of
 // docs/pool-queue-contract.md: affinity is pool identity, and a pool's identity
 // is its model, fixed for the pool's whole lifetime. SQS names allow
-// [A-Za-z0-9_-] up to 80 chars; callers are expected to pass an
-// already-slugged model name (mirrors taskpool.QueueName's own contract).
+// [A-Za-z0-9_-] up to 80 chars; model strings (e.g. calque's own default
+// "Qwen/Qwen2.5-1.5B-Instruct") routinely contain characters SQS rejects
+// (namely "/"), so the model is slugged internally — callers never need to
+// pre-sanitize (calque#129).
 func PoolQueueName(model string) string {
-	return "calque-pool-" + model
+	return poolQueuePrefix + slugModel(model)
+}
+
+// slugModel converts an arbitrary model identifier into a string safe to use
+// as (part of) an SQS QueueName: lowercased, any character outside
+// [a-z0-9_-] replaced with "-", runs of "-" collapsed to one, leading/
+// trailing "-" trimmed, and truncated so poolQueuePrefix+slug never exceeds
+// SQS's 80-char QueueName limit.
+func slugModel(model string) string {
+	lower := strings.ToLower(model)
+	var b strings.Builder
+	b.Grow(len(lower))
+	lastDash := false
+	for _, r := range lower {
+		var out rune
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			out = r
+		default:
+			out = '-'
+		}
+		if out == '-' {
+			if lastDash {
+				continue // collapse consecutive '-'
+			}
+			lastDash = true
+		} else {
+			lastDash = false
+		}
+		b.WriteRune(out)
+	}
+	slug := strings.Trim(b.String(), "-")
+
+	maxLen := 80 - len(poolQueuePrefix)
+	if maxLen < 0 {
+		maxLen = 0
+	}
+	if len(slug) > maxLen {
+		slug = strings.TrimRight(slug[:maxLen], "-")
+	}
+	return slug
 }
 
 // ClaimRef is what travels on a pool's queue: a pointer to an S3-staged

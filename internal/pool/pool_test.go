@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -197,6 +198,43 @@ func drainClock(t *testing.T, clk *clock, done <-chan struct{}) bool {
 }
 
 // ---- tests --------------------------------------------------------------
+
+// validSQSQueueName matches SQS's own QueueName constraint: up to 80
+// characters from [A-Za-z0-9_-]. slugModel's output (via PoolQueueName) must
+// always satisfy this, or CreateQueue fails outright (calque#129).
+var validSQSQueueName = regexp.MustCompile(`^calque-pool-[a-z0-9_-]+$`)
+
+// TestPoolQueueName_SlugsUnsafeModelChars: calque's own default/showcased
+// model string "Qwen/Qwen2.5-1.5B-Instruct" (cmd/calque's --model default and
+// realrun.go's canonical example) contains "/", which SQS's QueueName rejects
+// — this is the exact real-world case calque#129 reports as an outright
+// CreateQueue failure prior to this fix.
+func TestPoolQueueName_SlugsUnsafeModelChars(t *testing.T) {
+	got := PoolQueueName("Qwen/Qwen2.5-1.5B-Instruct")
+	if !validSQSQueueName.MatchString(got) {
+		t.Errorf("PoolQueueName(%q) = %q, does not match valid SQS QueueName pattern %s",
+			"Qwen/Qwen2.5-1.5B-Instruct", got, validSQSQueueName)
+	}
+	if len(got) > 80 {
+		t.Errorf("PoolQueueName(%q) = %q, length %d exceeds SQS's 80-char QueueName limit",
+			"Qwen/Qwen2.5-1.5B-Instruct", got, len(got))
+	}
+}
+
+// TestPoolQueueName_AlreadyCleanModelIsUnchanged: a model name that's already
+// a valid SQS-safe token should pass through slugging harmlessly (no
+// surprise mutation of names that didn't need sanitizing).
+func TestPoolQueueName_AlreadyCleanModelIsUnchanged(t *testing.T) {
+	got := PoolQueueName("llama-3-8b")
+	want := "calque-pool-llama-3-8b"
+	if got != want {
+		t.Errorf("PoolQueueName(%q) = %q, want %q", "llama-3-8b", got, want)
+	}
+	if !validSQSQueueName.MatchString(got) {
+		t.Errorf("PoolQueueName(%q) = %q, does not match valid SQS QueueName pattern %s",
+			"llama-3-8b", got, validSQSQueueName)
+	}
+}
 
 // TestWorker_StaysWarmAcrossClaims is the core sticky-pool proof (calque#100):
 // two claims for the SAME model, served by ONE worker, must warm the runner
