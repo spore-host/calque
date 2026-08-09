@@ -74,13 +74,19 @@ def _decorator_name(node: ast.AST) -> str:
     return ".".join(_attr_chain(target))
 
 
-def _volumes_map(node: ast.AST) -> dict[str, str] | None:
+def _volumes_map(node: ast.AST, leaks: list[dict[str, Any]] | None = None) -> dict[str, str] | None:
     """Extract `volumes={"/mount": vol_handle}` as {mount_path: volume_var_name}.
 
     The keys are string literals (mount paths); the values are Volume *variables*
     (handles), so `literal_eval` on the whole dict fails. We resolve it structurally
     to match IR §14 `Volumes map[string]string // mount path -> volume name`.
     Returns None if this isn't a dict we can map.
+
+    calque#91: a value that's a direct `CloudBucketMount(...)`/`NetworkFileSystem(...)`
+    call (not a Volume.from_name()-derived variable) is a DIFFERENT, unmodeled
+    construct — before this check existed it fell into the generic `ast.unparse(v)`
+    branch below and was silently treated as an ordinary Volume mount, with no
+    leak distinguishing it at all. When leaks is supplied, tag it there instead.
     """
     if not isinstance(node, ast.Dict):
         return None
@@ -92,8 +98,48 @@ def _volumes_map(node: ast.AST) -> dict[str, str] | None:
         if isinstance(v, ast.Name):
             out[key] = v.id
         else:
+            if leaks is not None and isinstance(v, ast.Call):
+                construct = _unsupported_construct_call(_attr_chain(v.func))
+                if construct is not None:
+                    leaks.append(
+                        {"where": construct, "detail": f"{construct}(...) used as a volumes= value, recognized but not modeled — NOT an ordinary Volume mount (calque#91)", "lineno": getattr(v, "lineno", 0)}
+                    )
             out[key] = ast.unparse(v)  # e.g. Volume.from_name(...) inline
     return out
+
+
+# calque#91: rare Modal constructs with zero implementation and, until now, no
+# distinguishable leak signal either — they either vanished entirely
+# (Dict/Queue/NetworkFileSystem's own visit_Assign branch didn't exist) or were
+# silently MISCATEGORIZED as an unrelated construct (CloudBucketMount(...) used
+# as a volumes={} value looked exactly like an ordinary Volume mount, since
+# _volumes_map's non-Name fallback just unparsed it with no tag at all). This
+# does NOT attempt to model any of them — it only makes their presence
+# distinguishable (a named "where" in the leak report) so a real script using
+# one is a clean grep hit instead of silence or a false Volume classification.
+_FROM_NAME_CONSTRUCTS = frozenset({"Dict", "Queue", "NetworkFileSystem"})
+_CALL_CONSTRUCTS = frozenset({"CloudBucketMount"})
+
+
+def _unsupported_construct_from_name(dotted: list[str]) -> str | None:
+    """dotted is an attribute chain ending in `.from_name`, e.g.
+    ['modal','Dict','from_name']. Returns "modal.Dict" if the owner (second-
+    to-last element) is one of Dict/Queue/NetworkFileSystem, else None."""
+    if len(dotted) < 2 or dotted[-1] != "from_name":
+        return None
+    owner = dotted[-2]
+    return "modal." + owner if owner in _FROM_NAME_CONSTRUCTS else None
+
+
+def _unsupported_construct_call(dotted: list[str]) -> str | None:
+    """dotted is a call's own attribute chain (no trailing method), e.g.
+    ['modal','CloudBucketMount']. Returns "modal.CloudBucketMount" if the
+    LEAF name is a known direct-constructor unsupported construct, else
+    None."""
+    if not dotted:
+        return None
+    leaf = dotted[-1]
+    return "modal." + leaf if leaf in _CALL_CONSTRUCTS else None
 
 
 def _schedule_marker(node: ast.AST) -> dict[str, Any] | None:
@@ -119,8 +165,10 @@ def _schedule_marker(node: ast.AST) -> dict[str, Any] | None:
     }
 
 
-def _decorator_kwargs(node: ast.AST) -> dict[str, Any]:
-    """kwargs of a decorator call. `gpu=`, `timeout=`, `image=`, `volumes=` etc."""
+def _decorator_kwargs(node: ast.AST, leaks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """kwargs of a decorator call. `gpu=`, `timeout=`, `image=`, `volumes=` etc.
+    leaks, when supplied, receives calque#91's unsupported-construct tags found
+    while walking volumes= (see _volumes_map)."""
     if not isinstance(node, ast.Call):
         return {}
     out: dict[str, Any] = {}
@@ -129,7 +177,7 @@ def _decorator_kwargs(node: ast.AST) -> dict[str, Any]:
             out["__splat__"] = ast.unparse(kw.value)
             continue
         if kw.arg == "volumes":
-            vm = _volumes_map(kw.value)
+            vm = _volumes_map(kw.value, leaks)
             out["volumes"] = vm if vm is not None else _literal(kw.value)
             continue
         if kw.arg == "image" and isinstance(kw.value, ast.Name):
@@ -202,13 +250,13 @@ def _entry_kind(decos: list[str]) -> str:
     return ""
 
 
-def _describe_fn(src: str, node: ast.FunctionDef) -> dict[str, Any]:
+def _describe_fn(src: str, node: ast.FunctionDef, leaks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     decos = []
     for d in node.decorator_list:
         decos.append(
             {
                 "name": _decorator_name(d),
-                "kwargs": _decorator_kwargs(d),
+                "kwargs": _decorator_kwargs(d, leaks),
                 "lineno": getattr(d, "lineno", node.lineno),
             }
         )
@@ -314,7 +362,7 @@ class Collector(ast.NodeVisitor):
         if isinstance(val, ast.Call) and _attr_chain(val.func)[-1:] == ["App"]:
             if val.args:
                 self.app_name = _const_str(val.args[0]) or self.app_name
-            kw = _decorator_kwargs(val)
+            kw = _decorator_kwargs(val, self.leaks)
             if "image" in kw:  # App(image=...) — note it
                 self.leaks.append(
                     {"where": "App(image=)", "detail": "app-level default image", "lineno": node.lineno}
@@ -331,6 +379,16 @@ class Collector(ast.NodeVisitor):
             for t in node.targets:
                 if isinstance(t, ast.Name):
                     self.volumes[t.id] = {"from_name": name, "lineno": node.lineno}
+        # calque#91: d = modal.Dict.from_name(...) / q = modal.Queue.from_name(...) /
+        # nfs = modal.NetworkFileSystem.from_name(...) — none of these are Volumes,
+        # but before this branch existed they simply vanished (no visit_Assign
+        # branch matched, so the whole statement fell through generic_visit unseen).
+        if isinstance(val, ast.Call):
+            construct = _unsupported_construct_from_name(_attr_chain(val.func))
+            if construct is not None:
+                self.leaks.append(
+                    {"where": construct, "detail": f"{construct}.from_name(...) recognized but not modeled (calque#91)", "lineno": node.lineno}
+                )
         self.generic_visit(node)
 
     # ---- record invocation idioms (spec §13 map; §C starmap/for_each/remote;
@@ -396,6 +454,17 @@ class Collector(ast.NodeVisitor):
                 self.volume_writes.append(
                     {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno}
                 )
+            elif attr in ("include", "deploy"):
+                # calque#91: App.include(...)/.deploy(...) — multi-app composition
+                # and deploy-strategy lifecycle calque has no concept of at all
+                # (always-ephemeral execution model). Deliberately NOT tagging
+                # bare `.run()` here: unlike include/deploy, "run" is far too
+                # generic a method name across unrelated objects (subprocess,
+                # asyncio, arbitrary classes) to tag reliably without false
+                # positives drowning out the real signal.
+                self.leaks.append(
+                    {"where": f"App.{attr}", "detail": f"App.{attr}(...) recognized but not modeled — no deployed-vs-ephemeral app concept (calque#91)", "lineno": node.lineno}
+                )
             elif attr == "from_name" and _attr_chain(node.func)[-2:-1] in (["Function"], ["Cls"]):
                 # calque#87: Function.from_name(app, fn)/Cls.from_name(app, cls) look
                 # up an ALREADY-DEPLOYED separate app by name — cross-app invocation,
@@ -422,11 +491,11 @@ class Collector(ast.NodeVisitor):
         leaves = {d.rsplit(".", 1)[-1] for d in decos}
         is_entrypoint = any(d.endswith("local_entrypoint") for d in decos)
         if is_entrypoint:
-            self.entrypoints.append(_describe_fn(self.src, node))
+            self.entrypoints.append(_describe_fn(self.src, node, self.leaks))
         elif any(d.endswith("function") for d in decos) or (leaves & _SERVE_DECOS):
             # A serve entrypoint (§F) may carry @app.function too, or only the serve
             # decorator — collect it either way so its entry_kind reaches the IR.
-            self.functions.append(_describe_fn(self.src, node))
+            self.functions.append(_describe_fn(self.src, node, self.leaks))
         # methods handled inside ClassDef; free functions with neither decorator are ignored
         if is_entrypoint:
             # calque#98: push this entrypoint's name so every call site visited
@@ -459,21 +528,21 @@ class Collector(ast.NodeVisitor):
                 # rather than overwrite — a separate @modal.concurrent(...) may
                 # have already contributed kwargs below (or will, if it comes
                 # later in decorator_list).
-                cls_kwargs.update(_decorator_kwargs(d))
+                cls_kwargs.update(_decorator_kwargs(d, self.leaks))
             elif name.endswith("concurrent"):
                 # calque#82: @modal.concurrent(max_inputs=, target_inputs=) is a
                 # SEPARATE decorator stacked on @app.cls, not a cls_kwargs entry —
                 # fold its kwargs in so the Go side's autoscaling-leak path sees
                 # them (the decorator itself carries no other calque-visible
                 # config, so merging is safe: no real collision with cls_kwargs).
-                cls_kwargs.update(_decorator_kwargs(d))
+                cls_kwargs.update(_decorator_kwargs(d, self.leaks))
         methods: list[dict[str, Any]] = []
         enter: dict[str, Any] | None = None
         exit_: dict[str, Any] | None = None
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 mdecos = [_decorator_name(dd) for dd in item.decorator_list]
-                desc = _describe_fn(self.src, item)  # type: ignore[arg-type]
+                desc = _describe_fn(self.src, item, self.leaks)  # type: ignore[arg-type]
                 if any(dd.endswith("enter") for dd in mdecos):
                     enter = desc
                 elif any(dd.endswith("exit") for dd in mdecos):

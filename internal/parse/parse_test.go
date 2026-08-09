@@ -703,3 +703,39 @@ func TestParseScheduleObjectForms(t *testing.T) {
 		t.Errorf("object-form schedule= leaks must note recognition for %v; leaks=%+v", wantObjectFormNote, rep.Leaks)
 	}
 }
+
+// TestParseRareConstructsAreTaggedNotSilent (calque#91): modal.Dict/Queue/
+// NetworkFileSystem.from_name(...), an inline modal.CloudBucketMount(...) used
+// as a volumes= value, and App.include(...) must each fire a DISTINCT, named
+// leak — before this fix, the first three vanished entirely (no visit_Assign
+// branch matched them) and CloudBucketMount was silently miscategorized as an
+// ordinary Volume mount (no leak at all). None of these are modeled; this only
+// proves each is now a clean grep hit instead of silence or a false
+// classification.
+func TestParseRareConstructsAreTaggedNotSilent(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/rare_constructs.py")
+
+	if _, err := Parse(context.Background(), script, rep, r, args...); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	wantTag := map[string]bool{
+		"modal.Dict":              true,
+		"modal.Queue":             true,
+		"modal.NetworkFileSystem": true,
+		"modal.CloudBucketMount":  true,
+		"App.include":             true,
+	}
+	for _, l := range rep.Leaks {
+		for tag := range wantTag {
+			if strings.Contains(l.Detail, `flagged "`+tag+`"`) {
+				delete(wantTag, tag)
+			}
+		}
+	}
+	if len(wantTag) != 0 {
+		t.Errorf("missing distinct leak tag for %v; leaks=%+v", wantTag, rep.Leaks)
+	}
+}
