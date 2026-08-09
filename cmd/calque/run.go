@@ -49,12 +49,10 @@ func run(o runOpts) error {
 
 	// calque#90: mimics `modal run file.py::entrypoint` — validates --entrypoint
 	// against app.Entrypoints (or requires it when the choice is ambiguous) and
-	// reports which one is in play. Does NOT yet change pickWarmUnit's selection
-	// below: calque has no call-site-to-entrypoint attribution (a .map()/.remote()
-	// call site isn't tracked as belonging to one entrypoint's body vs. another's),
-	// so --entrypoint can't steer WHICH callable runs yet — see calque#90's
-	// follow-up for that deeper fix. This pass only closes the "silently ran
-	// whichever pickWarmUnit found, no way to even ask for a different one" gap.
+	// reports which one is in play. calque#98: epName is now also threaded into
+	// pickWarmUnit below, which restricts its scan to invoke-kind evidence
+	// attributed to epName's own body once the script has 2+ entrypoints — see
+	// entrypointScoped/app.EntrypointInvokes.
 	epName, err := resolveEntrypoint(app, o.entrypoint)
 	if err != nil {
 		return err
@@ -63,8 +61,9 @@ func run(o runOpts) error {
 		fmt.Printf("entrypoint: %s (selected)\n", epName)
 	}
 
-	// pick the mapped warm unit (a @cls with @enter whose method is .map'd)
-	unit, ok := pickWarmUnit(app)
+	// pick the mapped warm unit (a @cls with @enter whose method is .map'd),
+	// scoped to epName's own body when the script has 2+ entrypoints (calque#98).
+	unit, ok := pickWarmUnit(app, epName)
 	if !ok {
 		// F2: a serve-shaped app (long-lived, request-driven) has no batch .map warm
 		// unit. Don't crash — emit a semantic-gap leak explaining the deferred shape,
@@ -246,31 +245,90 @@ type warmUnit struct {
 	plainFunction bool
 }
 
-func pickWarmUnit(app ir.App) (warmUnit, bool) {
+// entrypointScoped reports whether pickWarmUnit should restrict its scan to
+// invoke-kind evidence attributed to epName specifically (calque#98), rather
+// than fall back to the pre-existing whole-script scan. Scoping only kicks in
+// when there's a genuine choice to disambiguate: a script with 0 or 1
+// entrypoints has no ambiguity — a single entrypoint's own body already IS
+// the whole script's relevant call-site evidence, and a script with none has
+// no body to scope to at all — so both must keep running the original,
+// unscoped scan exactly as before this change (the regression guard for
+// today's common case).
+func entrypointScoped(app ir.App, epName string) bool {
+	return epName != "" && len(app.Entrypoints) >= 2
+}
+
+// pickWarmUnit selects the callable calque actually drives through the warm
+// supervisor. epName is the --entrypoint selection already resolved by
+// resolveEntrypoint (calque#90); when the script is entrypointScoped (2+
+// entrypoints, one selected), the scan is restricted to invoke-kind evidence
+// attributed to epName's OWN body (app.EntrypointInvokes, calque#98) — so
+// `--entrypoint do_evaluate` picks the callable do_evaluate itself invokes,
+// not whichever unrelated callable happens to be .map()'d somewhere else in
+// the script. Otherwise (0 or 1 entrypoints) this is the original whole-
+// script scan, unchanged.
+func pickWarmUnit(app ir.App, epName string) (warmUnit, bool) {
+	scoped := entrypointScoped(app, epName)
+	var epEvidence map[string]ir.InvokeKind
+	if scoped {
+		epEvidence = app.EntrypointInvokes[epName]
+	}
+
 	for _, c := range app.Classes {
 		if c.EnterBody == "" {
 			continue
 		}
-		for _, mth := range c.Methods {
-			if mth.IsMap {
+		methods := c.Methods
+		if scoped {
+			methods = nil
+			for _, mth := range c.Methods {
+				if _, ok := epEvidence[mth.Name]; ok {
+					methods = append(methods, mth)
+				}
+			}
+			if len(methods) == 0 {
+				// epName's own body never invokes any method on this class —
+				// not a candidate for this entrypoint's warm unit at all.
+				continue
+			}
+		}
+		for _, mth := range methods {
+			isMap := mth.IsMap
+			if scoped {
+				isMap = epEvidence[mth.Name] == ir.InvokeMap
+			}
+			if isMap {
 				return warmUnit{class: c, method: mth}, true
 			}
 		}
-		// fall back to the first method if none is explicitly .map'd
-		if len(c.Methods) > 0 {
-			return warmUnit{class: c, method: c.Methods[0]}, true
+		// fall back to the first (candidate) method if none is explicitly .map'd
+		if len(methods) > 0 {
+			return warmUnit{class: c, method: methods[0]}, true
 		}
 	}
 	// No @cls+@enter unit — prefer a plain function that's .map'd (closest
 	// analog to the class-based shape: many items through one warm process),
 	// else fall back to the first plain function (single-call replay, §G).
-	for _, f := range app.Functions {
-		if f.IsMap {
+	fns := app.Functions
+	if scoped {
+		fns = nil
+		for _, f := range app.Functions {
+			if _, ok := epEvidence[f.Name]; ok {
+				fns = append(fns, f)
+			}
+		}
+	}
+	for _, f := range fns {
+		isMap := f.IsMap
+		if scoped {
+			isMap = epEvidence[f.Name] == ir.InvokeMap
+		}
+		if isMap {
 			return warmUnit{class: syntheticClass(f), method: f, plainFunction: true}, true
 		}
 	}
-	if len(app.Functions) > 0 {
-		f := app.Functions[0]
+	if len(fns) > 0 {
+		f := fns[0]
 		return warmUnit{class: syntheticClass(f), method: f, plainFunction: true}, true
 	}
 	return warmUnit{}, false

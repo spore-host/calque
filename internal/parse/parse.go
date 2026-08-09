@@ -92,6 +92,11 @@ type pyClass struct {
 type pyMapCall struct {
 	Target string `json:"target"`
 	Lineno int    `json:"lineno"`
+	// Entrypoint is the @app.local_entrypoint() this call site's own body was
+	// found nested inside, or "" if it wasn't inside one (calque#98: lets
+	// invocationKinds attribute evidence to a SPECIFIC entrypoint instead of
+	// folding every call site into one whole-script-flat union).
+	Entrypoint string `json:"entrypoint"`
 }
 
 // pyInvokeCall is a recognized invocation idiom call site (§C): kind is one of
@@ -105,6 +110,10 @@ type pyInvokeCall struct {
 	// best-effort — a nil entry means that positional arg wasn't a plain string.
 	// Empty for every other invoke kind.
 	Args []*string `json:"args"`
+	// Entrypoint mirrors pyMapCall.Entrypoint (calque#98) — the enclosing
+	// @app.local_entrypoint()'s name, or "" if this call site isn't nested
+	// inside one.
+	Entrypoint string `json:"entrypoint"`
 }
 
 // Parse runs the helper on scriptPath and returns the IR plus any leaks emitted
@@ -217,7 +226,8 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	// other sync idioms .starmap/.for_each/.remote). The target of a call like
 	// `Chat().generate.map(...)` is the trailing attribute ("generate"); we key by
 	// that leaf name to match the callable's Name.
-	invokes := invocationKinds(out, script, rep)
+	invokes, epInvokes := invocationKinds(out, script, rep)
+	app.EntrypointInvokes = epInvokes
 
 	for _, f := range out.Functions {
 		app.Functions = append(app.Functions, buildFn(f, script, rep, invokes))
@@ -259,7 +269,20 @@ func build(out pyOut, rep *leak.Report) ir.App {
 // for_each > remote (the batch idioms dominate the spike's execution model). Async
 // idioms (.spawn/.map.aio) are recognized by the helper and leaked as deferred
 // (§C/M10-S2), never mapped to an executable kind here.
-func invocationKinds(out pyOut, script string, rep *leak.Report) map[string]ir.InvokeKind {
+//
+// It returns two views of the same call-site evidence (calque#98):
+//   - invokes: the pre-existing whole-script-flat map (leaf callable name ->
+//     best InvokeKind seen ANYWHERE in the script). Unchanged behavior — this
+//     is still what buildFn/buildClass use to populate every Function.Invoke,
+//     so a 0-or-1-entrypoint script (no ambiguity to resolve) sees exactly the
+//     same result as before this change.
+//   - epInvokes: the SAME evidence, but partitioned by which
+//     @app.local_entrypoint()'s body the call site was nested inside (""
+//     for a call site outside any entrypoint, e.g. module level). This lets a
+//     caller (cmd/calque/run.go's pickWarmUnit) ask "what does entrypoint X
+//     specifically invoke?" once a script has 2+ entrypoints and --entrypoint
+//     disambiguates which one is in play.
+func invocationKinds(out pyOut, script string, rep *leak.Report) (map[string]ir.InvokeKind, map[string]map[string]ir.InvokeKind) {
 	// InvokeSpawn ranks lowest (calque#88): a callable that's BOTH .map()'d
 	// somewhere and .spawn()'d elsewhere should still resolve to InvokeMap for
 	// warm-unit selection — .spawn() classification exists so a future fan-out
@@ -269,27 +292,39 @@ func invocationKinds(out pyOut, script string, rep *leak.Report) map[string]ir.I
 		ir.InvokeMap: 5, ir.InvokeStarmap: 4, ir.InvokeForEach: 3, ir.InvokeRemote: 2, ir.InvokeSpawn: 1,
 	}
 	invokes := map[string]ir.InvokeKind{}
-	consider := func(target string, kind ir.InvokeKind) {
+	epInvokes := map[string]map[string]ir.InvokeKind{}
+	consider := func(entrypoint, target string, kind ir.InvokeKind) {
 		leaf := leafName(target)
 		if rank[kind] > rank[invokes[leaf]] {
 			invokes[leaf] = kind
 		}
+		if entrypoint == "" {
+			return
+		}
+		m := epInvokes[entrypoint]
+		if m == nil {
+			m = map[string]ir.InvokeKind{}
+			epInvokes[entrypoint] = m
+		}
+		if rank[kind] > rank[m[leaf]] {
+			m[leaf] = kind
+		}
 	}
 	// Back-compat: MapCalls is the pre-existing .map() channel.
 	for _, mc := range out.MapCalls {
-		consider(mc.Target, ir.InvokeMap)
+		consider(mc.Entrypoint, mc.Target, ir.InvokeMap)
 	}
 	// §C: the other synchronous idioms, plus async ones flagged for a deferred leak.
 	for _, ic := range out.InvokeCalls {
 		switch ic.Kind {
 		case "map":
-			consider(ic.Target, ir.InvokeMap)
+			consider(ic.Entrypoint, ic.Target, ir.InvokeMap)
 		case "starmap":
-			consider(ic.Target, ir.InvokeStarmap)
+			consider(ic.Entrypoint, ic.Target, ir.InvokeStarmap)
 		case "for_each":
-			consider(ic.Target, ir.InvokeForEach)
+			consider(ic.Entrypoint, ic.Target, ir.InvokeForEach)
 		case "remote":
-			consider(ic.Target, ir.InvokeRemote)
+			consider(ic.Entrypoint, ic.Target, ir.InvokeRemote)
 		case "map.aio":
 			// S2: async result futures / detach — deferred per §18; block-and-wait only.
 			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
@@ -300,7 +335,7 @@ func invocationKinds(out pyOut, script string, rep *leak.Report) map[string]ir.I
 			// still not EXECUTED (§18 keeps calque block-and-wait-only). The leak
 			// reflects that shift: "we know what this is" rather than "deferred,
 			// unclassified."
-			consider(ic.Target, ir.InvokeSpawn)
+			consider(ic.Entrypoint, ic.Target, ir.InvokeSpawn)
 			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
 				"%s.spawn(...): classified but not executed — block-and-wait fan-out over distinct spawned callables is deferred per §18 (calque#97 tracks the driver)", leafName(ic.Target))
 		case "local":
@@ -326,7 +361,7 @@ func invocationKinds(out pyOut, script string, rep *leak.Report) map[string]ir.I
 				"%s.from_name(%s): cross-app invocation of an already-deployed separate app — calque has no notion of a separately-deployed app to call into; not reproduced", ic.Target, formatFromNameArgs(ic.Args))
 		}
 	}
-	return invokes
+	return invokes, epInvokes
 }
 
 // formatFromNameArgs renders Function.from_name/Cls.from_name's positional

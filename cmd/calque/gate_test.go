@@ -46,7 +46,7 @@ func TestPickWarmUnitPlainFunction(t *testing.T) {
 		ir.Function{Name: "greet", Body: "return 1"},
 		ir.Function{Name: "transform", Body: "return 2", IsMap: true},
 	)
-	unit, ok := pickWarmUnit(app)
+	unit, ok := pickWarmUnit(app, "")
 	if !ok {
 		t.Fatal("pickWarmUnit must select a plain function when no @cls exists")
 	}
@@ -67,7 +67,7 @@ func TestPickWarmUnitPlainFunction(t *testing.T) {
 // first function is selected (single-call replay per §G), not a refusal.
 func TestPickWarmUnitPlainFunctionFallback(t *testing.T) {
 	app := irApp(ir.Function{Name: "greet", Body: "return 1"})
-	unit, ok := pickWarmUnit(app)
+	unit, ok := pickWarmUnit(app, "")
 	if !ok {
 		t.Fatal("pickWarmUnit must fall back to the first plain function")
 	}
@@ -87,7 +87,7 @@ func TestPickWarmUnitPrefersClassOverPlainFunction(t *testing.T) {
 			Methods:   []ir.Function{{Name: "generate", IsMap: true}},
 		}},
 	}
-	unit, ok := pickWarmUnit(app)
+	unit, ok := pickWarmUnit(app, "")
 	if !ok {
 		t.Fatal("pickWarmUnit failed")
 	}
@@ -96,6 +96,77 @@ func TestPickWarmUnitPrefersClassOverPlainFunction(t *testing.T) {
 	}
 	if unit.class.Name != "Batcher" || unit.method.Name != "generate" {
 		t.Errorf("unit = %+v, want the Batcher class's generate method", unit)
+	}
+}
+
+// entrypointScopedFixtureApp mirrors testdata/scripts/entrypoint_scoped_invoke.py
+// (calque#98's issue repro): a @cls+@enter Trainer.train_step that's .map()'d
+// ONLY inside do_train's body, and a wholly unrelated plain function evaluate
+// that's .remote()'d ONLY inside do_evaluate's body. Before calque#98,
+// pickWarmUnit had no way to see this distinction and always picked
+// train_step (the script's only .map()'d callable) regardless of which
+// entrypoint was selected.
+func entrypointScopedFixtureApp() ir.App {
+	return ir.App{
+		Classes: []ir.Class{{
+			Name:      "Trainer",
+			EnterBody: "self.model = \"loaded\"",
+			Methods:   []ir.Function{{Name: "train_step"}}, // IsMap left false: only true for do_train's own scan
+		}},
+		Functions:   []ir.Function{{Name: "evaluate"}},
+		Entrypoints: []ir.Function{{Name: "do_train"}, {Name: "do_evaluate"}},
+		EntrypointInvokes: map[string]map[string]ir.InvokeKind{
+			"do_train":    {"train_step": ir.InvokeMap},
+			"do_evaluate": {"evaluate": ir.InvokeRemote},
+		},
+	}
+}
+
+// TestPickWarmUnitScopedToSelectedEntrypoint (calque#98): with --entrypoint
+// do_evaluate resolved, pickWarmUnit must select the evaluate-related warm
+// unit, NOT train_step — the exact repro from the issue. --entrypoint
+// do_train must still select train_step, proving both directions are scoped
+// correctly (neither entrypoint's selection leaks into the other's).
+func TestPickWarmUnitScopedToSelectedEntrypoint(t *testing.T) {
+	app := entrypointScopedFixtureApp()
+
+	unit, ok := pickWarmUnit(app, "do_evaluate")
+	if !ok {
+		t.Fatal("pickWarmUnit(do_evaluate) failed")
+	}
+	if !unit.plainFunction || unit.method.Name != "evaluate" {
+		t.Errorf("pickWarmUnit(do_evaluate) = %+v, want the plain function evaluate, NOT train_step", unit)
+	}
+
+	unit, ok = pickWarmUnit(app, "do_train")
+	if !ok {
+		t.Fatal("pickWarmUnit(do_train) failed")
+	}
+	if unit.plainFunction || unit.class.Name != "Trainer" || unit.method.Name != "train_step" {
+		t.Errorf("pickWarmUnit(do_train) = %+v, want Trainer.train_step", unit)
+	}
+}
+
+// TestPickWarmUnitUnscopedWhenNotAmbiguous (calque#98 regression guard): a
+// script with 0 or 1 entrypoints must fall back to the original whole-script
+// scan UNCHANGED — entrypointScoped only kicks in at 2+ entrypoints. Reusing
+// entrypointScopedFixtureApp's shape but trimmed to a single entrypoint
+// proves EntrypointInvokes (even if populated) is ignored in that case: the
+// whole-script IsMap on train_step is what decides the outcome here, not the
+// per-entrypoint map.
+func TestPickWarmUnitUnscopedWhenNotAmbiguous(t *testing.T) {
+	app := entrypointScopedFixtureApp()
+	app.Entrypoints = []ir.Function{{Name: "do_train"}} // now unambiguous: only 1
+	app.Classes[0].Methods[0].IsMap = true              // whole-script view says train_step IS mapped
+
+	unit, ok := pickWarmUnit(app, "do_train")
+	if !ok {
+		t.Fatal("pickWarmUnit(do_train, 1 entrypoint) failed")
+	}
+	// Unscoped: the @cls+@enter unit wins outright per the original
+	// class-before-function precedence, regardless of EntrypointInvokes.
+	if unit.plainFunction || unit.class.Name != "Trainer" || unit.method.Name != "train_step" {
+		t.Errorf("pickWarmUnit(1 entrypoint) = %+v, want the unscoped whole-script pick (Trainer.train_step)", unit)
 	}
 }
 

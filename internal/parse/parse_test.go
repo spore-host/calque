@@ -494,6 +494,101 @@ func TestSpawnCallSitesCapturesStringAndNumericArgs(t *testing.T) {
 	}
 }
 
+// TestInvocationKindsPartitionsByEntrypoint (calque#98): a unit test on
+// invocationKinds itself (no pyast subprocess, so it always runs even
+// without uv on PATH) — proves the returned per-entrypoint map correctly
+// filters call-site evidence by entrypoint while leaving the pre-existing
+// whole-script map exactly as it was (the regression guard for 0/1-
+// entrypoint scripts, which never consult the per-entrypoint map at all).
+func TestInvocationKindsPartitionsByEntrypoint(t *testing.T) {
+	out := pyOut{
+		InvokeCalls: []pyInvokeCall{
+			{Target: "train_step", Kind: "map", Entrypoint: "do_train"},
+			{Target: "evaluate", Kind: "remote", Entrypoint: "do_evaluate"},
+			{Target: "helper", Kind: "remote", Entrypoint: ""}, // module-level / no entrypoint
+		},
+	}
+	rep := &leak.Report{}
+	whole, byEP := invocationKinds(out, "s.py", rep)
+
+	// Whole-script view: every call site counts, regardless of entrypoint.
+	if whole["train_step"] != ir.InvokeMap {
+		t.Errorf(`whole["train_step"] = %q, want %q`, whole["train_step"], ir.InvokeMap)
+	}
+	if whole["evaluate"] != ir.InvokeRemote {
+		t.Errorf(`whole["evaluate"] = %q, want %q`, whole["evaluate"], ir.InvokeRemote)
+	}
+	if whole["helper"] != ir.InvokeRemote {
+		t.Errorf(`whole["helper"] = %q, want %q`, whole["helper"], ir.InvokeRemote)
+	}
+
+	// Per-entrypoint view: each entrypoint sees ONLY its own call sites.
+	if byEP["do_train"]["train_step"] != ir.InvokeMap {
+		t.Errorf(`byEP["do_train"]["train_step"] = %q, want %q`, byEP["do_train"]["train_step"], ir.InvokeMap)
+	}
+	if _, ok := byEP["do_train"]["evaluate"]; ok {
+		t.Errorf(`byEP["do_train"] must not contain "evaluate"; got %+v`, byEP["do_train"])
+	}
+	if byEP["do_evaluate"]["evaluate"] != ir.InvokeRemote {
+		t.Errorf(`byEP["do_evaluate"]["evaluate"] = %q, want %q`, byEP["do_evaluate"]["evaluate"], ir.InvokeRemote)
+	}
+	if _, ok := byEP["do_evaluate"]["train_step"]; ok {
+		t.Errorf(`byEP["do_evaluate"] must not contain "train_step"; got %+v`, byEP["do_evaluate"])
+	}
+	// A call site with no entrypoint ("" — module level) must not create a
+	// "" entry in the per-entrypoint map; it only ever contributes to whole.
+	if _, ok := byEP[""]; ok {
+		t.Errorf(`byEP must not have a "" key for module-level call sites; got %+v`, byEP)
+	}
+}
+
+// TestParseEntrypointScopedInvokes (calque#98): the fixture's two entrypoints
+// each invoke a wholly DIFFERENT callable (do_train -> Trainer.train_step via
+// .map(), do_evaluate -> evaluate via .remote()) — app.EntrypointInvokes must
+// attribute each call site to the entrypoint whose body it was found in, not
+// fold both into one whole-script union. The pre-existing whole-script Invoke
+// field on each Function/method (used by 0/1-entrypoint scripts) must also
+// still carry both idioms unchanged — this is the regression guard.
+func TestParseEntrypointScopedInvokes(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/entrypoint_scoped_invoke.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(app.Entrypoints) != 2 {
+		t.Fatalf("Entrypoints = %d, want 2 (do_train, do_evaluate)", len(app.Entrypoints))
+	}
+
+	trainEvidence := app.EntrypointInvokes["do_train"]
+	if trainEvidence["train_step"] != ir.InvokeMap {
+		t.Errorf(`EntrypointInvokes["do_train"]["train_step"] = %q, want %q`, trainEvidence["train_step"], ir.InvokeMap)
+	}
+	if _, ok := trainEvidence["evaluate"]; ok {
+		t.Errorf(`EntrypointInvokes["do_train"] must NOT contain "evaluate"; got %+v`, trainEvidence)
+	}
+
+	evalEvidence := app.EntrypointInvokes["do_evaluate"]
+	if evalEvidence["evaluate"] != ir.InvokeRemote {
+		t.Errorf(`EntrypointInvokes["do_evaluate"]["evaluate"] = %q, want %q`, evalEvidence["evaluate"], ir.InvokeRemote)
+	}
+	if _, ok := evalEvidence["train_step"]; ok {
+		t.Errorf(`EntrypointInvokes["do_evaluate"] must NOT contain "train_step"; got %+v`, evalEvidence)
+	}
+
+	// Whole-script fields (what 0/1-entrypoint scripts rely on) must still see
+	// BOTH idioms, unaffected by the new per-entrypoint partitioning.
+	if len(app.Classes) != 1 || len(app.Classes[0].Methods) != 1 || !app.Classes[0].Methods[0].IsMap {
+		t.Errorf("Trainer.train_step.IsMap must still be true (whole-script view); classes=%+v", app.Classes)
+	}
+	evalFn, ok := app.FindFunction("evaluate")
+	if !ok || evalFn.Invoke != ir.InvokeRemote {
+		t.Errorf("evaluate.Invoke = %+v (found=%v), want %q (whole-script view)", evalFn, ok, ir.InvokeRemote)
+	}
+}
+
 // TestLocalCallsPopulatedFromFixture (calque#92): each function/method's own
 // LocalCalls carries exactly the sibling names ITS OWN body references via
 // .local() — run_blend reaches both a plain function (stage_one) and a @cls

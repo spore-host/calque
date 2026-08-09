@@ -15,6 +15,21 @@ type App struct {
 	Classes     []Class           // @app.cls
 	Entrypoints []Function        // @app.local_entrypoint (may be more than one)
 	Script      string            // source path, for leak attribution (§10)
+	// EntrypointInvokes attributes invoke-kind evidence to the SPECIFIC
+	// @app.local_entrypoint() whose body contains the call site (calque#98):
+	// entrypoint name -> invoked callable's leaf name -> best InvokeKind seen
+	// at a call site nested inside that entrypoint's own body. A callable
+	// only appears under an entrypoint here if a recognized call site
+	// (.map/.starmap/.for_each/.remote/.spawn) inside that entrypoint's body
+	// targets it — this is what lets pickWarmUnit (cmd/calque/run.go) ask
+	// "what does entrypoint X specifically invoke?" instead of only ever
+	// seeing the whole-script-flat union every Function/Class's own
+	// Invoke/IsMap field already carries (that whole-script field is
+	// unchanged and still the right source of truth for 0-or-1-entrypoint
+	// scripts, where there is no ambiguity to resolve). Nil/missing for a
+	// script with no entrypoints, or an entrypoint with no recognized call
+	// sites of its own.
+	EntrypointInvokes map[string]map[string]InvokeKind
 }
 
 // FindFunction looks up a plain @app.function by name (calque#88: correlating

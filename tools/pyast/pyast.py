@@ -264,6 +264,20 @@ class Collector(ast.NodeVisitor):
         self.invoke_calls: list[dict[str, Any]] = []  # §C: starmap/for_each/remote/spawn/map.aio
         self.volume_writes: list[dict[str, Any]] = []  # §E: volume.commit()/reload() call sites
         self.leaks: list[dict[str, Any]] = []      # helper-level "I saw this but can't model it"
+        # calque#98: names of @app.local_entrypoint()s we are CURRENTLY walking
+        # into, innermost last. A call site visited while this is non-empty is
+        # attributed to _current_entrypoint below — this is what lets the Go
+        # side ask "what does entrypoint X specifically invoke?" instead of
+        # only ever seeing a whole-script-flat union of every call site.
+        self._entrypoint_stack: list[str] = []
+
+    @property
+    def _current_entrypoint(self) -> str:
+        """The @app.local_entrypoint() whose body we're currently inside, or ""
+        if we're not inside one (module level, or inside a plain @app.function/
+        @cls method body — those are never recursed into for call sites; see
+        visit_ClassDef, and visit_FunctionDef only pushes for entrypoints)."""
+        return self._entrypoint_stack[-1] if self._entrypoint_stack else ""
 
     # ---- module-level assignments: App(), Image chains, Volume.from_name() ----
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -308,15 +322,15 @@ class Collector(ast.NodeVisitor):
             # so the idiom is the PENULTIMATE attribute and this is an async future.
             if attr == "aio" and isinstance(node.func.value, ast.Attribute) and node.func.value.attr in ("map", "starmap"):
                 target = ".".join(_attr_chain(node.func.value)[:-1])
-                self.invoke_calls.append({"target": target, "kind": "map.aio", "lineno": node.lineno})
+                self.invoke_calls.append({"target": target, "kind": "map.aio", "lineno": node.lineno, "entrypoint": self._current_entrypoint})
             elif attr == "map":
                 target = ".".join(_attr_chain(node.func)[:-1])
                 # keep the legacy map_calls channel AND the unified invoke_calls one
-                self.map_calls.append({"target": target, "lineno": node.lineno})
-                self.invoke_calls.append({"target": target, "kind": "map", "lineno": node.lineno})
+                self.map_calls.append({"target": target, "lineno": node.lineno, "entrypoint": self._current_entrypoint})
+                self.invoke_calls.append({"target": target, "kind": "map", "lineno": node.lineno, "entrypoint": self._current_entrypoint})
             elif attr in self._SYNC_IDIOMS:
                 self.invoke_calls.append(
-                    {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno}
+                    {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno, "entrypoint": self._current_entrypoint}
                 )
             elif attr == "spawn":
                 # calque#88: .spawn(args) fires an async call — deferred per §18
@@ -334,6 +348,7 @@ class Collector(ast.NodeVisitor):
                         "kind": "spawn",
                         "lineno": node.lineno,
                         "args": [_spawn_arg_str(a) for a in node.args],
+                        "entrypoint": self._current_entrypoint,
                     }
                 )
             elif attr == "local":
@@ -343,7 +358,7 @@ class Collector(ast.NodeVisitor):
                 # only the picked warm unit's body verbatim; a sibling function
                 # referenced via .local() is not in scope and will NameError).
                 self.invoke_calls.append(
-                    {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": "local", "lineno": node.lineno}
+                    {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": "local", "lineno": node.lineno, "entrypoint": self._current_entrypoint}
                 )
             elif attr in ("commit", "reload"):
                 # §E: volume.commit()/reload() call sites. We record the target var
@@ -367,7 +382,7 @@ class Collector(ast.NodeVisitor):
                 base = _attr_chain(node.func)[-2]
                 args = [_const_str(a) for a in node.args]
                 self.invoke_calls.append(
-                    {"target": base, "kind": "from_name", "lineno": node.lineno, "args": args}
+                    {"target": base, "kind": "from_name", "lineno": node.lineno, "args": args, "entrypoint": self._current_entrypoint}
                 )
         self.generic_visit(node)
 
@@ -377,14 +392,28 @@ class Collector(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         decos = self._decos(node)
         leaves = {d.rsplit(".", 1)[-1] for d in decos}
-        if any(d.endswith("local_entrypoint") for d in decos):
+        is_entrypoint = any(d.endswith("local_entrypoint") for d in decos)
+        if is_entrypoint:
             self.entrypoints.append(_describe_fn(self.src, node))
         elif any(d.endswith("function") for d in decos) or (leaves & _SERVE_DECOS):
             # A serve entrypoint (§F) may carry @app.function too, or only the serve
             # decorator — collect it either way so its entry_kind reaches the IR.
             self.functions.append(_describe_fn(self.src, node))
         # methods handled inside ClassDef; free functions with neither decorator are ignored
-        self.generic_visit(node)
+        if is_entrypoint:
+            # calque#98: push this entrypoint's name so every call site visited
+            # while walking its body (below, via generic_visit) is attributed to
+            # it — see _current_entrypoint / visit_Call's invoke_calls/map_calls
+            # entries. Popped in a finally so a malformed body can't leave the
+            # stack (and therefore every subsequent call site's attribution)
+            # corrupted for the rest of the walk.
+            self._entrypoint_stack.append(node.name)
+            try:
+                self.generic_visit(node)
+            finally:
+                self._entrypoint_stack.pop()
+        else:
+            self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node) -> None:  # treat async defs the same
         self.visit_FunctionDef(node)  # type: ignore[arg-type]
