@@ -197,10 +197,10 @@ The three commands below acquire billable GPU hardware and are gated behind an e
 ```
 calque smoke   --bucket B --run-id ID [--region R] [--ttl 30m] \
       --i-understand-this-spends-money                          # acquire-only smoke test
-calque real    --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] \
+calque real    --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] \
       [--model HF_REPO] [--n 1] [--shards 1] \                  # single instance, or --shards N to fan out
       --i-understand-this-spends-money                          #   across a fleet (§15)
-calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] \
+calque session --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] \
       [--rungs 1,100,1000] \                                    # acquire once, hold, run every rung on it
       --i-understand-this-spends-money
 ```

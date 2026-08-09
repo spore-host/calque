@@ -23,10 +23,18 @@ type SpawnLauncher struct {
 	OnComplete string        // "terminate" (default) so the instance dies when the job signals done
 	Username   string        // primary linux user (for pre-stop hook $HOME resolution)
 	Timeout    time.Duration // per-Provision call timeout
-	// AMI pins the machine image. Empty lets spawn auto-select. spawn#356 (GPU
-	// AL2023 SSM param missing g6e/g7/g7e auto-detect) was fixed upstream in
-	// spawn v0.79.0 — auto-select may now be safe for GPU instances, but that's
-	// unverified against a live launch, so we keep pinning until confirmed.
+	// AMI pins the machine image. Empty lets spawn auto-select (GetRecommendedAMI
+	// -> GetAL2023AMI, resolving the "Deep Learning Base OSS Nvidia Driver GPU
+	// AMI" SSM parameter for GPU instance types). spawn#356 (GPU AL2023 SSM
+	// param missing g6e/g7/g7e auto-detect) was fixed upstream in spawn v0.79.0;
+	// calque#75 verified this LIVE on all four target families (g6/g6e/g7/g7e):
+	// auto-select resolves successfully, the instance boots, SSM comes online,
+	// and — checked specifically on g7 — Docker + NVIDIA drivers + the nvidia
+	// container runtime are all present and working (confirmed via
+	// `docker info | grep nvidia` showing the nvidia runtime registered). Pin
+	// this only when a specific AMI is required for a reason OTHER than the
+	// old spawn#356 workaround (e.g. reproducibility, or an image lacking a
+	// tool a bootstrap script needs).
 	AMI string
 	// IMDSv2HopLimit sets the instance metadata hop limit. Set to 2 when warmd
 	// runs inside a docker container so it can reach instance-role creds via IMDS

@@ -135,7 +135,7 @@ func realCmd(args []string) error {
 	region := fs.String("region", "us-east-1", "AWS region")
 	runID := fs.String("run-id", "", "unique run id (required)")
 	instance := fs.String("instance", "g6.2xlarge", "GPU instance type")
-	ami := fs.String("ami", "", "pinned AMI (required for GPU; spawn auto-select is broken)")
+	ami := fs.String("ami", "", "pin the AMI; empty => spawn auto-selects a GPU-capable AMI (verified working on g6/g6e/g7/g7e, calque#75)")
 	model := fs.String("model", "Qwen/Qwen2.5-1.5B-Instruct", "HF model repo id (must NOT be on Bedrock)")
 	n := fs.Int("n", 1, "number of prompts (N=1 validates inference; N~100 for amortized K)")
 	shards := fs.Int("shards", 1, "fan out .map across N single-node instances acquired in parallel (§15 fleet; 1 => single instance)")
@@ -148,10 +148,7 @@ func realCmd(args []string) error {
 		return err
 	}
 	if *bucket == "" || *runID == "" {
-		return fmt.Errorf("usage: calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
-	}
-	if !*pool && *ami == "" {
-		return fmt.Errorf("--ami is required unless --pool is set (a pool's workers already have an AMI baked in at `calque pool create` time)")
+		return fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
 	}
 	if !*confirm {
 		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money")
@@ -182,7 +179,7 @@ func sessionCmd(args []string) error {
 	region := fs.String("region", "us-east-1", "AWS region")
 	runID := fs.String("run-id", "", "unique session id (required)")
 	instance := fs.String("instance", "g7e.2xlarge", "GPU instance type to hold")
-	ami := fs.String("ami", "", "pinned AMI (required for GPU)")
+	ami := fs.String("ami", "", "pin the AMI; empty => spawn auto-selects a GPU-capable AMI (verified working on g6/g6e/g7/g7e, calque#75)")
 	model := fs.String("model", "Qwen/Qwen2.5-1.5B-Instruct", "HF model repo id (must NOT be on Bedrock)")
 	rungsCSV := fs.String("rungs", "1,100,1000", "comma-separated N-ramp to run on the held instance")
 	ttl := fs.String("ttl", "3h", "instance TTL hard cap (held across the whole ramp)")
@@ -197,8 +194,8 @@ func sessionCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *bucket == "" || *runID == "" || *ami == "" {
-		return fmt.Errorf("usage: calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] [--rungs 1,100,1000] [--spot] --i-understand-this-spends-money")
+	if *bucket == "" || *runID == "" {
+		return fmt.Errorf("usage: calque session --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] [--rungs 1,100,1000] [--spot] --i-understand-this-spends-money")
 	}
 	if !*confirm {
 		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money (holds a billable GPU for up to the TTL)")
@@ -256,8 +253,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque analyze <script.py> [...]")
 	fmt.Fprintln(os.Stderr, "  calque run [--n N] [--region R] [--dry-run] <script.py>")
 	fmt.Fprintln(os.Stderr, "  calque smoke --bucket B --run-id ID [--region R] [--ttl 30m] --i-understand-this-spends-money")
-	fmt.Fprintln(os.Stderr, "  calque real --bucket B --run-id ID --ami AMI [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
-	fmt.Fprintln(os.Stderr, "  calque session --bucket B --run-id ID --ami AMI [--instance g7e.2xlarge] [--rungs 1,100,1000] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque session --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] [--rungs 1,100,1000] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque pool create --model M --instance-type T --manifest-bucket B --results-bucket B --runner-path P [--workers N] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque spawn-run --bucket B --run-id ID --ami AMI [--instance m7i.large] <script.py> --i-understand-this-spends-money")
 }
