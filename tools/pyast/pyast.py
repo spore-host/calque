@@ -142,6 +142,57 @@ def _unsupported_construct_call(dotted: list[str]) -> str | None:
     return "modal." + leaf if leaf in _CALL_CONSTRUCTS else None
 
 
+def _iterable_literal(node: ast.Call) -> dict[str, Any] | None:
+    """Best-effort static resolution of a `.map()`/`.starmap()` call's iterable
+    argument (calque#136): node is the `.map(...)`/`.starmap(...)` Call itself;
+    the iterable is its first positional arg (`node.args[0]`).
+
+    Two shapes are statically resolvable without executing any script code:
+      - A literal list/tuple/string (or any other literal `ast.literal_eval`
+        accepts): `[1,2,3]`, `[(1,2),(3,4)]`, `"abc"`. Returns
+        {"kind": "literal", "values": [...]}, coercing a non-list/tuple/str
+        result (e.g. a bare literal) to a single-element list, and a str to
+        its list of characters (str is iterable the same way in real .map()).
+      - `range(N)` / `range(start, stop)` / `range(start, stop, step)`, when
+        range's OWN args are all literal ints: we replay `list(range(*ints))`
+        using ints we already safely extracted via literal_eval — this is
+        NOT executing arbitrary script code, just the 1-3 ints themselves.
+        Returns {"kind": "range", "values": [...]}.
+
+    Everything else (a variable reference, a comprehension, a function call
+    result other than range, unpacking, etc.) returns None so the caller
+    omits the "iterable" key entirely — never a null placeholder — and the Go
+    side falls back to its synthesized placeholder.
+    """
+    if not node.args:
+        return None
+    arg = node.args[0]
+
+    try:
+        val = ast.literal_eval(arg)
+    except (ValueError, SyntaxError):
+        val = None
+    else:
+        if isinstance(val, (list, tuple)):
+            values = list(val)
+        elif isinstance(val, str):
+            values = list(val)
+        else:
+            values = [val]
+        return {"kind": "literal", "values": values}
+
+    # range(...) whose own args are all literal ints: replay it structurally.
+    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "range":
+        try:
+            ints = [ast.literal_eval(a) for a in arg.args]
+        except (ValueError, SyntaxError):
+            return None
+        if ints and all(isinstance(i, int) and not isinstance(i, bool) for i in ints):
+            return {"kind": "range", "values": list(range(*ints))}
+
+    return None
+
+
 def _schedule_marker(node: ast.AST) -> dict[str, Any] | None:
     """Recognize `schedule=modal.Cron(...)` / `schedule=modal.Period(...)` object
     forms (calque#91). Without this, the Call node falls through to `_literal`'s
@@ -411,13 +462,29 @@ class Collector(ast.NodeVisitor):
                 self.invoke_calls.append({"target": target, "kind": "map.aio", "lineno": node.lineno, "entrypoint": self._current_entrypoint})
             elif attr == "map":
                 target = ".".join(_attr_chain(node.func)[:-1])
+                mc = {"target": target, "lineno": node.lineno, "entrypoint": self._current_entrypoint}
+                ic = {"target": target, "kind": "map", "lineno": node.lineno, "entrypoint": self._current_entrypoint}
+                # calque#136: capture the real .map() iterable when it's statically
+                # resolvable (a literal list/tuple/str or a range() of literal ints),
+                # so run/real/ramp/fleetrun can drive the actual item batch instead of
+                # a synthesized placeholder. Omitted entirely (no "iterable": null)
+                # when unresolved, matching every other optional marker in this file.
+                iterable = _iterable_literal(node)
+                if iterable is not None:
+                    mc["iterable"] = iterable
+                    ic["iterable"] = iterable
                 # keep the legacy map_calls channel AND the unified invoke_calls one
-                self.map_calls.append({"target": target, "lineno": node.lineno, "entrypoint": self._current_entrypoint})
-                self.invoke_calls.append({"target": target, "kind": "map", "lineno": node.lineno, "entrypoint": self._current_entrypoint})
+                self.map_calls.append(mc)
+                self.invoke_calls.append(ic)
             elif attr in self._SYNC_IDIOMS:
-                self.invoke_calls.append(
-                    {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno, "entrypoint": self._current_entrypoint}
-                )
+                ic = {"target": ".".join(_attr_chain(node.func)[:-1]), "kind": attr, "lineno": node.lineno, "entrypoint": self._current_entrypoint}
+                if attr == "starmap":
+                    # calque#136: same iterable capture as .map(), for the tuple-splat
+                    # shape's own real data (e.g. combine.starmap([(1,2),(3,4)])).
+                    iterable = _iterable_literal(node)
+                    if iterable is not None:
+                        ic["iterable"] = iterable
+                self.invoke_calls.append(ic)
             elif attr == "spawn":
                 # calque#88: .spawn(args) fires an async call — deferred per §18
                 # (still leaked, block-and-wait only), but the TARGET is now also

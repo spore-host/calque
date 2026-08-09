@@ -111,6 +111,13 @@ type Function struct {
 	// of how this function itself is invoked (distinct from Invoke/IsMap).
 	LocalCalls []string
 	Line       int // source line of the def, for leak attribution
+	// Items is the real .map()/.starmap() iterable this callable is invoked
+	// against, extracted at parse time from a literal list/tuple/str or a
+	// range(N) call site (calque#136) — nil if the script's iterable wasn't
+	// statically resolvable (a variable, comprehension, or non-range function
+	// call result). See cmd/calque's realOrSyntheticItems, which falls back to
+	// synthesized placeholders when this is nil.
+	Items []any
 }
 
 // EntryKind is a callable's execution shape (§F). Serve entrypoints are long-lived

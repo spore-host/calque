@@ -20,7 +20,6 @@ import (
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
 	"github.com/spore-host/calque/internal/target"
-	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
 // realOpts controls a real GPU inference run — the headline-K vehicle.
@@ -37,6 +36,11 @@ type realOpts struct {
 	ratesFP      string
 	spot         bool   // acquire on the Spot market (different capacity pool than on-demand)
 	spotMaxPrice string // $/hr bid cap; "" => spawn caps at on-demand price
+	// script, when set, is a Modal script to parse for its REAL .map()/
+	// .starmap() iterable (calque#136) — opt-in; "" (the default) reproduces
+	// today's synthesized-prompt behavior exactly, since realRun/fleetRun
+	// don't otherwise parse any script at all.
+	script string
 }
 
 // The real warm-unit bodies: actual vLLM. @enter loads the model ONCE; the
@@ -98,11 +102,15 @@ func realRun(o realOpts) (err error) {
 	}
 	fmt.Printf("[2/8] uploaded artifacts\n")
 
-	// N real prompts. The warm runner loads the model once (@enter) then drains these.
-	items := make([]warm.Item, o.n)
-	for i := range items {
-		items[i] = warm.Item{Index: i, Payload: fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)}
-	}
+	// N real prompts. The warm runner loads the model once (@enter) then drains
+	// these. calque#136: when --script names a Modal script, use its REAL
+	// .map()/.starmap() iterable when it's long enough; else (the default,
+	// --script unset) this is byte-identical to the pre-existing synthesized
+	// canned-sentence placeholder.
+	unit, _ := warmUnitForScript(ctx, o.script, rep)
+	items := realOrSyntheticItems(unit, o.n, func(i int) any {
+		return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
+	}, rep)
 	if err := calexec.WriteManifest(ctx, s3c, layout, realEnterBody, realMethodBody, "prompt", hostWorkerDir, items); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}

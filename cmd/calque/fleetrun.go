@@ -21,7 +21,6 @@ import (
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
 	"github.com/spore-host/calque/internal/target"
-	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
 // fleetRun is the multi-instance .map fan-out (spec §15, Gap D): it shards N items
@@ -73,11 +72,14 @@ func fleetRun(o realOpts, shards int) (err error) {
 	}
 	fmt.Printf("[fleet] artifacts uploaded; sharding %d items across %d instances\n", o.n, shards)
 
-	// D1: shard the items, each with its own manifest + result prefix.
-	allItems := make([]warm.Item, o.n)
-	for i := range allItems {
-		allItems[i] = warm.Item{Index: i, Payload: fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)}
-	}
+	// D1: shard the items, each with its own manifest + result prefix. calque#136:
+	// draw from --script's REAL .map()/.starmap() iterable when it's long enough,
+	// else the pre-existing synthesized placeholder (unchanged when --script is
+	// unset, the default).
+	unit, _ := warmUnitForScript(ctx, o.script, rep)
+	allItems := realOrSyntheticItems(unit, o.n, func(i int) any {
+		return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
+	}, rep)
 	shs := calexec.ShardItems(allItems, shards)
 	for i := range shs {
 		mk, rp, sk, lk := calexec.ShardLayout(base, sharedLayout.ArtifactPfx, strconv.Itoa(shs[i].ID))

@@ -519,10 +519,13 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 		// 0 leaves warmd's sane default.
 		MaxRestarts: unit.class.Config.Retries,
 	}
-	items := make([]warm.Item, sample)
-	for i := range items {
-		items[i] = warm.Item{Index: i, Payload: fmt.Sprintf("dry-run-item-%d", i)}
-	}
+	// calque#136: drive the script's REAL .map()/.starmap() iterable when pyast
+	// statically resolved one long enough for `sample` items, else fall back to
+	// the pre-existing synthesized placeholder (unchanged behavior for every
+	// script whose iterable wasn't statically resolvable).
+	items := realOrSyntheticItems(unit, sample, func(i int) any {
+		return fmt.Sprintf("dry-run-item-%d", i)
+	}, rep)
 	start := time.Now()
 	failed, err := sup.Run(ctx, items)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -737,5 +738,55 @@ func TestParseRareConstructsAreTaggedNotSilent(t *testing.T) {
 	}
 	if len(wantTag) != 0 {
 		t.Errorf("missing distinct leak tag for %v; leaks=%+v", wantTag, rep.Leaks)
+	}
+}
+
+// TestParseMapIterables (calque#136): a real .map()/.starmap() iterable that
+// pyast could statically resolve (a literal list, a literal list of tuples,
+// or a range()) must land in ir.Function.Items; an unresolvable one (a
+// variable reference) must leave Items nil so callers fall back cleanly to
+// their synthesized placeholder instead of erroring.
+func TestParseMapIterables(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/map_iterables.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	fn := func(name string) ir.Function {
+		f, ok := app.FindFunction(name)
+		if !ok {
+			t.Fatalf("function %q not found in parsed app", name)
+		}
+		return f
+	}
+
+	litMap := fn("lit_map")
+	wantLitMap := []any{float64(1), float64(2), float64(3)}
+	if !reflect.DeepEqual(litMap.Items, wantLitMap) {
+		t.Errorf("lit_map.Items = %#v, want %#v", litMap.Items, wantLitMap)
+	}
+
+	litStarmap := fn("lit_starmap")
+	wantStarmap := []any{
+		[]any{float64(1), float64(2)},
+		[]any{float64(3), float64(4)},
+	}
+	if !reflect.DeepEqual(litStarmap.Items, wantStarmap) {
+		t.Errorf("lit_starmap.Items = %#v, want %#v", litStarmap.Items, wantStarmap)
+	}
+
+	litRange := fn("lit_range")
+	wantRange := []any{float64(0), float64(1), float64(2), float64(3), float64(4)}
+	if !reflect.DeepEqual(litRange.Items, wantRange) {
+		t.Errorf("lit_range.Items = %#v, want %#v", litRange.Items, wantRange)
+	}
+
+	litUnresolvable := fn("lit_unresolvable")
+	if litUnresolvable.Items != nil {
+		t.Errorf("lit_unresolvable.Items = %#v, want nil (variable reference is not statically resolvable)", litUnresolvable.Items)
 	}
 }

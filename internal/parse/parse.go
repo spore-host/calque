@@ -97,6 +97,22 @@ type pyMapCall struct {
 	// invocationKinds attribute evidence to a SPECIFIC entrypoint instead of
 	// folding every call site into one whole-script-flat union).
 	Entrypoint string `json:"entrypoint"`
+	// Iterable is the .map() call's real iterable argument, when pyast could
+	// statically resolve it (calque#136) — nil when it's a variable,
+	// comprehension, or non-range function call result.
+	Iterable *pyIterable `json:"iterable,omitempty"`
+}
+
+// pyIterable is a `.map()`/`.starmap()` call's iterable argument, captured at
+// parse time when it's statically resolvable (calque#136; see pyast.py's
+// _iterable_literal). Kind is "literal" (a literal list/tuple/str argument)
+// or "range" (a range(...) call whose own args were all literal ints); Values
+// is the resolved item list either way, heterogeneous JSON decoded lazily by
+// the caller (a starmap's items are themselves lists/tuples, a map's items
+// are usually scalars).
+type pyIterable struct {
+	Kind   string            `json:"kind"`
+	Values []json.RawMessage `json:"values"`
 }
 
 // pyInvokeCall is a recognized invocation idiom call site (§C): kind is one of
@@ -114,6 +130,10 @@ type pyInvokeCall struct {
 	// @app.local_entrypoint()'s name, or "" if this call site isn't nested
 	// inside one.
 	Entrypoint string `json:"entrypoint"`
+	// Iterable mirrors pyMapCall.Iterable (calque#136) — populated for "map"
+	// and "starmap" kinds when pyast could statically resolve the call's
+	// iterable argument; nil otherwise (and for every other Kind).
+	Iterable *pyIterable `json:"iterable,omitempty"`
 }
 
 // Parse runs the helper on scriptPath and returns the IR plus any leaks emitted
@@ -229,14 +249,19 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	invokes, epInvokes := invocationKinds(out, script, rep)
 	app.EntrypointInvokes = epInvokes
 
+	// calque#136: leaf callable name -> real .map()/.starmap() iterable, when
+	// pyast statically resolved it. Threaded into buildFn below so ir.Function.
+	// Items carries the real item batch instead of always being nil.
+	items := mapItems(out)
+
 	for _, f := range out.Functions {
-		app.Functions = append(app.Functions, buildFn(f, script, rep, invokes))
+		app.Functions = append(app.Functions, buildFn(f, script, rep, invokes, items))
 	}
 	for _, c := range out.Classes {
-		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes))
+		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items))
 	}
 	for _, ep := range out.Entrypoints {
-		app.Entrypoints = append(app.Entrypoints, buildFn(ep, script, rep, invokes))
+		app.Entrypoints = append(app.Entrypoints, buildFn(ep, script, rep, invokes, items))
 	}
 
 	// E3: volume.commit()/reload() call sites. A volume that's WRITTEN (not just
@@ -262,6 +287,46 @@ func build(out pyOut, rep *leak.Report) ir.App {
 		}
 	}
 	return app
+}
+
+// mapItems collects the real .map()/.starmap() iterable pyast statically
+// resolved for each leaf callable name (calque#136), decoding pyIterable.
+// Values from json.RawMessage to any. When a callable has more than one
+// call site with a resolved iterable (rare — the same callable .map()'d at
+// two different sites), the FIRST one found wins deterministically, mirroring
+// resolveImage's own "first resolved wins, no ambiguity logic beyond that"
+// posture; a callable with ANY unresolvable call site alongside a resolvable
+// one still keeps the resolvable one, since that's the best real data
+// available. A callable with only unresolvable call sites has no entry here,
+// so buildFn leaves ir.Function.Items nil.
+func mapItems(out pyOut) map[string][]any {
+	items := map[string][]any{}
+	add := func(target string, it *pyIterable) {
+		if it == nil {
+			return
+		}
+		leaf := leafName(target)
+		if _, ok := items[leaf]; ok {
+			return // first resolved wins
+		}
+		vals := make([]any, len(it.Values))
+		for i, raw := range it.Values {
+			var v any
+			if err := json.Unmarshal(raw, &v); err == nil {
+				vals[i] = v
+			}
+		}
+		items[leaf] = vals
+	}
+	for _, mc := range out.MapCalls {
+		add(mc.Target, mc.Iterable)
+	}
+	for _, ic := range out.InvokeCalls {
+		if ic.Kind == "map" || ic.Kind == "starmap" {
+			add(ic.Target, ic.Iterable)
+		}
+	}
+	return items
 }
 
 // invocationKinds resolves each callable's invocation idiom from the helper's call
@@ -519,7 +584,7 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 	return img
 }
 
-func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.InvokeKind) ir.Function {
+func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any) ir.Function {
 	fn := ir.Function{
 		Name:      f.Name,
 		Body:      f.Body,
@@ -528,6 +593,7 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 		EntryKind: ir.EntryKind(f.EntryKind), // "serve" or "" (§F)
 		Args:      f.Args,
 		ItemArg:   firstItemArg(f.Args),
+		Items:     items[f.Name],
 	}
 	for _, lc := range f.LocalCalls {
 		fn.LocalCalls = append(fn.LocalCalls, leafName(lc))
@@ -551,7 +617,7 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 	return fn
 }
 
-func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind) ir.Class {
+func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any) ir.Class {
 	cls := ir.Class{Name: c.Name, Line: c.Lineno}
 	gpu, vols, timeout, cfg := readConfigKwargs(c.ClsKwargs, leak.PrimGPU, c.Name, script, c.Lineno, rep)
 	cls.GPU, cls.Volumes, cls.Timeout, cls.Config = gpu, vols, timeout, cfg
@@ -576,7 +642,7 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 			"@cls %q has @modal.exit(); container-shutdown teardown is not reproduced by the warm supervisor", c.Name)
 	}
 	for _, m := range c.Methods {
-		method := buildFn(m, script, rep, invokes)
+		method := buildFn(m, script, rep, invokes, items)
 		// A class method inherits the class's gpu/volumes if it declares none.
 		if method.GPU == "" {
 			method.GPU = cls.GPU

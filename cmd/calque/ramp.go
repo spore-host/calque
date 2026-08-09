@@ -18,7 +18,6 @@ import (
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
 	"github.com/spore-host/calque/internal/target"
-	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
 // rampOpts controls an acquire-once / hold / run-many session.
@@ -44,6 +43,11 @@ type rampOpts struct {
 	// docs/measured-runs/2026-07-28-qwen-g7e-spot-ramp.md). Empty => today's
 	// single-region behavior, unchanged.
 	fallbackRegions []string
+	// script, when set, is a Modal script to parse for its REAL .map()/
+	// .starmap() iterable (calque#136) — opt-in; "" (the default) reproduces
+	// today's synthesized-prompt behavior exactly, since runRamp doesn't
+	// otherwise parse any script at all.
+	script string
 }
 
 // runRamp acquires ONE GPU instance (patiently — acquisition is the expensive,
@@ -212,10 +216,14 @@ func runRamp(o rampOpts) (err error) {
 	}
 	fmt.Printf("[prep] image pulled; instance ready. Running ramp %v.\n", o.rungs)
 
-	// Run each rung on the held instance via SSM.
+	// Run each rung on the held instance via SSM. calque#136: parse --script (if
+	// any) ONCE, up front, rather than per-rung — its real .map()/.starmap()
+	// iterable doesn't change between rungs, only how many of its items each
+	// rung's own --n draws from.
 	rates, _ := cost.LoadRates(o.ratesFP)
+	unit, _ := warmUnitForScript(ctx, o.script, rep)
 	for _, n := range o.rungs {
-		if rerr := runRung(ctx, spawnClient, s3c, o, acquired, sessBase, n, rates, rep); rerr != nil {
+		if rerr := runRung(ctx, spawnClient, s3c, o, acquired, sessBase, n, rates, rep, unit); rerr != nil {
 			fmt.Fprintf(os.Stderr, "rung N=%d failed: %v (continuing to teardown)\n", n, rerr)
 			// keep going to teardown; a failed rung shouldn't leak the instance
 			break
@@ -229,7 +237,7 @@ func runRamp(o rampOpts) (err error) {
 
 // runRung drives one N-value test onto the held instance over SSM and emits its K.
 func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o rampOpts,
-	acq plan.Acquired, sessBase string, n int, rates *cost.Rates, rep *leak.Report) error {
+	acq plan.Acquired, sessBase string, n int, rates *cost.Rates, rep *leak.Report, unit warmUnit) error {
 	fmt.Printf("\n========== RUNG N=%d ==========\n", n)
 	rungBase := fmt.Sprintf("%s/rung-%d", sessBase, n)
 	layout := calexec.RunLayout{
@@ -238,10 +246,12 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o rampOpt
 		SummaryKey: rungBase + "/summary.json", LogKey: rungBase + "/test.log",
 		Concurrency: o.concurrency, BatchSize: o.batchSize,
 	}
-	items := make([]warm.Item, n)
-	for i := range items {
-		items[i] = warm.Item{Index: i, Payload: fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)}
-	}
+	// calque#136: this rung's real items when --script named one long enough
+	// for THIS rung's own n, else the pre-existing synthesized placeholder —
+	// unchanged when --script is unset.
+	items := realOrSyntheticItems(unit, n, func(i int) any {
+		return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
+	}, rep)
 	// Batch mode uses the LIST-shaped body + arg `prompts` (one vLLM .generate(list)
 	// call per batch); the default single-item path is unchanged.
 	methodBody, methodArg := realMethodBody, "prompt"

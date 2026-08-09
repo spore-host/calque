@@ -192,17 +192,18 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 	poolFlag := fs.Bool("pool", false, "submit to the existing model pool (via `calque pool create --model M`) instead of self-acquiring a dedicated instance (calque#103)")
 	spot := fs.Bool("spot", false, "acquire on the Spot market (different capacity pool than on-demand; interruptible; K is then a SPOT rate)")
 	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
+	script := fs.String("script", "", "optional Modal script to parse for its REAL .map()/.starmap() iterable (calque#136); empty => today's synthesized-prompt items, unchanged")
 	confirmFlag := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
 	if err := fs.Parse(args); err != nil {
 		return realOpts{}, 0, false, false, err
 	}
 	if *bucket == "" || *runID == "" {
-		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] --i-understand-this-spends-money")
+		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] --i-understand-this-spends-money")
 	}
 	opts = realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
-		spot: *spot, spotMaxPrice: *spotMaxPrice,
+		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script,
 	}
 	return opts, *shardsFlag, *poolFlag, *confirmFlag, nil
 }
@@ -228,12 +229,13 @@ func rampCmd(args []string) error {
 	prepMin := fs.Int("prep-timeout-min", 30, "minutes to wait for the one-time docker image pull before giving up")
 	concurrency := fs.Int("concurrency", 1, "items in flight per rung for THREAD-SAFE bodies (guarded off for vLLM-offline; use --batch-size there)")
 	batchSize := fs.Int("batch-size", 1, "items per micro-batch: one vLLM .generate(list) call fills the GPU — the real occupancy lever (1 = per-item)")
+	script := fs.String("script", "", "optional Modal script to parse for its REAL .map()/.starmap() iterable (calque#136); empty => today's synthesized-prompt items, unchanged")
 	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance held for hours")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *bucket == "" || *runID == "" {
-		return fmt.Errorf("usage: calque ramp --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] [--rungs 1,100,1000] [--spot] --i-understand-this-spends-money")
+		return fmt.Errorf("usage: calque ramp --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] [--rungs 1,100,1000] [--spot] [--script FILE.py] --i-understand-this-spends-money")
 	}
 	if !*confirm {
 		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money (holds a billable GPU for up to the TTL)")
@@ -250,6 +252,7 @@ func rampCmd(args []string) error {
 		prepTimeout: time.Duration(*prepMin) * time.Minute,
 		concurrency: *concurrency, batchSize: *batchSize,
 		fallbackRegions: splitComma(*fallbackRegionsCSV),
+		script:          *script,
 	})
 }
 
