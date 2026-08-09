@@ -21,13 +21,15 @@ import (
 
 // smokeOpts controls the acquire-only smoke test — the FIRST billable action.
 type smokeOpts struct {
-	bucket   string
-	region   string
-	runID    string
-	ttl      string
-	deadline time.Duration
-	instance string // override the resolved instance (capacity fallback, e.g. g6.2xlarge)
-	ami      string // pinned AMI (spawn's GPU auto-select is broken; see spawn issue)
+	bucket       string
+	region       string
+	runID        string
+	ttl          string
+	deadline     time.Duration
+	instance     string // override the resolved instance (capacity fallback, e.g. g6.2xlarge)
+	ami          string // pinned AMI (spawn's GPU auto-select is broken; see spawn issue)
+	spot         bool   // acquire on the Spot market (different capacity pool than on-demand)
+	spotMaxPrice string // $/hr bid cap; "" => spawn caps at on-demand price
 }
 
 // smoke is the acquire-only smoke test (§16.1 de-risking): acquire a g7e, run
@@ -124,7 +126,20 @@ func smoke(o smokeOpts) (err error) {
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
 		Username: "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
+		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 	}.Build()
+	if o.spot {
+		// Honesty (§9/§10): a spot smoke test acquires against a SPOT R_a, and the
+		// box can be reclaimed mid-run. Say so loudly and leak it, so any downstream
+		// number is never read as the on-demand headline number.
+		bidCap := o.spotMaxPrice
+		if bidCap == "" {
+			bidCap = "on-demand price"
+		}
+		fmt.Printf("[spot] acquiring on the SPOT market (max bid %s). NOTE: interruptible mid-run.\n", bidCap)
+		rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "smoke", 0,
+			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
+	}
 	acq := &plan.Acquirer{
 		LaunchConfig: launchCfg, Report: rep, Deadline: o.deadline, Placements: places,
 		OnProgress: func(attempt int, code, detail string, waited time.Duration) {

@@ -25,16 +25,18 @@ import (
 
 // realOpts controls a real GPU inference run — the headline-K vehicle.
 type realOpts struct {
-	bucket   string
-	region   string
-	runID    string
-	instance string
-	ami      string
-	model    string // HF repo id, e.g. "Qwen/Qwen2.5-1.5B-Instruct"
-	n        int    // number of prompts
-	ttl      string
-	deadline time.Duration
-	ratesFP  string
+	bucket       string
+	region       string
+	runID        string
+	instance     string
+	ami          string
+	model        string // HF repo id, e.g. "Qwen/Qwen2.5-1.5B-Instruct"
+	n            int    // number of prompts
+	ttl          string
+	deadline     time.Duration
+	ratesFP      string
+	spot         bool   // acquire on the Spot market (different capacity pool than on-demand)
+	spotMaxPrice string // $/hr bid cap; "" => spawn caps at on-demand price
 }
 
 // The real warm-unit bodies: actual vLLM. @enter loads the model ONCE; the
@@ -140,7 +142,21 @@ func realRun(o realOpts) (err error) {
 		Username: "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
 		IMDSv2HopLimit: 2,   // warmd runs INSIDE docker; needs IMDS creds one hop away
 		RootVolumeGiB:  200, // vLLM image + weights blow past spawn's 20 GiB default
+		Spot:           o.spot, SpotMaxPrice: o.spotMaxPrice,
 	}.Build()
+	if o.spot {
+		// Honesty (§9/§10): a spot run measures K against a SPOT R_a, and the box
+		// can be reclaimed mid-run. Say so loudly and leak it, so the resulting K
+		// is never read as the on-demand headline number.
+		bidCap := o.spotMaxPrice
+		if bidCap == "" {
+			bidCap = "on-demand price"
+		}
+		fmt.Printf("[spot] acquiring on the SPOT market (max bid %s). NOTE: interruptible mid-run; "+
+			"any K measured here is against a SPOT rate, NOT the on-demand headline K.\n", bidCap)
+		rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "real", 0,
+			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
+	}
 	acq := &plan.Acquirer{
 		LaunchConfig: launchCfg, Report: rep, Deadline: o.deadline, Placements: places,
 		OnProgress: func(attempt int, code, detail string, waited time.Duration) {

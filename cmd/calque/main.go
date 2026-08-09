@@ -103,6 +103,22 @@ func runCmd(args []string) error {
 // behind an explicit --i-understand-this-spends-money flag so it can never fire
 // by accident.
 func smokeCmd(args []string) error {
+	o, confirm, err := parseSmokeArgs(args)
+	if err != nil {
+		return err
+	}
+	if !confirm {
+		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money (this acquires a billable g7e)")
+	}
+	return smoke(o)
+}
+
+// parseSmokeArgs parses `calque smoke`'s flags into a smokeOpts (plus the
+// separate --i-understand-this-spends-money confirmation, checked by the
+// caller) without launching anything — split out from smokeCmd so flag
+// wiring (in particular --spot/--spot-max-price, calque#94) is unit-testable
+// on its own.
+func parseSmokeArgs(args []string) (smokeOpts, bool, error) {
 	fs := flag.NewFlagSet("smoke", flag.ExitOnError)
 	bucket := fs.String("bucket", "", "S3 bucket for artifacts/results (required)")
 	region := fs.String("region", "us-west-2", "AWS region")
@@ -111,25 +127,51 @@ func smokeCmd(args []string) error {
 	deadlineMin := fs.Int("deadline-min", 20, "give up acquiring/waiting after N minutes")
 	instance := fs.String("instance", "", "override instance type (capacity fallback, e.g. g6.2xlarge); empty => g7e.2xlarge")
 	ami := fs.String("ami", "", "pin the AMI (spawn's GPU auto-select is broken); empty => let spawn choose")
+	spot := fs.Bool("spot", false, "acquire on the Spot market (different capacity pool than on-demand; interruptible; K is then a SPOT rate)")
+	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
 	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable g7e")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return smokeOpts{}, false, err
 	}
 	if *bucket == "" || *runID == "" {
-		return fmt.Errorf("usage: calque smoke --bucket B --run-id ID [--region R] [--ttl 30m] --i-understand-this-spends-money")
+		return smokeOpts{}, false, fmt.Errorf("usage: calque smoke --bucket B --run-id ID [--region R] [--ttl 30m] [--spot] --i-understand-this-spends-money")
 	}
-	if !*confirm {
-		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money (this acquires a billable g7e)")
-	}
-	return smoke(smokeOpts{
+	return smokeOpts{
 		bucket: *bucket, region: *region, runID: *runID, ttl: *ttl,
 		deadline: time.Duration(*deadlineMin) * time.Minute, instance: *instance, ami: *ami,
-	})
+		spot: *spot, spotMaxPrice: *spotMaxPrice,
+	}, *confirm, nil
 }
 
 // realCmd runs a REAL GPU inference run — the measured-K vehicle. Gated behind
 // --i-understand-this-spends-money (launches a billable GPU instance).
 func realCmd(args []string) error {
+	opts, shards, pool, confirm, err := parseRealArgs(args)
+	if err != nil {
+		return err
+	}
+	if !confirm {
+		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money")
+	}
+	if shards > opts.n {
+		return fmt.Errorf("--shards %d exceeds --n %d (a shard would be empty)", shards, opts.n)
+	}
+	if pool {
+		if shards > 1 {
+			return fmt.Errorf("--pool and --shards>1 are mutually exclusive: a pool submission is one claim against one already-provisioned pool, not a fleet acquisition")
+		}
+		return realRunViaPool(opts)
+	}
+	// shards>1 fans out across a fleet (§15); shards<=1 is the single-instance path.
+	return fleetRun(opts, shards)
+}
+
+// parseRealArgs parses `calque real`'s flags into a realOpts (plus shards,
+// --pool, and the separate --i-understand-this-spends-money confirmation,
+// checked by the caller) without launching anything — split out from realCmd
+// so flag wiring (in particular --spot/--spot-max-price, calque#94) is
+// unit-testable on its own.
+func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm bool, err error) {
 	fs := flag.NewFlagSet("real", flag.ExitOnError)
 	bucket := fs.String("bucket", "", "S3 bucket (required)")
 	region := fs.String("region", "us-east-1", "AWS region")
@@ -138,36 +180,26 @@ func realCmd(args []string) error {
 	ami := fs.String("ami", "", "pin the AMI; empty => spawn auto-selects a GPU-capable AMI (verified working on g6/g6e/g7/g7e, calque#75)")
 	model := fs.String("model", "Qwen/Qwen2.5-1.5B-Instruct", "HF model repo id (must NOT be on Bedrock)")
 	n := fs.Int("n", 1, "number of prompts (N=1 validates inference; N~100 for amortized K)")
-	shards := fs.Int("shards", 1, "fan out .map across N single-node instances acquired in parallel (§15 fleet; 1 => single instance)")
+	shardsFlag := fs.Int("shards", 1, "fan out .map across N single-node instances acquired in parallel (§15 fleet; 1 => single instance)")
 	ttl := fs.String("ttl", "40m", "instance TTL hard cap")
 	deadlineMin := fs.Int("deadline-min", 40, "give up acquiring/waiting after N minutes")
 	rates := fs.String("rates", "config/rates.json", "rate table path")
-	pool := fs.Bool("pool", false, "submit to the existing model pool (via `calque pool create --model M`) instead of self-acquiring a dedicated instance (calque#103)")
-	confirm := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
+	poolFlag := fs.Bool("pool", false, "submit to the existing model pool (via `calque pool create --model M`) instead of self-acquiring a dedicated instance (calque#103)")
+	spot := fs.Bool("spot", false, "acquire on the Spot market (different capacity pool than on-demand; interruptible; K is then a SPOT rate)")
+	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
+	confirmFlag := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return realOpts{}, 0, false, false, err
 	}
 	if *bucket == "" || *runID == "" {
-		return fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
+		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] --i-understand-this-spends-money")
 	}
-	if !*confirm {
-		return fmt.Errorf("refusing to launch: pass --i-understand-this-spends-money")
-	}
-	if *shards > *n {
-		return fmt.Errorf("--shards %d exceeds --n %d (a shard would be empty)", *shards, *n)
-	}
-	opts := realOpts{
+	opts = realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
+		spot: *spot, spotMaxPrice: *spotMaxPrice,
 	}
-	if *pool {
-		if *shards > 1 {
-			return fmt.Errorf("--pool and --shards>1 are mutually exclusive: a pool submission is one claim against one already-provisioned pool, not a fleet acquisition")
-		}
-		return realRunViaPool(opts)
-	}
-	// shards>1 fans out across a fleet (§15); shards<=1 is the single-instance path.
-	return fleetRun(opts, *shards)
+	return opts, *shardsFlag, *poolFlag, *confirmFlag, nil
 }
 
 // rampCmd runs the acquire-once / hold / run-many ramp — the efficient way

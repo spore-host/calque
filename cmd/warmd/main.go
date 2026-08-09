@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -207,6 +208,19 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 	sampler.Stdout = &occSummaryBuf
 	occStarted := sampler.Start() == nil
 
+	// Start the spot-interruption-notice poller (calque#94, gap 2): polls IMDS
+	// for the EC2 2-minute spot interruption warning while the run is in
+	// flight. This is intentionally NOT a new recovery protocol — on detecting
+	// a notice it just leaks it loudly (a distinct kind from an ordinary crash)
+	// and lets the existing flow continue to its normal summary-write path.
+	// The existing crash-restart/re-drive machinery (warm.Supervisor here,
+	// fleetrun.go's shard re-drive at the control-plane layer) already handles
+	// a box disappearing out from under a run; this just makes the CAUSE
+	// distinguishable in the log rather than looking like an ordinary crash.
+	interruptCtx, stopInterruptPoll := context.WithCancel(ctx)
+	defer stopInterruptPoll()
+	go pollSpotInterruption(interruptCtx, stderrLeaker{})
+
 	started := time.Now()
 	sink := &calexec.S3Sink{Client: s3c, Bucket: man.Bucket, Prefix: man.ResultPrefix}
 	sup := &warm.Supervisor{
@@ -343,4 +357,62 @@ type stderrLeaker struct{}
 
 func (stderrLeaker) Leak(kind, detail string) {
 	fmt.Fprintf(os.Stderr, "LEAK[%s] %s\n", kind, detail)
+}
+
+// spotInterruptionURL is EC2's instance-metadata endpoint for the 2-minute
+// spot interruption warning (calque#94). It 404s until an interruption is
+// actually pending. A package-level var so a test can point it at an
+// httptest.Server standing in for IMDS.
+var spotInterruptionURL = "http://169.254.169.254/latest/meta-data/spot/instance-action"
+
+// spotInterruptionPollInterval is how often pollSpotInterruption checks IMDS.
+// A package-level var so a test can shrink it instead of waiting ~5s per poll.
+var spotInterruptionPollInterval = 5 * time.Second
+
+// spotLeaker is the subset of warm.Leaker's shape pollSpotInterruption needs
+// (stderrLeaker satisfies it; kept minimal so a test can supply a stub without
+// depending on warm-runner).
+type spotLeaker interface {
+	Leak(kind, detail string)
+}
+
+// pollSpotInterruption polls the EC2 spot-interruption-notice metadata
+// endpoint every spotInterruptionPollInterval until ctx is done. The endpoint
+// returns 404 until an interruption is actually pending, so any non-200
+// response is treated as "no interruption yet" — never an error, never a
+// retry storm. On the first 200 response it leaks a clearly distinct
+// "spot_interruption" record (so it reads as a warning, not an ordinary
+// crash) and keeps polling until ctx is cancelled — a repeated warning is
+// harmless, and this deliberately does NOT layer any new early-exit/flush
+// logic on top (calque#94's scope note: don't over-design; the existing
+// crash-restart/re-drive machinery already handles the box disappearing).
+func pollSpotInterruption(ctx context.Context, leak spotLeaker) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	ticker := time.NewTicker(spotInterruptionPollInterval)
+	defer ticker.Stop()
+	warned := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, spotInterruptionURL, nil)
+			if err != nil {
+				continue
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				continue // no signal, not an error — IMDS may be transiently unreachable
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				continue // 404 (the common case): no interruption pending
+			}
+			if !warned {
+				warned = true
+				leak.Leak("spot_interruption", "EC2 spot interruption notice received (instance-action metadata returned 200) — "+
+					"this box will be reclaimed within ~2 minutes; the run continues to its normal summary-write path (calque#94)")
+			}
+		}
+	}
 }

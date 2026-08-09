@@ -99,6 +99,21 @@ func fleetRun(o realOpts, shards int) (err error) {
 		}
 	}
 
+	if o.spot {
+		// Honesty (§9/§10): a spot fleet measures K against a SPOT R_a, and any
+		// shard's instance can be reclaimed mid-run. Say so loudly and leak it ONCE
+		// for the whole fleet (the flag is shared fleet-wide, not per-shard), so the
+		// resulting fleet K is never read as the on-demand headline number.
+		bidCap := o.spotMaxPrice
+		if bidCap == "" {
+			bidCap = "on-demand price"
+		}
+		fmt.Printf("[spot] fleet acquiring on the SPOT market (max bid %s). NOTE: any shard's instance is "+
+			"interruptible mid-run; any K measured here is against a SPOT rate, NOT the on-demand headline K.\n", bidCap)
+		rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "fleet", 0,
+			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
+	}
+
 	// D2: launch every shard's acquire+bootstrap IN PARALLEL. Each shard is fully
 	// independent; a leak.Report is shared, so guard it with a mutex.
 	var repMu sync.Mutex
@@ -182,6 +197,7 @@ func runShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Client,
 		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
 		Username: "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
+		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
 	tgt := &target.Target{Card: target.DefaultCard, Instance: o.instance}
