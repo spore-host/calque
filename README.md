@@ -94,8 +94,8 @@ them apart:
 | `gpu=` swap guard (§7) | ✅ | ✅ | ✅ corpus |
 | Bedrock gate + route-away (§11) | ✅ | ✅ (live catalog) | n/a |
 | Idiom pass-through (§C) | ✅ | n/a | n/a |
-| Single-instance warm run (§6) | ✅ | ✅ (L4, Qwen2.5-1.5B) | ✅ N=100 |
-| Cost + crossover K (§9) | ✅ | ✅ (all `[measured]`) | ✅ N=100 |
+| Single-instance warm run (§6) | ✅ | ✅ (L4 + RTX PRO 6000, Qwen2.5-1.5B) | ✅ N=1000 |
+| Cost + crossover K (§9) | ✅ | ✅ (all `[measured]`, STAY ON MODAL every rung run so far) | ⏳ N=100 on-demand CROSS still unconfirmed ([template](docs/measured-runs/TEMPLATE-qwen-l4-n100.md)) |
 | Volume sync + commit write-back (§3/§15) | ✅ | ✅ (sync) | — |
 | Multi-instance fan-out / fleet K (§15) | ✅ | ⏳ pending capacity | ⏳ pending N=100k ([#18](https://github.com/spore-host/calque/issues/18)) |
 | Serve entrypoints (§F) | detect + leak only | ❌ not built | ❌ |
@@ -136,22 +136,34 @@ The per-capability detail follows; nothing is removed, only sequenced under the 
 - **full pipeline** — `calque run --dry-run` runs every stage locally; `calque session` acquires one
   GPU and runs an N-ramp on it; `calque real --shards N` fans out across a fleet.
 
-**Real measured crossover K — achieved on a live GPU.** A real run (Qwen2.5-1.5B on an L4, all
-`[measured]`, no proxies) produced the headline number:
+**Real measured crossover K — the phase detector working, honestly, on live GPUs.** Every
+run below is committed with raw provenance in
+[`docs/measured-runs/`](docs/measured-runs/README.md) — no number here is claimed without an
+auditable record behind it (see that index's own template-vs-complete distinction):
 
-- N=100: `@enter` ran **once** (102.7s load), **1.583s/item**, **59% measured occupancy** → **K ≈ 73 items**
-  on-demand (~18 with a Savings Plan); verdict at 100k = **CROSS**.
-- N=1: same load amortized over one item → 5% occupancy → **STAY ON MODAL**.
+- **g7e.2xlarge / RTX PRO 6000 (the spike's target card), spot, N-ramp 1/100/1000:**
+  `@enter` loaded once (~173–207s), **0.36–0.40s/item**, occupancy climbing 0.4%→12%→45%
+  as N grows — **STAY ON MODAL at every rung.** At these single-stream occupancies AWS's
+  per-item cost never undercuts Modal's; this is the phase detector saying "not yet," not a
+  failure. See [`2026-07-28-qwen-g7e-spot-ramp.md`](docs/measured-runs/2026-07-28-qwen-g7e-spot-ramp.md).
+- **Same card, N=1000, `--batch-size 32`:** micro-batching made inference ~24x faster
+  per item (0.015s/item) — and *still* **STAY ON MODAL**, because batching cuts Modal's bill too
+  (busy-GPU-seconds billing). See [`2026-07-29-qwen-g7e-batch32.md`](docs/measured-runs/2026-07-29-qwen-g7e-batch32.md).
+- **L4 / g6.2xlarge, N=1:** 1.70s/item, 5% occupancy — **STAY ON MODAL**. See
+  [`2026-07-16-qwen-l4-n1.md`](docs/measured-runs/2026-07-16-qwen-l4-n1.md).
 
-> **Occupancy scope (#71):** those occupancy percentages are `whole_run` means — averaged over
-> the *whole* rung including the one-time model load, so they understate steady-state GPU fill
-> and are not recomputable (those runs' samples were not timestamped). Occupancy now carries an
-> explicit `scope` (`inference` vs `whole_run`); see
-> [`docs/measured-runs/README.md`](docs/measured-runs/README.md). Per-item seconds, load times,
-> and the verdicts are unaffected.
+**No committed run has crossed yet.** An on-demand N≈100 CROSS verdict (K ≈ 73 items) was
+reported here previously without a backing raw artifact — that was a process failure (a
+claimed number that skipped this project's own provenance discipline), not a measured result.
+It's been retracted pending an actual run against the
+[open template](docs/measured-runs/TEMPLATE-qwen-l4-n100.md); every occupancy figure above is
+a `whole_run` mean (#71) — see the caveat in
+[`docs/measured-runs/README.md`](docs/measured-runs/README.md) for why that's conservative in
+Modal's favor, not AWS's.
 
-The N=1↔N=100 contrast is the phase detector working: same code, same model, honest verdict at each
-scale (§9). Getting real inference end-to-end surfaced five genuine deployment findings, each caught
+The N=1→N=1000 occupancy climb (0.4%→45%) across the g7e ramp is the phase detector working: same
+code, same model, honest verdict at each scale (§9) — no crossover yet, reported plainly rather than
+rounded up. Getting real inference end-to-end surfaced five genuine deployment findings, each caught
 fast and fixed: worker dir `/opt`→`/tmp`, docker needs `sudo`, IMDSv2 hop-limit 2 for container creds,
 200 GiB root volume for the vLLM image, and vLLM's stdout logs colliding with the warm-worker JSON
 protocol (the §6 "socket draws blood" edge — now isolated + regression-tested).

@@ -76,3 +76,7 @@ structured leak naming the gap — never a silent drop or a mysterious crash.
   today, [#92](https://github.com/spore-host/calque/issues/92)).
 - N=100k multi-instance rung not yet run at real scale
   ([#18](https://github.com/spore-host/calque/issues/18)).
+- No committed run has crossed yet — every completed, provenance-recorded run
+  (see [`docs/measured-runs/`](docs/measured-runs/README.md)) verdicts STAY ON
+  MODAL. An earlier README claim of an on-demand N≈100 CROSS (K≈73) was never
+  backed by a raw artifact and has been retracted.
