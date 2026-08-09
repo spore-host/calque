@@ -21,8 +21,8 @@ import (
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
-// sessionOpts controls an acquire-once / hold / run-many session.
-type sessionOpts struct {
+// rampOpts controls an acquire-once / hold / run-many session.
+type rampOpts struct {
 	bucket          string
 	region          string
 	runID           string
@@ -40,15 +40,15 @@ type sessionOpts struct {
 	batchSize       int           // items per micro-batch (real vLLM occupancy lever); 0/1 => per-item
 }
 
-// runSession acquires ONE GPU instance (patiently — acquisition is the expensive,
+// runRamp acquires ONE GPU instance (patiently — acquisition is the expensive,
 // hard part, so we hold it), prepares it once (docker + vLLM image pull), then
 // drives the whole N-ramp onto it over SSM, computing K per rung. The instance is
 // held for the entire ramp and terminated only at the end. This amortizes the
 // painful acquisition across every test instead of re-acquiring per test.
-func runSession(o sessionOpts) (err error) {
+func runRamp(o rampOpts) (err error) {
 	ctx := context.Background()
 	rep := &leak.Report{}
-	fmt.Printf("=== calque SESSION (acquire-once, hold, run %v) model=%s instance=%s ===\n", o.rungs, o.model, o.instance)
+	fmt.Printf("=== calque RAMP (acquire-once, hold, run %v) model=%s instance=%s ===\n", o.rungs, o.model, o.instance)
 
 	// Route-away gate (§11, G3): refuse to hold a billable GPU for a model that's
 	// already an exact Bedrock API call, before the (slow, expensive) acquisition.
@@ -194,7 +194,7 @@ func runSession(o sessionOpts) (err error) {
 }
 
 // runRung drives one N-value test onto the held instance over SSM and emits its K.
-func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o sessionOpts,
+func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o rampOpts,
 	acq plan.Acquired, sessBase string, n int, rates *cost.Rates, rep *leak.Report) error {
 	fmt.Printf("\n========== RUNG N=%d ==========\n", n)
 	rungBase := fmt.Sprintf("%s/rung-%d", sessBase, n)

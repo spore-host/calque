@@ -136,7 +136,7 @@ The per-capability detail follows; nothing is removed, only sequenced under the 
 - **serve entrypoints** (§F) — `@web_endpoint`/`@asgi_app`/`@wsgi_app` are **detected and leaked** as a
   deferred shape (batch is the shape the spike runs); a served *Bedrock* model still routes away. The
   long-lived server is not built — see `docs/serve-architecture.md`.
-- **full pipeline** — `calque run --dry-run` runs every stage locally; `calque session` acquires one
+- **full pipeline** — `calque run --dry-run` runs every stage locally; `calque ramp` acquires one
   GPU and runs an N-ramp on it; `calque real --shards N` fans out across a fleet.
 
 **Real inference, verified on live GPUs.** Getting real inference end-to-end surfaced
@@ -190,12 +190,12 @@ calque smoke   --bucket B --run-id ID [--region R] [--ttl 30m] \
 calque real    --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] \
       [--model HF_REPO] [--n 1] [--shards 1] \                  # single instance, or --shards N to fan out
       --i-understand-this-spends-money                          #   across a fleet (§15)
-calque session --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] \
+calque ramp    --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] \
       [--rungs 1,100,1000] \                                    # acquire once, hold, run every rung on it
       --i-understand-this-spends-money
 ```
 
-The route-away gate runs on `run`/`real`/`session` too: if the model (or `--model`) is already an exact
+The route-away gate runs on `run`/`real`/`ramp` too: if the model (or `--model`) is already an exact
 Bedrock API call, calque prints the offer and stops **before** acquiring anything.
 
 ## Institutional GPU sharing

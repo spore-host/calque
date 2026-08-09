@@ -5,17 +5,19 @@ scoped have since shipped as real code — `internal/mig` (MIG slice
 provisioning), `internal/mps` (MPS trusted-tenant mode), `internal/tenancy`
 (generic check-out/check-in registry), closed via #107/#108. The CLI-level
 rename this note calls for (`calque session` → `calque ramp`, freeing
-`session` for the new interactive-tenancy verb) has NOT shipped yet —
-tracked at #117. So: primitives done, naming/CLI still pending.
+`session` for the new interactive-tenancy verb) has now shipped (#117,
+`cmd/calque/ramp.go`). The new `calque session` (interactive tenancy)
+CLI verb itself is still unbuilt — see "What this unblocks" below.
 
 ## The collision
 
-`cmd/calque/session.go` today implements **acquire-once, hold, run-many**:
-one instance is acquired patiently (acquisition is the slow, expensive part),
-held for an entire N-item ramp (`sessionOpts.rungs`), and terminated only at
-the end (`session.go:39-48`'s doc comment: "amortizes the painful acquisition
-across every test instead of re-acquiring per test"). It is single-tenant —
-one `calque session` invocation, one user, one instance, for the whole ramp.
+`cmd/calque/ramp.go` (formerly `session.go`, renamed by #117) implements
+**acquire-once, hold, run-many**: one instance is acquired patiently
+(acquisition is the slow, expensive part), held for an entire N-item ramp
+(`rampOpts.rungs`), and terminated only at the end (`ramp.go`'s doc comment:
+"amortizes the painful acquisition across every test instead of
+re-acquiring per test"). It is single-tenant — one `calque ramp` invocation,
+one user, one instance, for the whole ramp.
 
 M13's institutional-sharing design needs a **different** thing: one
 university user's bounded interactive occupancy of a MIG slice or MPS
@@ -46,11 +48,9 @@ in docs, the CLI, and support conversations if left undisambiguated.
    ramp of item counts for verification, not as an end-user workflow.
    Renaming the less-user-facing verb is the smaller disruption.
 
-This is a rename ONLY — `cmd/calque/session.go`'s behavior, flags, and
-acquire-once/hold/run-many contract are UNCHANGED. Renaming the file and CLI
-verb (`calque session` → `calque ramp`) is left to the implementation issue
-that actually needs to touch that code path (not bundled into this
-design-only issue, consistent with #106's own "no code" scope).
+This was a rename ONLY — `cmd/calque/ramp.go`'s behavior, flags, and
+acquire-once/hold/run-many contract are UNCHANGED from the pre-rename
+`session.go`. The rename shipped via #117.
 
 ## The new primitive: `calque session` (interactive tenancy)
 
@@ -126,6 +126,6 @@ already provisioned, rather than provisioning it.
   software-cooperative (MPS), not in how a user checks in/out.
 - **#109 (M12/M13 joint boundary doc)**: can cite this note's boundary
   statement directly rather than re-deriving it.
-- **A future rename issue** for `cmd/calque/session.go` → `cmd/calque/ramp.go`
-  (`calque session` → `calque ramp`) is now well-defined; not attempted here
-  per this issue's own explicit "design-only, no code" scope.
+- **The `session`→`ramp` rename**: shipped (#117) — `session` is now free
+  for the new interactive-tenancy verb described above, which is not yet
+  built.

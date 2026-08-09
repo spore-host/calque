@@ -142,8 +142,8 @@ MPS context) with a SEPARATE, fleet-layer failure mode:
   serves, not just the one user a dedicated (non-shared) spot instance would
   have affected. This should be surfaced explicitly wherever a future
   implementation issue wires tenancy on top of a spot-acquired instance —
-  the existing spot leak (`session.go`'s "spot acquisition: R_a is a spot
-  rate and the instance is interruptible" leak, see `realOpts`/`sessionOpts`
+  the existing spot leak (`ramp.go`'s "spot acquisition: R_a is a spot
+  rate and the instance is interruptible" leak, see `realOpts`/`rampOpts`
   callers) is per-RUN; a tenancy-aware version needs to say "interruptible,
   AND N other users' sessions are equally exposed," not just restate the
   single-tenant framing.

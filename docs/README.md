@@ -15,9 +15,9 @@ guessing from filenames.
   request-driven entrypoints (`@web_endpoint`/`@asgi_app`/etc.) are detected
   and leaked but the server itself isn't built.
 - [`tenancy-vs-session.md`](tenancy-vs-session.md) — why `calque session`
-  (today's acquire-once/hold/run-many verb) is being renamed `calque ramp`,
-  and what the new `calque session` (multi-tenant MIG/MPS slice check-out)
-  actually means.
+  (the acquire-once/hold/run-many verb) was renamed `calque ramp` (shipped,
+  #117), and what the new `calque session` (multi-tenant MIG/MPS slice
+  check-out, not yet built) will actually mean.
 - [`gpu-sharing-support-matrix.md`](gpu-sharing-support-matrix.md) — which
   GPU families/generations actually support MIG vs. MPS, verified against
   live hardware rather than assumed from datasheets.
