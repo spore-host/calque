@@ -2,6 +2,7 @@ package mps
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -26,7 +27,10 @@ func TestRequireOptInRefusesByDefault(t *testing.T) {
 // registered client sharing that MPS context — including itself and every
 // sibling, not just the one that actually crashed.
 func TestConservativeCoordinatorRestartsEveryClientOnAnyCrash(t *testing.T) {
-	c := NewCoordinator(Conservative)
+	c, err := NewCoordinator(Conservative)
+	if err != nil {
+		t.Fatalf("NewCoordinator(Conservative) = %v, want nil error", err)
+	}
 
 	var mu sync.Mutex
 	restarted := map[ClientID]int{}
@@ -57,7 +61,10 @@ func TestConservativeCoordinatorRestartsEveryClientOnAnyCrash(t *testing.T) {
 // client (e.g. it finished its work and checked in via tenancy.CheckIn) is
 // not spuriously "restarted" after it's gone.
 func TestUnregisterExcludesClientFromFutureFanout(t *testing.T) {
-	c := NewCoordinator(Conservative)
+	c, err := NewCoordinator(Conservative)
+	if err != nil {
+		t.Fatalf("NewCoordinator(Conservative) = %v, want nil error", err)
+	}
 	calls := 0
 	c.Register("client-0", func(ClientID) { calls++ })
 	c.Register("client-1", func(ClientID) { calls++ })
@@ -70,20 +77,36 @@ func TestUnregisterExcludesClientFromFutureFanout(t *testing.T) {
 	}
 }
 
-// TestOptimisticPolicyPanicsRatherThanSilentlyNoOp proves selecting the
-// unimplemented Optimistic policy fails LOUDLY (a panic a test catches
-// immediately) rather than silently doing nothing, which would look like a
-// working isolation guarantee MPS does not actually provide.
-func TestOptimisticPolicyPanicsRatherThanSilentlyNoOp(t *testing.T) {
-	c := NewCoordinator(Optimistic)
-	c.Register("client-0", func(ClientID) {})
+// TestOptimisticPolicyErrorsAtConstruction proves selecting the unimplemented
+// Optimistic policy fails LOUDLY at NewCoordinator construction time (an
+// error a caller must handle immediately) rather than succeeding silently
+// and only failing later, deep inside NotifyCrash, when a crash actually
+// happens in production — which would look like a working isolation
+// guarantee MPS does not actually provide until it was too late to matter.
+func TestOptimisticPolicyErrorsAtConstruction(t *testing.T) {
+	c, err := NewCoordinator(Optimistic)
+	if err == nil {
+		t.Fatal("NewCoordinator(Optimistic) = nil error, want an error (Optimistic is not implemented)")
+	}
+	if c != nil {
+		t.Errorf("NewCoordinator(Optimistic) = %v, want nil Coordinator alongside the error", c)
+	}
+	if !strings.Contains(err.Error(), "Optimistic") {
+		t.Errorf("NewCoordinator(Optimistic) error = %q, want it to mention the Optimistic policy by name", err.Error())
+	}
+}
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("NotifyCrash under Optimistic policy did not panic; want a loud failure, not a silent no-op")
-		}
-	}()
-	c.NotifyCrash("client-0")
+// TestUnknownPolicyErrorsAtConstruction proves any BlastRadiusPolicy value
+// other than Conservative or Optimistic (e.g. an unrecognized string) is
+// also rejected at construction, not just the documented Optimistic case.
+func TestUnknownPolicyErrorsAtConstruction(t *testing.T) {
+	c, err := NewCoordinator(BlastRadiusPolicy("bogus"))
+	if err == nil {
+		t.Fatal("NewCoordinator(\"bogus\") = nil error, want an error (unknown policy)")
+	}
+	if c != nil {
+		t.Errorf("NewCoordinator(\"bogus\") = %v, want nil Coordinator alongside the error", c)
+	}
 }
 
 // TestStartDaemonScriptPinsPipeAndLogDirs proves the emitted script scopes
@@ -129,4 +152,37 @@ func TestClientEnvCarriesThePipeDir(t *testing.T) {
 	if env["CUDA_MPS_PIPE_DIRECTORY"] != "/tmp/mps-0/pipe" {
 		t.Errorf("ClientEnv = %v, want CUDA_MPS_PIPE_DIRECTORY=/tmp/mps-0/pipe", env)
 	}
+}
+
+// TestCoordinatorConcurrentAccessDoesNotRace proves Coordinator.clients is
+// now safe under concurrent Register/Unregister/NotifyCrash calls (calque#126).
+// It doesn't assert on any particular restart count — with Register and
+// Unregister racing against each other, which clients are present at the
+// moment a given NotifyCrash fans out is inherently nondeterministic. The
+// point of this test is solely to give `go test -race` unguarded concurrent
+// map access to catch; run it with `go test -race ./internal/mps/...` to
+// actually exercise that guarantee.
+func TestCoordinatorConcurrentAccessDoesNotRace(t *testing.T) {
+	c, err := NewCoordinator(Conservative)
+	if err != nil {
+		t.Fatalf("NewCoordinator(Conservative) = %v, want nil error", err)
+	}
+
+	const goroutines = 8
+	const iterations = 50
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				id := ClientID(fmt.Sprintf("client-%d", g))
+				c.Register(id, func(ClientID) {})
+				c.NotifyCrash(id)
+				c.Unregister(id)
+			}
+		}(g)
+	}
+	wg.Wait()
 }

@@ -33,6 +33,7 @@ package mps
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // RequireOptIn is the gate every MPS-enabling code path must check before
@@ -108,31 +109,44 @@ type RestartFunc func(client ClientID)
 // Coordinator implements Conservative blast-radius handling: when any one
 // registered client crashes, every OTHER registered client sharing the same
 // MPS context is restarted too. This is the "no per-client isolation" trust
-// model made concrete in code, not just documented.
+// model made concrete in code, not just documented. Safe for concurrent use.
 type Coordinator struct {
+	mu      sync.Mutex
 	policy  BlastRadiusPolicy
 	clients map[ClientID]RestartFunc
 }
 
 // NewCoordinator builds a Coordinator for the given policy. Only
 // Conservative is implemented (see BlastRadiusPolicy's doc) — passing
-// Optimistic returns a Coordinator that panics on NotifyCrash, so a caller
-// that mistakenly wires it up finds out immediately in a test, not silently
-// in production with an unimplemented safety net.
-func NewCoordinator(policy BlastRadiusPolicy) *Coordinator {
-	return &Coordinator{policy: policy, clients: map[ClientID]RestartFunc{}}
+// Optimistic or any other/unknown value returns an error immediately, so a
+// caller that mistakenly wires up an unimplemented policy finds out at
+// construction time (e.g. in a test, or at startup), not later as a panic
+// deep inside NotifyCrash when a crash actually happens in production.
+func NewCoordinator(policy BlastRadiusPolicy) (*Coordinator, error) {
+	switch policy {
+	case Conservative:
+		return &Coordinator{policy: policy, clients: map[ClientID]RestartFunc{}}, nil
+	case Optimistic:
+		return nil, fmt.Errorf("mps: Optimistic blast-radius policy has no implementation yet (see BlastRadiusPolicy doc) — do not select it")
+	default:
+		return nil, fmt.Errorf("mps: unknown BlastRadiusPolicy %q", policy)
+	}
 }
 
 // Register adds a client to the coordinator's crash-fanout set. restart is
 // called for THIS client whenever any registered client (including this one)
 // crashes, under the Conservative policy.
 func (c *Coordinator) Register(id ClientID, restart RestartFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.clients[id] = restart
 }
 
 // Unregister removes a client (e.g. on its own clean shutdown) so a future
 // crash elsewhere does not try to restart a process that no longer exists.
 func (c *Coordinator) Unregister(id ClientID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	delete(c.clients, id)
 }
 
@@ -141,16 +155,22 @@ func (c *Coordinator) Unregister(id ClientID) {
 // client (crashed and siblings alike) gets restarted — the crashed one
 // because it crashed, the siblings because MPS gives no isolation guarantee
 // that their state is uncorrupted just because their own process didn't die.
+//
+// This no longer needs to guard against Optimistic or an unknown policy
+// value: NewCoordinator is the only constructor (policy and clients are
+// unexported, so no other package can build a Coordinator via a struct
+// literal), and it already rejects anything but Conservative. A
+// zero-value Coordinator (e.g. `var c Coordinator`) has policy == "", which
+// the switch below still treats as Conservative, matching NewCoordinator's
+// only valid outcome.
 func (c *Coordinator) NotifyCrash(crashed ClientID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	switch c.policy {
 	case Conservative, "":
 		for id, restart := range c.clients {
 			restart(id)
 		}
-	case Optimistic:
-		panic("mps: Optimistic blast-radius policy has no implementation yet (see BlastRadiusPolicy doc) — do not select it")
-	default:
-		panic(fmt.Sprintf("mps: unknown BlastRadiusPolicy %q", c.policy))
 	}
 }
 
