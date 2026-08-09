@@ -670,6 +670,26 @@ class Collector(ast.NodeVisitor):
                     exit_ = desc
                 elif any(dd.endswith("method") for dd in mdecos):
                     methods.append(desc)
+                elif item.name == "__enter__":
+                    # calque#138: pre-1.0 Modal API — before @modal.enter()
+                    # existed, the class-lifecycle load-once hook was spelled
+                    # as the bare context-manager dunder __enter__(self), no
+                    # decorator at all. Recognize it as the load-once body
+                    # (unless a real @modal.enter()-decorated method on this
+                    # class already claimed that role — decorator-based
+                    # recognition wins). Either way, exclude it from the
+                    # generic methods list below: same calque#86 rationale —
+                    # a load-once/teardown hook must never be eligible for
+                    # pickWarmUnit's per-item "fall back to first method".
+                    if enter is None:
+                        enter = desc
+                elif item.name == "__exit__":
+                    # calque#138: legacy pair to __enter__ above —
+                    # __exit__(self, exc_type, exc_value, traceback) is the
+                    # pre-1.0 shutdown hook, predating @modal.exit(). Same
+                    # precedence and methods-exclusion rules as __enter__.
+                    if exit_ is None:
+                        exit_ = desc
                 else:
                     methods.append(desc)  # plain method inside @cls — keep, label by decos
         self.classes.append(

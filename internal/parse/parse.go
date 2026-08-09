@@ -638,8 +638,18 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 		// Excluded from cls.Methods (unlike before the fix, where it fell into
 		// the generic "plain method" bucket and could be invoked per-item).
 		cls.HasExit = true
-		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, script, c.Exit.Lineno,
-			"@cls %q has @modal.exit(); container-shutdown teardown is not reproduced by the warm supervisor", c.Name)
+		if c.Exit.Name == "__exit__" && len(c.Exit.Decorators) == 0 {
+			// calque#138: recognized via the bare __exit__(self, exc_type,
+			// exc_value, traceback) dunder — Modal's pre-@modal.exit() class-
+			// lifecycle API. No decorator is present in the script at all, so
+			// the @modal.exit() wording above would misdescribe what's on the
+			// page; same non-reproduced posture either way.
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, script, c.Exit.Lineno,
+				"@cls %q has legacy __exit__ (pre-@modal.exit() Modal API); container-shutdown teardown is not reproduced by the warm supervisor", c.Name)
+		} else {
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, script, c.Exit.Lineno,
+				"@cls %q has @modal.exit(); container-shutdown teardown is not reproduced by the warm supervisor", c.Name)
+		}
 	}
 	for _, m := range c.Methods {
 		method := buildFn(m, script, rep, invokes, items)

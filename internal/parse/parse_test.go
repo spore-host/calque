@@ -367,6 +367,50 @@ func TestParseExitHookExcludedFromMethods(t *testing.T) {
 	}
 }
 
+// TestParseDunderLifecycleRecognizedAndExcludedFromMethods (calque#138):
+// Modal's pre-1.0 class lifecycle API — bare __enter__/__exit__ dunders, no
+// decorator at all — must be recognized exactly like @modal.enter()/
+// @modal.exit() are, and excluded from Methods for the identical calque#86
+// reason: a load-once/teardown hook must never be eligible for pickWarmUnit's
+// per-item "fall back to first method" heuristic.
+func TestParseDunderLifecycleRecognizedAndExcludedFromMethods(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/dunder_lifecycle.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(app.Classes) != 1 {
+		t.Fatalf("classes = %d, want 1", len(app.Classes))
+	}
+	cls := app.Classes[0]
+	if cls.EnterBody == "" {
+		t.Error("EnterBody = \"\", want non-empty (Batcher has bare __enter__)")
+	}
+	if !cls.HasExit {
+		t.Error("HasExit = false, want true (Batcher has bare __exit__)")
+	}
+	for _, m := range cls.Methods {
+		if m.Name == "__enter__" || m.Name == "__exit__" {
+			t.Errorf("%s must be excluded from Methods, got %+v", m.Name, cls.Methods)
+		}
+	}
+	if len(cls.Methods) != 1 || cls.Methods[0].Name != "generate" {
+		t.Errorf("Methods = %+v, want exactly [generate]", cls.Methods)
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "legacy __exit__") && strings.Contains(l.Detail, "not reproduced") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("legacy __exit__ should leak that teardown isn't reproduced, distinctly from @modal.exit(); leaks=%+v", rep.Leaks)
+	}
+}
+
 // TestParseCrossAppFromNameLeaksNotVolumeOrSecret (calque#87):
 // Function.from_name/Cls.from_name (cross-app invocation) must be recognized
 // and leaked distinctly — but Volume.from_name/Secret.from_name (unrelated,
