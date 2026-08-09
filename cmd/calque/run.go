@@ -89,8 +89,19 @@ func run(o runOpts) error {
 		// load to amortize across items. Any K computed against it measures
 		// something different than a warm @cls+@enter unit's reuse economics;
 		// say so rather than silently reporting a K that reads the same as one.
-		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
-			"%s: plain @app.function, no @cls+@enter — no warm-reuse economics to amortize across items; K here measures a different thing than a @cls+@enter warm unit's K", unit.method.Name)
+		if len(unit.method.Volumes) > 0 {
+			// calque#124: this function has no @enter, but it DOES mount a
+			// Volume — VolumeSync's delta-only `aws s3 sync` (internal/plan/volume.go)
+			// still avoids re-downloading cached weights across separate runs, even
+			// though there's no per-item in-memory reuse within this one run. Say
+			// both things, rather than let the @enter-less leak read as "no caching
+			// at all here."
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"%s: plain @app.function, no @cls+@enter — no per-item warm-reuse economics within this run; K here measures a different thing than a @cls+@enter warm unit's K. It DOES mount a Volume, though: VolumeSync's delta sync still avoids re-downloading cached weights across separate runs, even without @enter's in-memory reuse", unit.method.Name)
+		} else {
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"%s: plain @app.function, no @cls+@enter — no warm-reuse economics to amortize across items; K here measures a different thing than a @cls+@enter warm unit's K", unit.method.Name)
+		}
 	}
 	// calque#83: the warm runner only binds ONE positional arg per item (§6
 	// protocol) and always collects+returns a result. .starmap/.for_each are
