@@ -1,10 +1,12 @@
 # Design note: disambiguating "session" — interactive tenancy vs. today's N-item ramp (calque#106)
 
-**Status:** decision record, design-only (no code). Settles terminology and
-lifecycle for M13's institutional-sharing primitive before any implementation
-issue (MIG slice provisioning, MPS trusted-tenant mode) starts, so neither
-has to invent naming under its own scope or collide with what `cmd/calque
-session` already means.
+**Status:** decision record. Was design-only when filed; the primitives it
+scoped have since shipped as real code — `internal/mig` (MIG slice
+provisioning), `internal/mps` (MPS trusted-tenant mode), `internal/tenancy`
+(generic check-out/check-in registry), closed via #107/#108. The CLI-level
+rename this note calls for (`calque session` → `calque ramp`, freeing
+`session` for the new interactive-tenancy verb) has NOT shipped yet —
+tracked at #117. So: primitives done, naming/CLI still pending.
 
 ## The collision
 

@@ -118,10 +118,11 @@ The per-capability detail follows; nothing is removed, only sequenced under the 
 - **`gpu=` guard** (§7) — clean-swap vs multi-GPU/coupled flags, adversarial fixture.
 - **idiom pass-through** (§C) — image verbs (incl. `from_aws_ecr`); portable kwargs (`cpu=`/`memory=`
   recorded-not-acted behind the seam, `retries=` wired to the warm supervisor); synchronous invocation
-  kinds `.map`/`.starmap`/`.for_each`/`.remote`; async `.spawn`/`.map.aio` recognized-and-leaked.
+  kinds `.map`/`.starmap`/`.for_each`/`.remote`; `.map.aio` recognized-and-leaked; `.spawn()`+`.get()`
+  block-and-wait fan-out has a real driver (`calque spawn-run`), live-verified on real AWS.
 - **warm worker** (`warmd` + `runner.py`, §6) — `@enter` once, crash-restart re-drive, partial-failure.
-- **plan** (§5) — truffle resolve+price, `Acquirer` over `spawn.Provision` with capacity-aware
-  AZ-sweep retry.
+- **plan** (§5) — truffle resolve+price, `Acquirer` as a thin adapter over
+  `lagotto/pkg/snipe.Snipe` (AZ-sweep, capacity retry/backoff, deadline).
 - **image / exec** — Dockerfile+digest cache; S3 sink/collector; on-instance `warmd` entrypoint.
 - **volumes** (§3/§15) — `Volume.from_name` → stable S3 prefix, delta-synced to the mount path
   before `@enter` (warm-cache reuse; image/volume separation). `volume.commit()` persists as an
@@ -155,7 +156,7 @@ script.py
    └─ gate     Bedrock exact match?    (route away: print offer & stop BEFORE any GPU)
      └─ recommend  IR → Target         (STUB: constant behind Recommender interface)
        └─ plan   truffle: Card → candidate g7e instances (+ live price)
-                 acquire: block-and-wait retry over spawn.Provision until landed
+                 acquire: block-and-wait via lagotto/pkg/snipe.Snipe (AZ-sweep, retry/backoff)
                  image:   .image DSL → Dockerfile → ECR (cache by digest)
          └─ exec   spawn.Provision launches + brings up the instance(s)
                    [worker] warmd supervises warm Python: @enter once, drain → S3
@@ -168,9 +169,10 @@ script.py
 The Go control plane understands **decorators** (configuration). It does **not** parse function
 **bodies** (payload) — those ship to the worker verbatim and run under Python exactly as on Modal.
 
-> **Acquisition seam** (confirmed with spore.host, spawn#351/lagotto#73): `spawn.Provision` *owns*
-> `RunInstances` (acquire + bring-up in one shot); calque owns the block-and-wait retry loop. This is
-> the inverse of the spec's implied "lagotto acquires → spawn brings up," and is the real model.
+> **Acquisition seam**: `spawn.Provision` *owns* `RunInstances` (acquire + bring-up in one shot).
+> The block-and-wait retry/backoff/AZ-sweep loop calque needs on top of that now lives in
+> `lagotto/pkg/snipe.Snipe` — `internal/plan.Acquirer` is a thin adapter over it, not the owner of
+> that logic itself (a deliberate migration off a hand-rolled local copy, lagotto#106).
 
 ## CLI
 
@@ -195,6 +197,31 @@ calque session --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] \
 
 The route-away gate runs on `run`/`real`/`session` too: if the model (or `--model`) is already an exact
 Bedrock API call, calque prints the offer and stops **before** acquiring anything.
+
+## Institutional GPU sharing
+
+A second, related use case: once a workload is on infrastructure you control, an institution
+can make utilization and trust decisions Modal reasonably can't make for arbitrary public
+tenants. calque has real, tested primitives for this — a warm model pool, and two ways to
+divide one physical GPU across concurrent users:
+
+- **Warm pools** (`calque pool`) — a model-scoped SQS queue with resident workers that keep a
+  loaded model warm across separate claims, instead of paying `@enter`'s load cost per run. See
+  [`docs/pool-queue-contract.md`](docs/pool-queue-contract.md).
+- **MIG slice provisioning** (`internal/mig`) — hardware-partitions a supported card (g7/g7e's
+  RTX PRO 4500/6000, both Server Edition on AWS) into isolated slices, live-verified against
+  real hardware rather than assumed from datasheets. See
+  [`docs/gpu-sharing-support-matrix.md`](docs/gpu-sharing-support-matrix.md).
+- **MPS trusted-tenant sharing** (`internal/mps`) — cooperative multi-process sharing for
+  cards without MIG (g6/g6e's L4/L40S), for a known/bounded population rather than arbitrary
+  tenants; requires a separate `--i-understand-shared-gpu-has-no-isolation` consent flag
+  distinct from the ordinary spend confirmation, since the risk (no hardware isolation) is a
+  different kind than "this costs money."
+
+See [`docs/tenancy-vs-session.md`](docs/tenancy-vs-session.md) for the check-out/check-in
+lifecycle design. **Maturity note:** the primitives above are real, shipped, and tested — the
+end-to-end institutional CLI workflow (a `calque session` that checks out a slice, binds a
+workload, and enforces a TTL) is still in progress.
 
 ## Design notes
 
