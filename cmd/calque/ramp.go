@@ -38,6 +38,12 @@ type rampOpts struct {
 	prepTimeout     time.Duration // how long to wait for the one-time image pull; 0 => 30m default
 	concurrency     int           // items warmd keeps in flight per rung; 0/1 => serial (occupancy knob)
 	batchSize       int           // items per micro-batch (real vLLM occupancy lever); 0/1 => per-item
+	// fallbackRegions, in preference order, are tried (via plan.AcquireMultiRegion,
+	// calque#95) if region has no capacity — region-thin GPU families (g7e) can be
+	// out of capacity EVERYWHERE in one region while another has it (see
+	// docs/measured-runs/2026-07-28-qwen-g7e-spot-ramp.md). Empty => today's
+	// single-region behavior, unchanged.
+	fallbackRegions []string
 }
 
 // runRamp acquires ONE GPU instance (patiently — acquisition is the expensive,
@@ -99,13 +105,34 @@ func runRamp(o rampOpts) (err error) {
 		Region: o.region, LogKey: sessBase + "/prep.log", DoneKey: sessBase + "/prep.done",
 	}
 
-	// AZ sweep (offered ∩ default-subnet).
-	var places []plan.Placement
-	if found, aerr := calexec.AZsForInstance(ctx, ec2.NewFromConfig(cfg), o.instance); aerr == nil {
+	// AZ sweep (offered ∩ default-subnet), per candidate region (calque#95):
+	// o.region always gets its own lookup; each o.fallbackRegions entry needs the
+	// SAME lookup done again in ITS OWN region — an AZ/subnet pair from one region
+	// says nothing about another.
+	regions := append([]string{o.region}, o.fallbackRegions...)
+	placementsByRegion := make(map[string][]plan.Placement, len(regions))
+	for _, r := range regions {
+		regionCfg := cfg
+		if r != o.region {
+			var rerr error
+			regionCfg, rerr = config.LoadDefaultConfig(ctx, config.WithRegion(r))
+			if rerr != nil {
+				fmt.Fprintf(os.Stderr, "WARNING: could not load AWS config for fallback region %s: %v (will sweep with EC2-chosen AZ)\n", r, rerr)
+				continue
+			}
+		}
+		found, aerr := calexec.AZsForInstance(ctx, ec2.NewFromConfig(regionCfg), o.instance)
+		if aerr != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: AZ lookup failed for %s in %s: %v (will sweep with EC2-chosen AZ)\n", o.instance, r, aerr)
+			continue
+		}
+		var places []plan.Placement
 		for _, f := range found {
 			places = append(places, plan.Placement{AZ: f.AZ, Subnet: f.Subnet})
 		}
+		placementsByRegion[r] = places
 	}
+	places := placementsByRegion[o.region]
 
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: prep.PrepCommand(artifactPfx), TTL: o.ttl,
@@ -145,8 +172,15 @@ func runRamp(o rampOpts) (err error) {
 		},
 	}
 	tgt := &target.Target{Card: target.DefaultCard, Instance: o.instance}
-	fmt.Printf("[acquire] sniping %s in %s (patient — up to %s; $0 until it lands)...\n", o.instance, o.region, o.acquireDeadline)
-	acquired, err := acq.Acquire(ctx, tgt, o.region)
+	var acquired plan.Acquired
+	if len(o.fallbackRegions) > 0 {
+		fmt.Printf("[acquire] sniping %s in %s, falling back to %v (patient — up to %s; $0 until it lands)...\n",
+			o.instance, o.region, o.fallbackRegions, o.acquireDeadline)
+		acquired, err = acq.AcquireMultiRegion(ctx, tgt, regions, placementsByRegion)
+	} else {
+		fmt.Printf("[acquire] sniping %s in %s (patient — up to %s; $0 until it lands)...\n", o.instance, o.region, o.acquireDeadline)
+		acquired, err = acq.Acquire(ctx, tgt, o.region)
+	}
 	if err != nil {
 		return fmt.Errorf("acquire: %w", err)
 	}

@@ -7,6 +7,8 @@ import (
 
 	"github.com/aws/smithy-go"
 
+	spawnaws "github.com/spore-host/spawn/pkg/aws"
+
 	"github.com/spore-host/calque/internal/target"
 )
 
@@ -49,6 +51,92 @@ func TestErrorCodeExtractsThroughWrapping(t *testing.T) {
 		if ok != c.wantOK || got != c.want {
 			t.Errorf("errorCode(%v) = (%q, %v), want (%q, %v)", c.err, got, ok, c.want, c.wantOK)
 		}
+	}
+}
+
+// TestBuildSnipeTargetsSingleRegion (calque#95): a single-region call — the
+// shape Acquire itself now uses via AcquireMultiRegion — must produce a
+// primary snipe.Target carrying THAT region's placements/instance type/spot/
+// launch config, and exactly ZERO fallbacks. This is the "existing
+// single-region callers are unaffected" guarantee: Acquire's own new one-line
+// body (regions=[]string{region}) must build the identical snipe.Target it
+// built by hand before the #95 migration.
+func TestBuildSnipeTargetsSingleRegion(t *testing.T) {
+	cfg := spawnaws.LaunchConfig{Spot: true, AMI: "ami-123"}
+	places := map[string][]Placement{
+		"us-east-1": {{AZ: "us-east-1a", Subnet: "subnet-1"}, {AZ: "us-east-1b", Subnet: "subnet-2"}},
+	}
+	primary, fallbacks := buildSnipeTargets("g7e.2xlarge", []string{"us-east-1"}, places, cfg)
+
+	if primary.InstanceType != "g7e.2xlarge" || primary.Region != "us-east-1" {
+		t.Fatalf("primary = %+v, want InstanceType=g7e.2xlarge Region=us-east-1", primary)
+	}
+	if !primary.Spot {
+		t.Errorf("primary.Spot = false, want true (from LaunchConfig)")
+	}
+	if primary.LaunchConfig.AMI != "ami-123" {
+		t.Errorf("primary.LaunchConfig.AMI = %q, want %q", primary.LaunchConfig.AMI, "ami-123")
+	}
+	if len(primary.Placements) != 2 || primary.Placements[0].AZ != "us-east-1a" || primary.Placements[1].AZ != "us-east-1b" {
+		t.Errorf("primary.Placements = %+v, want 2 placements for us-east-1 in order", primary.Placements)
+	}
+	if len(fallbacks) != 0 {
+		t.Errorf("fallbacks = %+v, want none for a single-region call", fallbacks)
+	}
+}
+
+// TestBuildSnipeTargetsMultiRegion (calque#95): regions beyond the first must
+// become one snipe.Target each, IN ORDER, each carrying its OWN region's
+// placements from placementsByRegion — proving cross-region fallback targets
+// don't leak the primary region's AZ/subnet list (an AZ in one region says
+// nothing about another).
+func TestBuildSnipeTargetsMultiRegion(t *testing.T) {
+	cfg := spawnaws.LaunchConfig{AMI: "ami-abc"}
+	places := map[string][]Placement{
+		"us-east-1":    {{AZ: "us-east-1a", Subnet: "subnet-a"}},
+		"us-west-2":    {{AZ: "us-west-2b", Subnet: "subnet-b"}},
+		"eu-central-1": {{AZ: "eu-central-1a", Subnet: "subnet-c"}},
+	}
+	primary, fallbacks := buildSnipeTargets("g7e.2xlarge",
+		[]string{"us-east-1", "us-west-2", "eu-central-1"}, places, cfg)
+
+	if primary.Region != "us-east-1" {
+		t.Fatalf("primary.Region = %q, want us-east-1", primary.Region)
+	}
+	if len(fallbacks) != 2 {
+		t.Fatalf("fallbacks = %+v, want exactly 2 (one per additional region)", fallbacks)
+	}
+	if fallbacks[0].Region != "us-west-2" || fallbacks[1].Region != "eu-central-1" {
+		t.Errorf("fallback regions = [%s, %s], want [us-west-2, eu-central-1] IN ORDER",
+			fallbacks[0].Region, fallbacks[1].Region)
+	}
+	if len(fallbacks[0].Placements) != 1 || fallbacks[0].Placements[0].AZ != "us-west-2b" {
+		t.Errorf("fallbacks[0].Placements = %+v, want us-west-2's own placement, not us-east-1's", fallbacks[0].Placements)
+	}
+	if len(fallbacks[1].Placements) != 1 || fallbacks[1].Placements[0].AZ != "eu-central-1a" {
+		t.Errorf("fallbacks[1].Placements = %+v, want eu-central-1's own placement", fallbacks[1].Placements)
+	}
+	for _, fb := range fallbacks {
+		if fb.InstanceType != "g7e.2xlarge" {
+			t.Errorf("fallback %s InstanceType = %q, want g7e.2xlarge (same as primary)", fb.Region, fb.InstanceType)
+		}
+		if fb.LaunchConfig.AMI != "ami-abc" {
+			t.Errorf("fallback %s LaunchConfig.AMI = %q, want %q (shared base config)", fb.Region, fb.LaunchConfig.AMI, "ami-abc")
+		}
+	}
+}
+
+// TestBuildSnipeTargetsMissingRegionPlacements: a candidate region absent from
+// placementsByRegion must sweep with a single EC2-chosen placement (nil/empty
+// Placements) rather than erroring or silently borrowing another region's list.
+func TestBuildSnipeTargetsMissingRegionPlacements(t *testing.T) {
+	places := map[string][]Placement{"us-east-1": {{AZ: "us-east-1a"}}}
+	_, fallbacks := buildSnipeTargets("g6.2xlarge", []string{"us-east-1", "ap-south-1"}, places, spawnaws.LaunchConfig{})
+	if len(fallbacks) != 1 {
+		t.Fatalf("fallbacks = %+v, want 1", fallbacks)
+	}
+	if len(fallbacks[0].Placements) != 0 {
+		t.Errorf("fallbacks[0].Placements = %+v, want empty (ap-south-1 has no entry in placementsByRegion)", fallbacks[0].Placements)
 	}
 }
 

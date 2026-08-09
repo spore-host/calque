@@ -102,18 +102,42 @@ type Acquirer struct {
 
 // Acquire blocks until the target lands or the deadline passes. It fills the
 // Target's Region on success (§4: acquisition fills Region).
+//
+// This is a thin single-region wrapper over [Acquirer.AcquireMultiRegion]
+// (calque#95): it hands the multi-region path a one-element region list using
+// a.Placements as that region's sweep, so it produces exactly the same
+// snipe.Target/snipe.Options (zero Fallbacks) as before the #95 migration —
+// existing single-region callers are unaffected.
 func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string) (Acquired, error) {
+	return a.AcquireMultiRegion(ctx, t, []string{region}, map[string][]Placement{region: a.Placements})
+}
+
+// AcquireMultiRegion blocks until the target lands in the first of regions (in
+// preference order) that has capacity, or the deadline passes. regions[0] is
+// the primary region; any additional regions become lagotto/pkg/snipe's
+// Options.Fallbacks (lagotto#76, shipped v0.50.0+) — calque#95's cross-region
+// capacity search: Snipe sweeps the primary region's placements, then each
+// fallback region's placements IN ORDER, all within one round, before backing
+// off and retrying the whole thing. It fills the Target's Region on success
+// (§4) to whichever candidate region actually landed.
+//
+// placementsByRegion supplies each candidate region's own (AZ, subnet) sweep
+// list, keyed by region — a caller must resolve AZs/subnets per region (e.g.
+// via calexec.AZsForInstance), since a placement in one region says nothing
+// about another. A region absent from the map (or mapped to nil/empty) sweeps
+// with a single EC2-chosen placement, same as Acquire's existing default.
+func (a *Acquirer) AcquireMultiRegion(ctx context.Context, t *target.Target, regions []string, placementsByRegion map[string][]Placement) (Acquired, error) {
+	if len(regions) == 0 {
+		return Acquired{}, fmt.Errorf("acquire %s: at least one region is required", t.Instance)
+	}
+
 	deadline := a.Deadline
 	if deadline == 0 {
 		deadline = 30 * time.Minute
 	}
 
-	places := make([]snipe.Placement, len(a.Placements))
-	for i, p := range a.Placements {
-		places[i] = snipe.Placement{AZ: p.AZ, Subnet: p.Subnet}
-	}
+	primary, fallbacks := buildSnipeTargets(t.Instance, regions, placementsByRegion, a.LaunchConfig)
 
-	cfg := a.LaunchConfig
 	requestedAt := time.Now()
 	// failedAttempts counts only Status reports carrying a LastErr — Snipe
 	// also reports a pre-attempt Status (LastErr==nil) before each placement
@@ -121,15 +145,10 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 	// Progress contract (and the leak line below) means "how many failed
 	// attempts so far," so only count the ones that actually failed.
 	failedAttempts := 0
-	result, err := snipe.Snipe(ctx, snipe.Target{
-		InstanceType: t.Instance,
-		Region:       region,
-		Placements:   places,
-		Spot:         a.LaunchConfig.Spot,
-		LaunchConfig: cfg,
-	}, snipe.Options{
+	result, err := snipe.Snipe(ctx, primary, snipe.Options{
 		Deadline:      requestedAt.Add(deadline),
 		RetryInterval: a.PollInterval,
+		Fallbacks:     fallbacks,
 		Progress: func(s snipe.Status) {
 			if s.LastErr == nil {
 				return // pre-attempt report; nothing failed yet
@@ -144,9 +163,9 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 	if err != nil {
 		if a.Report != nil {
 			a.Report.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, t.Card, 0,
-				"gave up acquiring %s in %s after %s: %v", t.Instance, region, deadline, err)
+				"gave up acquiring %s in %v after %s: %v", t.Instance, regions, deadline, err)
 		}
-		return Acquired{}, fmt.Errorf("acquire %s/%s: %w", t.Instance, region, err)
+		return Acquired{}, fmt.Errorf("acquire %s/%v: %w", t.Instance, regions, err)
 	}
 
 	acquiredAt := time.Now()
@@ -162,6 +181,41 @@ func (a *Acquirer) Acquire(ctx context.Context, t *target.Target, region string)
 			t.Instance, acq.Region, acq.AvailabilityZone, acq.TimeToAcquire().Round(time.Second))
 	}
 	return acq, nil
+}
+
+// buildSnipeTargets translates calque's own (regions, per-region Placements,
+// LaunchConfig) shape into what lagotto/pkg/snipe.Snipe wants: a primary
+// snipe.Target (regions[0]) plus one snipe.Target per remaining region, to be
+// passed as snipe.Options.Fallbacks (lagotto#76) — calque#95's cross-region
+// search. Each region gets its OWN Placements from placementsByRegion: an AZ
+// in one region says nothing about another, so a caller resolving multiple
+// candidate regions must look up each region's AZs/subnets separately (e.g.
+// one calexec.AZsForInstance call per region).
+func buildSnipeTargets(instanceType string, regions []string, placementsByRegion map[string][]Placement, launchCfg spawnaws.LaunchConfig) (primary snipe.Target, fallbacks []snipe.Target) {
+	toSnipePlacements := func(region string) []snipe.Placement {
+		places := placementsByRegion[region]
+		out := make([]snipe.Placement, len(places))
+		for i, p := range places {
+			out[i] = snipe.Placement{AZ: p.AZ, Subnet: p.Subnet}
+		}
+		return out
+	}
+	buildTarget := func(region string) snipe.Target {
+		return snipe.Target{
+			InstanceType: instanceType,
+			Region:       region,
+			Placements:   toSnipePlacements(region),
+			Spot:         launchCfg.Spot,
+			LaunchConfig: launchCfg,
+		}
+	}
+
+	primary = buildTarget(regions[0])
+	fallbacks = make([]snipe.Target, 0, len(regions)-1)
+	for _, region := range regions[1:] {
+		fallbacks = append(fallbacks, buildTarget(region))
+	}
+	return primary, fallbacks
 }
 
 // errorCode extracts the AWS error code from err for logging, if it wraps one

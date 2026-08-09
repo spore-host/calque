@@ -187,6 +187,7 @@ func rampCmd(args []string) error {
 	rates := fs.String("rates", "config/rates.json", "rate table path")
 	spot := fs.Bool("spot", false, "acquire on the Spot market (different capacity pool than on-demand; interruptible; K is then a SPOT rate)")
 	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
+	fallbackRegionsCSV := fs.String("fallback-regions", "", "comma-separated regions to try (in order) if --region has no capacity (calque#95); empty => single-region only")
 	prepMin := fs.Int("prep-timeout-min", 30, "minutes to wait for the one-time docker image pull before giving up")
 	concurrency := fs.Int("concurrency", 1, "items in flight per rung for THREAD-SAFE bodies (guarded off for vLLM-offline; use --batch-size there)")
 	batchSize := fs.Int("batch-size", 1, "items per micro-batch: one vLLM .generate(list) call fills the GPU — the real occupancy lever (1 = per-item)")
@@ -211,6 +212,7 @@ func rampCmd(args []string) error {
 		spot: *spot, spotMaxPrice: *spotMaxPrice,
 		prepTimeout: time.Duration(*prepMin) * time.Minute,
 		concurrency: *concurrency, batchSize: *batchSize,
+		fallbackRegions: splitComma(*fallbackRegionsCSV),
 	})
 }
 
@@ -254,7 +256,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque run [--n N] [--region R] [--dry-run] <script.py>")
 	fmt.Fprintln(os.Stderr, "  calque smoke --bucket B --run-id ID [--region R] [--ttl 30m] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
-	fmt.Fprintln(os.Stderr, "  calque ramp --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] [--rungs 1,100,1000] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque ramp --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] [--rungs 1,100,1000] [--fallback-regions us-west-2,eu-central-1] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque pool create --model M --instance-type T --manifest-bucket B --results-bucket B --runner-path P [--workers N] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque spawn-run --bucket B --run-id ID --ami AMI [--instance m7i.large] <script.py> --i-understand-this-spends-money")
 }
