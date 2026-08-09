@@ -111,7 +111,10 @@ func realRunViaPool(o realOpts) error {
 // the claim's OWN warm-hit fixed cost into cost.Model, rather than a fresh
 // acquisition's AcquireSeconds/EnterSeconds — the honest fixed cost for THIS
 // run is whatever the claim reported, not what a dedicated run would have
-// measured (calque#102).
+// measured (calque#102). Occupancy (calque#116) is likewise THIS claim's own
+// measurement — the pool worker now runs occupancy.py scoped to just this
+// claim's DrainBatch window (internal/pool.Worker.runOne) — rather than the
+// hardcoded full-fill placeholder pool mode used before the sampler existed.
 func emitKForPoolClaim(o realOpts, results []warm.Result, summary calpool.Summary) error {
 	rates, err := cost.LoadRates(o.ratesFP)
 	if err != nil {
@@ -127,11 +130,26 @@ func emitKForPoolClaim(o realOpts, results []warm.Result, summary calpool.Summar
 	// pool (calque#101), not per-run. That fixed cost is real but belongs to
 	// the pool's lifetime, not any single claim's K.
 	_, awsMeasured, _ := rates.AWSOnDemandPerSecond(o.instance)
+
+	// occFrac/occMeasured mirror measure.Measurement.OccupancyFraction's own
+	// conservative fallback (internal/measure/measure.go): an unmeasured claim
+	// reports occupancy as 1.0 (least favorable to AWS, so K stays honestly
+	// pessimistic rather than silently optimistic) with occScope left as the
+	// claim's own reported scope so the verdict's labeling discipline (#71)
+	// still holds even in that fallback case.
+	occFrac := 1.0
+	occMeasured := false
+	if summary.Occupancy.Measured && summary.Occupancy.MeanOccupancy != nil {
+		occFrac = *summary.Occupancy.MeanOccupancy
+		occMeasured = true
+	}
+	occScope := summary.Occupancy.ScopeOrWholeRun()
+
 	model := &cost.Model{Rates: rates, M: cost.Measured{
 		CardAskedFor: "H100", InstanceUsed: o.instance, SecPerItem: pi.MeanSecs,
-		Occupancy: 1, SampleItems: pi.Count, AWSRateMeasured: awsMeasured,
+		Occupancy: occFrac, SampleItems: pi.Count, AWSRateMeasured: awsMeasured,
 		AcquireSeconds: 0, EnterSeconds: summary.EnterSecondsPaid,
-		OccupancyScope: "inference", // no occupancy sampler runs in pool mode (calque#102's scope); treat as full-fill rather than silently mislabel as whole_run
+		OccupancyScope: occScope,
 		WarmHit:        summary.WarmHit,
 	}}
 	fmt.Println("\n--- crossover K (§9) — POOL claim ---")
@@ -144,8 +162,12 @@ func emitKForPoolClaim(o realOpts, results []warm.Result, summary calpool.Summar
 	default:
 		fmt.Print(verdict)
 	}
-	fmt.Println("NOTE: pool-mode K has no occupancy sampler (calque#103's scope); Occupancy is reported as 100% " +
-		"rather than measured — treat this K as compute-time-honest but occupancy-optimistic until a future pass " +
-		"wires the sampler into pool claims too.")
+	if !occMeasured {
+		fmt.Println("NOTE: occupancy unmeasured for this claim (sampler unavailable or no samples landed in its " +
+			"inference window) — Occupancy is reported as 100% as a conservative placeholder, not a measurement.")
+	} else {
+		fmt.Printf("This K's occupancy is grounded in a REAL per-claim measurement: %.0f%% (%s).\n", occFrac*100, occScope)
+		fmt.Printf("  %s\n", calexec.OccScopeNote(summary.Occupancy))
+	}
 	return nil
 }

@@ -23,7 +23,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	calexec "github.com/spore-host/calque/internal/exec"
@@ -127,8 +130,10 @@ type ResultWriter interface {
 	// runner already warm when this claim was served; enterSecondsPaid —
 	// the @enter cost THIS claim actually paid (0 on a warm hit; the
 	// measured load time on a miss, since the runner just reloaded to serve
-	// it).
-	WriteSummary(ctx context.Context, man calexec.Manifest, failed []int, warmHit bool, enterSecondsPaid float64) error
+	// it); occ — THIS claim's own occupancy measurement (calque#116),
+	// scoped to just its DrainBatch window (zero-value/Measured=false if
+	// the sampler could not be started or produced nothing usable).
+	WriteSummary(ctx context.Context, man calexec.Manifest, failed []int, warmHit bool, enterSecondsPaid float64, occ calexec.OccupancyRaw) error
 }
 
 // Queue is the slice of spawn's taskpool.Queue this package needs — an
@@ -140,6 +145,12 @@ type ResultWriter interface {
 type Queue interface {
 	Claim(ctx context.Context, waitSeconds int32) (ref ClaimRef, receiptHandle string, ok bool, err error)
 	Ack(ctx context.Context, receiptHandle string) error
+	// Extend resets a claimed message's visibility timeout to timeoutSeconds
+	// from now (SQS ChangeMessageVisibility semantics) — calque#131's
+	// heartbeat hook, called periodically by runOne while a claim's batch is
+	// still draining, so a slow DrainBatch doesn't outlive the queue's
+	// visibility window and get redelivered/double-run while still in flight.
+	Extend(ctx context.Context, receipt string, timeoutSeconds int) error
 }
 
 // WorkerConfig configures one pool worker's claim loop.
@@ -155,6 +166,14 @@ type WorkerConfig struct {
 	// inter-arrival time, NOT a CPU task-pool worker's short default, because
 	// closing here throws away the warm model calque exists to keep loaded.
 	IdleTimeout time.Duration
+	// VisibilityTimeout is the pool queue's configured SQS visibility timeout
+	// (seconds) — the SAME value passed to CreatePoolQueue. runOne uses it to
+	// size its heartbeat interval (calque#131): a claim still draining gets
+	// its visibility renewed to this many seconds every VisibilityTimeout/3,
+	// so a slow DrainBatch doesn't outlive the window and get redelivered
+	// while still in flight. 0 disables heartbeating (e.g. existing tests
+	// against a fakeQueue with no real visibility semantics).
+	VisibilityTimeout int
 	// Log receives one-line progress messages; nil discards them.
 	Log io.Writer
 }
@@ -268,7 +287,29 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 	}
 	w.Supervisor.Sink = w.Results.Sink(man)
 
+	// Start the occupancy sampler sidecar for THIS claim only (calque#116),
+	// mirroring cmd/warmd's runOnInstance start/stop/signal/parse pattern but
+	// scoped to one claim's DrainBatch window rather than the whole worker
+	// process's lifetime: a pool worker serves MANY claims sequentially
+	// against one resident runner, and sampling across the whole process would
+	// mix every claim's occupancy together — wrong for a per-claim report.
+	// Best-effort, matching runOnInstance's own philosophy: if the sampler
+	// can't start (no occupancy_path in the manifest, python missing, etc.)
+	// the claim still runs; occupancy is reported as unmeasured.
+	sampler := startClaimSampler(ctx, man, ref.RunID)
+	spansBefore := len(w.Supervisor.InferenceSpans)
+
+	stopHeartbeat := w.startHeartbeat(ctx, receipt)
 	failed, derr := w.Supervisor.DrainBatch(ctx, man.Items)
+	stopHeartbeat()
+
+	// Stop the sampler and fold its samples into an occupancy figure scoped to
+	// ONLY the spans DrainBatch just added — not the supervisor's full
+	// lifetime InferenceSpans slice, which also carries every earlier claim's
+	// spans (see the Sink comment above for why that would be wrong here).
+	claimSpans := toClaimSpans(w.Supervisor.InferenceSpans[spansBefore:])
+	occ := sampler.stopAndMeasure(claimSpans)
+
 	if derr != nil {
 		// The supervisor exhausted its restart budget — this claim did not
 		// complete. Leave it un-acked: the resident runner is gone
@@ -290,7 +331,7 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 		enterSecondsPaid = w.Supervisor.EnterSeconds
 	}
 
-	if serr := w.Results.WriteSummary(ctx, man, failed, wasWarm, enterSecondsPaid); serr != nil {
+	if serr := w.Results.WriteSummary(ctx, man, failed, wasWarm, enterSecondsPaid, occ); serr != nil {
 		// Wrote results (if any landed before this point they're already in the
 		// sink) but couldn't signal completion. Leave un-acked: a redelivery
 		// re-drains against the (still warm, unaffected) resident runner and
@@ -302,6 +343,136 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 	if aerr := w.Queue.Ack(ctx, receipt); aerr != nil {
 		w.logf("claim run=%s: ack failed (may redeliver a completed claim): %v", ref.RunID, aerr)
 	}
+}
+
+// claimSampler wraps one claim's occupancy.py subprocess (calque#116),
+// mirroring cmd/warmd's runOnInstance sampler plumbing but scoped to a single
+// DrainBatch call rather than warmd's whole-process lifetime. started is
+// false when the sampler could not even be launched (missing occupancy_path
+// in the manifest, interpreter not found, etc.) — stopAndMeasure degrades to
+// an unmeasured OccupancyRaw in that case rather than failing the claim,
+// matching runOnInstance's own best-effort philosophy for this sidecar.
+type claimSampler struct {
+	cmd     *exec.Cmd
+	outPath string
+	stdout  strings.Builder
+	started bool
+}
+
+// startClaimSampler launches occupancy.py sampling to a claim-scoped temp
+// file. Uses runID (unique per submitted run) rather than a fixed path like
+// cmd/warmd's /tmp/calque-occ.jsonl, since ONE pool worker process serves
+// many claims sequentially — a fixed path would let one claim's leftover
+// samples bleed into the next's window if a previous stop/cleanup ever
+// raced. Returns a claimSampler with started=false (never nil) if the
+// manifest carries no occupancy path or the subprocess fails to start.
+func startClaimSampler(ctx context.Context, man calexec.Manifest, runID string) *claimSampler {
+	if man.Occupancy == "" {
+		return &claimSampler{}
+	}
+	python := man.PythonBin
+	if python == "" {
+		python = "python3"
+	}
+	cs := &claimSampler{outPath: fmt.Sprintf("/tmp/calque-pool-occ-%s.jsonl", runID)}
+	cs.cmd = exec.CommandContext(ctx, python, man.Occupancy, "sample", "--interval", "1.0", "--out", cs.outPath)
+	cs.cmd.Stdout = &cs.stdout
+	cs.started = cs.cmd.Start() == nil
+	return cs
+}
+
+// stopAndMeasure signals the sampler to stop (mirroring runOnInstance:
+// SIGTERM -> it prints its whole-run JSON summary and exits), then
+// recomputes occupancy over ONLY this claim's inference spans (the #71
+// windowing fix, applied per-claim here rather than per-process) so the
+// figure reflects this claim's fill and not the sampler's own
+// whole-subprocess-life mean. If the sampler never started, or no sample
+// landed inside the claim's spans, it returns a zero-value OccupancyRaw
+// (Measured=false) — an honest "unmeasured," never a fabricated number.
+func (cs *claimSampler) stopAndMeasure(spans []calexec.Span) calexec.OccupancyRaw {
+	if !cs.started {
+		return calexec.OccupancyRaw{}
+	}
+	_ = cs.cmd.Process.Signal(syscall.SIGTERM)
+	_ = cs.cmd.Wait()
+	var wholeRun calexec.OccupancyRaw
+	_ = json.Unmarshal([]byte(strings.TrimSpace(cs.stdout.String())), &wholeRun)
+	if wholeRun.Scope == "" {
+		wholeRun.Scope = calexec.ScopeWholeRun
+	}
+
+	raw, rerr := os.ReadFile(cs.outPath)
+	_ = os.Remove(cs.outPath) // best-effort cleanup; this worker serves more claims after this one
+	if rerr != nil {
+		return wholeRun
+	}
+	samples := calexec.ParseOccSamples(raw)
+	if windowed, ok := calexec.OccupancyInWindows(samples, spans, wholeRun.IntervalS); ok {
+		return windowed
+	}
+	return wholeRun
+}
+
+// toClaimSpans converts warm.Span (the supervisor's own type) to
+// calexec.Span (the occupancy-windowing package's type) — the same
+// conversion cmd/warmd's toExecSpans does, duplicated here rather than
+// exported from warmd's package main (which can't be imported).
+func toClaimSpans(in []warm.Span) []calexec.Span {
+	out := make([]calexec.Span, len(in))
+	for i, s := range in {
+		out[i] = calexec.Span{StartUnix: s.StartUnix, EndUnix: s.EndUnix}
+	}
+	return out
+}
+
+// heartbeatInterval computes how often startHeartbeat ticks for a given
+// VisibilityTimeout (a third of it, so a single missed/slow Extend call still
+// leaves margin before the message would go visible again). A package var —
+// mirroring queue.go's poolOpenRetryDelay — so tests can shrink it to make a
+// heartbeat observable without waiting on a real multi-second visibility
+// window.
+var heartbeatInterval = func(visibilityTimeoutSeconds int) time.Duration {
+	d := time.Duration(visibilityTimeoutSeconds) * time.Second / 3
+	if d <= 0 {
+		d = time.Second
+	}
+	return d
+}
+
+// startHeartbeat begins periodically extending receipt's visibility while a
+// claim's batch drains (calque#131), and returns a stop func the caller MUST
+// invoke once DrainBatch returns (success or failure) to end the heartbeat
+// goroutine — mirroring the ticker-goroutine-plus-explicit-stop shape used
+// elsewhere in this package (e.g. sleepCtx's timer) rather than tying the
+// heartbeat's lifetime to ctx alone, since ctx may still be live after
+// DrainBatch returns (e.g. the claim loop continues to the next claim) and
+// must not keep extending a receipt runOne is done with.
+//
+// A VisibilityTimeout of 0 (e.g. tests wiring a fakeQueue with no real SQS
+// visibility semantics) disables heartbeating entirely — stop is then a no-op.
+func (w *Worker) startHeartbeat(ctx context.Context, receipt string) (stop func()) {
+	if w.Config.VisibilityTimeout <= 0 {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(heartbeatInterval(w.Config.VisibilityTimeout))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if eerr := w.Queue.Extend(ctx, receipt, w.Config.VisibilityTimeout); eerr != nil {
+					w.logf("heartbeat: extend visibility failed (claim may be redelivered if drain outlasts the window): %v", eerr)
+				}
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 func (w *Worker) logf(format string, a ...interface{}) {

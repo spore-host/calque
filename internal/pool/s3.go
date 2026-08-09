@@ -53,10 +53,9 @@ func (r *S3Results) Sink(man calexec.Manifest) warm.Sink {
 	return &calexec.S3Sink{Client: r.Client, Bucket: man.Bucket, Prefix: man.ResultPrefix}
 }
 
-// Summary is the completion record a pool claim writes — deliberately
-// smaller than cmd/warmd's full Summary (no occupancy bookkeeping here). It
-// carries just enough for a submitter (calque#103) to feed cost.Measured
-// honestly (calque#102): WarmHit tells the submitter whether THIS claim's
+// Summary is the completion record a pool claim writes. It carries just
+// enough for a submitter (calque#103) to feed cost.Measured honestly
+// (calque#102): WarmHit tells the submitter whether THIS claim's
 // AcquireSeconds/EnterSeconds should be reported as near-zero (a pool hit)
 // or the pool's own dedicated first-load cost (a miss); EnterSecondsPaid is
 // the ACTUAL @enter cost this specific claim caused (0 on a clean warm hit,
@@ -66,15 +65,24 @@ func (r *S3Results) Sink(man calexec.Manifest) warm.Sink {
 // the run's item count and card-asked-for. Exported (unlike cmd/warmd's own
 // unexported Summary) because a submitter living in cmd/calque needs to
 // decode it after calexec.WaitForSummary returns.
+//
+// Occupancy is THIS claim's own occupancy.py measurement (calque#116),
+// scoped to just this claim's DrainBatch window — not cmd/warmd's whole-run
+// figure, since a pool worker serves many claims sequentially against one
+// resident runner, and averaging across claims would mix one claim's fill
+// into another's. Zero-value (Measured=false) means the sampler could not be
+// started or produced no usable measurement for this claim — a submitter
+// must treat that as unmeasured, not as a genuine 0% fill.
 type Summary struct {
-	Failed           []int   `json:"failed"`
-	WarmHit          bool    `json:"warm_hit"`
-	EnterSecondsPaid float64 `json:"enter_seconds_paid"`
+	Failed           []int                `json:"failed"`
+	WarmHit          bool                 `json:"warm_hit"`
+	EnterSecondsPaid float64              `json:"enter_seconds_paid"`
+	Occupancy        calexec.OccupancyRaw `json:"occupancy"`
 }
 
 // WriteSummary implements ResultWriter.
-func (r *S3Results) WriteSummary(ctx context.Context, man calexec.Manifest, failed []int, warmHit bool, enterSecondsPaid float64) error {
-	body, err := json.Marshal(Summary{Failed: failed, WarmHit: warmHit, EnterSecondsPaid: enterSecondsPaid})
+func (r *S3Results) WriteSummary(ctx context.Context, man calexec.Manifest, failed []int, warmHit bool, enterSecondsPaid float64, occ calexec.OccupancyRaw) error {
+	body, err := json.Marshal(Summary{Failed: failed, WarmHit: warmHit, EnterSecondsPaid: enterSecondsPaid, Occupancy: occ})
 	if err != nil {
 		return err
 	}

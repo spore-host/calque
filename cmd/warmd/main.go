@@ -102,6 +102,7 @@ func main() {
 		runnerPath := fs.String("runner-path", "", "path to runner.py in the image")
 		idleTimeout := fs.Duration("idle-timeout", 30*time.Minute, "how long to keep the resident runner warm with an empty queue before closing it")
 		pollWait := fs.Int("poll-wait-seconds", 20, "SQS long-poll wait per claim (0..20)")
+		visibilityTimeout := fs.Int("visibility-timeout", 900, "MUST match the pool queue's own SQS VisibilityTimeout (set by `calque pool create`'s --i-understand-this-spends-money path, currently 900s) — used to size this worker's calque#131 heartbeat interval (visibilityTimeout/3), not to configure the queue itself")
 		_ = fs.Parse(os.Args[2:])
 		if *model == "" || *runnerPath == "" {
 			fmt.Fprintln(os.Stderr, "error: --model and --runner-path required")
@@ -110,6 +111,7 @@ func main() {
 		if err := runPoolWorker(context.Background(), poolWorkerArgs{
 			model: *model, region: *region, pythonBin: *pythonBin, runnerPath: *runnerPath,
 			idleTimeout: *idleTimeout, pollWaitSeconds: int32(*pollWait),
+			visibilityTimeout: *visibilityTimeout,
 		}); err != nil {
 			fmt.Fprintln(os.Stderr, "warmd pool error:", err)
 			os.Exit(1)
@@ -126,6 +128,7 @@ type poolWorkerArgs struct {
 	model, region, pythonBin, runnerPath string
 	idleTimeout                          time.Duration
 	pollWaitSeconds                      int32
+	visibilityTimeout                    int
 }
 
 // runPoolWorker starts a calque#100 sticky pool worker: claims from the
@@ -154,7 +157,8 @@ func runPoolWorker(ctx context.Context, a poolWorkerArgs) error {
 		Results:    &calpool.S3Results{Client: s3Client},
 		Supervisor: sup,
 		Config: calpool.WorkerConfig{
-			Model: a.model, PollWaitSeconds: a.pollWaitSeconds, IdleTimeout: a.idleTimeout, Log: os.Stderr,
+			Model: a.model, PollWaitSeconds: a.pollWaitSeconds, IdleTimeout: a.idleTimeout,
+			VisibilityTimeout: a.visibilityTimeout, Log: os.Stderr,
 		},
 	}
 	served, err := w.Run(ctx)

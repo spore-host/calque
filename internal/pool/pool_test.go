@@ -41,10 +41,12 @@ func runnerScript(t *testing.T) string {
 // at a time, and only removed on Ack — mirroring taskpool's fakeSQS closely
 // enough to drive Worker deterministically without real SQS.
 type fakeQueue struct {
-	mu      sync.Mutex
-	pending []queuedClaim
-	claimed map[string]queuedClaim // receipt -> claim, until acked
-	nextID  int
+	mu        sync.Mutex
+	pending   []queuedClaim
+	claimed   map[string]queuedClaim // receipt -> claim, until acked
+	nextID    int
+	extends   []string // receipts passed to Extend, in call order
+	extendErr error
 }
 
 type queuedClaim struct {
@@ -89,6 +91,23 @@ func (f *fakeQueue) liveCount() int {
 	return len(f.pending) + len(f.claimed)
 }
 
+// Extend is a no-op stub for tests that don't specifically exercise
+// heartbeating — it just records the call (calque#131) so
+// TestWorker_HeartbeatExtendsVisibilityDuringLongDrain can assert it happened
+// at least once during a slow DrainBatch.
+func (f *fakeQueue) Extend(_ context.Context, receipt string, _ int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.extends = append(f.extends, receipt)
+	return f.extendErr
+}
+
+func (f *fakeQueue) extendCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.extends)
+}
+
 // fakeFetcher serves manifest JSON from an in-memory map keyed by URI.
 type fakeFetcher struct {
 	byURI map[string][]byte
@@ -120,6 +139,7 @@ type writtenSummary struct {
 	failed           []int
 	warmHit          bool
 	enterSecondsPaid float64
+	occ              calexec.OccupancyRaw
 }
 
 func (f *fakeResults) Sink(_ calexec.Manifest) warm.Sink {
@@ -130,13 +150,13 @@ func (f *fakeResults) Sink(_ calexec.Manifest) warm.Sink {
 	return s
 }
 
-func (f *fakeResults) WriteSummary(_ context.Context, man calexec.Manifest, failed []int, warmHit bool, enterSecondsPaid float64) error {
+func (f *fakeResults) WriteSummary(_ context.Context, man calexec.Manifest, failed []int, warmHit bool, enterSecondsPaid float64, occ calexec.OccupancyRaw) error {
 	if f.writeErr != nil {
 		return f.writeErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.summaries = append(f.summaries, writtenSummary{man: man, failed: failed, warmHit: warmHit, enterSecondsPaid: enterSecondsPaid})
+	f.summaries = append(f.summaries, writtenSummary{man: man, failed: failed, warmHit: warmHit, enterSecondsPaid: enterSecondsPaid, occ: occ})
 	return nil
 }
 
@@ -411,5 +431,102 @@ func TestWorker_IdleDrainClosesResidentRunner(t *testing.T) {
 	}
 	if sup.IsWarm() {
 		t.Error("supervisor still warm after idle-drain; Close should have run")
+	}
+}
+
+// TestWorker_HeartbeatExtendsVisibilityDuringLongDrain proves calque#131's
+// fix: a claim whose DrainBatch runs longer than one heartbeat interval must
+// have Queue.Extend called at least once WHILE it's still draining, not just
+// (accidentally) after. heartbeatInterval is overridden to a few
+// milliseconds — the real 900s/3 production interval would make this test
+// take minutes — mirroring queue.go's poolOpenRetryDelay pattern of a
+// package var tests shrink.
+func TestWorker_HeartbeatExtendsVisibilityDuringLongDrain(t *testing.T) {
+	origInterval := heartbeatInterval
+	heartbeatInterval = func(int) time.Duration { return 20 * time.Millisecond }
+	defer func() { heartbeatInterval = origInterval }()
+
+	q := newFakeQueue()
+	fetcher := &fakeFetcher{}
+	results := &fakeResults{}
+	sup := &warm.Supervisor{Python: python(t), Script: runnerScript(t)}
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+
+	// A method body that sleeps well past several heartbeat ticks (20ms each)
+	// so the heartbeat goroutine gets multiple chances to fire before
+	// DrainBatch returns.
+	man := calexec.Manifest{
+		EnterBody:  `pass`,
+		MethodBody: "import time\ntime.sleep(0.3)\nreturn {'ok': True}",
+		MethodArg:  "payload",
+	}
+	man.Items = items("a")
+	stageManifest(t, fetcher, "s3://b/claim1.json", man)
+	q.submit(ClaimRef{RunID: "run-1", Model: "resnet", ManifestURI: "s3://b/claim1.json"})
+
+	w := &Worker{
+		Queue: q, Fetcher: fetcher, Results: results, Supervisor: sup,
+		Config: WorkerConfig{Model: "resnet", IdleTimeout: 10 * time.Second, VisibilityTimeout: 60},
+		now:    clk.now,
+	}
+
+	done := make(chan struct{})
+	var served int
+	var runErr error
+	go func() { served, runErr = w.Run(context.Background()); close(done) }()
+
+	if !drainClock(t, clk, done) {
+		t.Fatal("worker did not drain within 5s")
+	}
+	if runErr != nil {
+		t.Fatalf("Run error: %v", runErr)
+	}
+	if served != 1 {
+		t.Fatalf("claims served = %d, want 1", served)
+	}
+	if q.extendCount() == 0 {
+		t.Error("Queue.Extend was never called during a drain that outlasted several heartbeat intervals")
+	}
+}
+
+// TestSummary_OccupancyRoundTripsThroughJSON (calque#116): Summary's new
+// Occupancy field must survive a JSON marshal/unmarshal unchanged — this is
+// the exact path a pool worker's WriteSummary and a submitter's
+// json.Unmarshal(summaryBytes, &summary) (cmd/calque/poolsubmit.go) both take,
+// so a field that silently drops on the wire would make emitKForPoolClaim
+// read a zero-value Occupancy no matter what the worker measured.
+func TestSummary_OccupancyRoundTripsThroughJSON(t *testing.T) {
+	mean := 0.83
+	want := Summary{
+		Failed: []int{2, 5}, WarmHit: true, EnterSecondsPaid: 12.5,
+		Occupancy: calexec.OccupancyRaw{
+			MeanOccupancy: &mean, OccupancySource: "dcgm_sm", Samples: 40,
+			Source: "dcgm_sm", IntervalS: 1.0, Measured: true, Scope: calexec.ScopeInference,
+		},
+	}
+	body, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Summary
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Occupancy.MeanOccupancy == nil || *got.Occupancy.MeanOccupancy != mean {
+		t.Errorf("MeanOccupancy = %v, want %v", got.Occupancy.MeanOccupancy, mean)
+	}
+	if got.Occupancy.Scope != calexec.ScopeInference {
+		t.Errorf("Scope = %q, want %q", got.Occupancy.Scope, calexec.ScopeInference)
+	}
+	if !got.Occupancy.Measured {
+		t.Error("Measured = false, want true")
+	}
+	if got.Occupancy.Samples != 40 {
+		t.Errorf("Samples = %d, want 40", got.Occupancy.Samples)
+	}
+	// The pre-existing fields must still round-trip too — this field addition
+	// must not have disturbed them.
+	if got.WarmHit != want.WarmHit || got.EnterSecondsPaid != want.EnterSecondsPaid || len(got.Failed) != 2 {
+		t.Errorf("pre-existing fields changed across round-trip: got %+v", got)
 	}
 }
