@@ -7,10 +7,12 @@ AWS is where the same code *scales* — you own the rectangle and the economics 
 calque is the loan-translation between the two: the same script that ran over 10 items on Modal
 runs over 10,000,000 on AWS **without a logic rewrite** (only a mechanical `gpu=` substitution).
 
-**Current spike target:** batch inference using `.map()` and warm single-node GPU
-workers. Unsupported Modal idioms (serve, async futures, multi-GPU/coupled, some
-config kwargs) are detected and reported, never silently ignored — see the
-capability matrix below.
+**The thesis:** groups hit cases where Modal doesn't scale for them — capacity, cost at
+volume, control — and need an unchanged migration path off it. calque is that path: it
+widens its supported Modal-idiom surface toward real-world scripts (not a fixed test
+corpus), and for anything it doesn't yet support, it says so loudly (a structured leak)
+rather than silently dropping semantics or crashing mysteriously. See the capability
+matrix below for exactly where that frontier is today.
 
 > A *calque* is a structure-preserving translation between languages (English "flea market" ←
 > French *marché aux puces*). That is the job: translate Modal's idioms onto AWS term-by-term,
@@ -18,12 +20,10 @@ capability matrix below.
 
 **This is a spike.** It exists to prove one thing and fake everything else:
 
-- **Prove:** the plumbing carries Modal's semantics onto AWS, and produce the **crossover K** —
-  the workload scale at which AWS becomes cheaper than Modal, from a **real measured run**, not a model.
+- **Prove:** the plumbing carries Modal's semantics onto AWS — a real Modal script's decorators,
+  execution shape, and payload code run unchanged against real AWS hardware.
 - **Fake behind the seam:** all card-selection / cost-optimization intelligence. The recommender
   returns a constant (`RTX PRO 6000`) behind an interface. See `internal/target`.
-
-calque is a **phase detector, not a sales funnel**: below K the honest verdict is "stay on Modal."
 
 ## Quick start (zero spend)
 
@@ -52,7 +52,7 @@ go build -o calque ./cmd/calque      # control plane
 LEAKS: 1 emitted across 1 primitives
 ```
 
-**Produce a crossover K** (full pipeline, dry-run — the default):
+**Run the full pipeline locally** (dry-run — the default, no AWS spend):
 
 ```
 ./calque run --n 100 --dry-run examples/map_batch_inference.py
@@ -60,17 +60,15 @@ LEAKS: 1 emitted across 1 primitives
 
 ```
 [DRY-RUN] not launching a billable instance; driving warm worker locally on a synthetic sample
---- crossover K (§9) ---
-Verdict:    you are running 100.  100 >= K(0) -> CROSS. Code is unchanged; here's the bill.
-
-*** DRY-RUN K IS NOT DEFENSIBLE ***
-Per-item seconds and occupancy are SYNTHETIC (stand-in body, no GPU). A K that
-survives a hostile read requires the real payload on an acquired RTX PRO 6000 (§16.1).
+[DRY-RUN] warm unit ran 50 items, 0 failed; @enter x1 (0.305s), mean 0.0542s/item
+...
+--- leak report (§10) ---
+LEAKS: 3 emitted across 3 primitives
 ```
 
-That's the whole idea in two commands: a mechanical `gpu=` swap, then an honest K —
-stamped **not defensible** here precisely because no real GPU ran. See
-[`examples/`](examples/) for four annotated journeys (analyze, dry-run K, Bedrock
+That's the whole idea in two commands: a mechanical `gpu=` swap, then every pipeline stage
+running end to end against the unchanged script — parse, gate, plan, warm-execute, collect.
+See [`examples/`](examples/) for four annotated journeys (analyze, dry-run, Bedrock
 route-away, and an unsupported-workload refusal), each with real output.
 
 > **Notes.** `analyze`/`run` reach two best-effort network sources (the Bedrock
@@ -84,9 +82,16 @@ route-away, and an unsupported-workload refusal), each with real output.
 Spike, in active build. Tracking lives on GitHub (Issues / Projects / milestones), not local files.
 **Phase 2 (Modal-idiom porting, milestones M5–M10) is merged.**
 
-Verification is layered — offline (unit-tested, no spend), live (run on a real
-acquired GPU), and at scale (the rung that only bites at volume). The matrix reads
-them apart:
+The single most direct answer to "does calque support my script" is
+[`docs/modal-compatibility-matrix.md`](docs/modal-compatibility-matrix.md) — a
+construct-by-construct census against Modal's real API surface and a corpus of
+real-world usage, not a hand-picked list. Everything not yet supported is either
+recognized-and-leaked (detected, explained, never silently dropped) or tracked as an
+open gap; see [`docs/behind-the-seam-register.md`](docs/behind-the-seam-register.md)
+for the deliberate non-goals.
+
+Verification below is layered — offline (unit-tested, no spend), live (run on a real
+acquired GPU), and at scale (larger N, more instances). The matrix reads them apart:
 
 | Capability | Offline tested | Live verified | Scale verified |
 |---|---|---|---|
@@ -95,9 +100,8 @@ them apart:
 | Bedrock gate + route-away (§11) | ✅ | ✅ (live catalog) | n/a |
 | Idiom pass-through (§C) | ✅ | n/a | n/a |
 | Single-instance warm run (§6) | ✅ | ✅ (L4 + RTX PRO 6000, Qwen2.5-1.5B) | ✅ N=1000 |
-| Cost + crossover K (§9) | ✅ | ✅ (all `[measured]`, STAY ON MODAL every rung run so far) | ⏳ N=100 on-demand CROSS still unconfirmed ([template](docs/measured-runs/TEMPLATE-qwen-l4-n100.md)) |
 | Volume sync + commit write-back (§3/§15) | ✅ | ✅ (sync) | — |
-| Multi-instance fan-out / fleet K (§15) | ✅ | ⏳ pending capacity | ⏳ pending N=100k ([#18](https://github.com/spore-host/calque/issues/18)) |
+| Multi-instance `.map()` fan-out (§15) | ✅ | ⏳ pending capacity | ⏳ pending N=100k ([#18](https://github.com/spore-host/calque/issues/18)) |
 | Serve entrypoints (§F) | detect + leak only | ❌ not built | ❌ |
 
 ✅ done · ⏳ blocked/pending · ❌ deliberately not built (see `docs/behind-the-seam-register.md`).
@@ -116,8 +120,6 @@ The per-capability detail follows; nothing is removed, only sequenced under the 
   recorded-not-acted behind the seam, `retries=` wired to the warm supervisor); synchronous invocation
   kinds `.map`/`.starmap`/`.for_each`/`.remote`; async `.spawn`/`.map.aio` recognized-and-leaked.
 - **warm worker** (`warmd` + `runner.py`, §6) — `@enter` once, crash-restart re-drive, partial-failure.
-- **cost + crossover K** (§9) — rate asymmetry (`R_m` for card asked-for vs `R_a` for card substituted-to),
-  willing to say *stay on Modal*, `measured | proxy` flag.
 - **plan** (§5) — truffle resolve+price, `Acquirer` over `spawn.Provision` with capacity-aware
   AZ-sweep retry.
 - **image / exec** — Dockerfile+digest cache; S3 sink/collector; on-instance `warmd` entrypoint.
@@ -127,46 +129,21 @@ The per-capability detail follows; nothing is removed, only sequenced under the 
   is leaked as a semantic gap the spike doesn't reproduce.
 - **multi-instance `.map` fan-out** (§15) — shard N items across S single-node instances acquired **in
   parallel**, drive each shard's `warmd` independently, collect the **union** back into one globally
-  ordered result set + one global `missing[]`, re-drive a dead shard once, fold a **fleet-level K** that
-  sums per-instance overheads. Embarrassingly parallel across independent boxes — *not* §1's forbidden
-  multi-node/gang scheduling. Core is unit-tested offline; `calque real --shards N` wires it.
+  ordered result set + one global `missing[]`, re-drive a dead shard once. Embarrassingly parallel
+  across independent boxes — *not* §1's forbidden multi-node/gang scheduling. Core is unit-tested
+  offline; `calque real --shards N` wires it.
 - **serve entrypoints** (§F) — `@web_endpoint`/`@asgi_app`/`@wsgi_app` are **detected and leaked** as a
-  deferred shape (the spike measures batch + K); a served *Bedrock* model still routes away. The
+  deferred shape (batch is the shape the spike runs); a served *Bedrock* model still routes away. The
   long-lived server is not built — see `docs/serve-architecture.md`.
 - **full pipeline** — `calque run --dry-run` runs every stage locally; `calque session` acquires one
   GPU and runs an N-ramp on it; `calque real --shards N` fans out across a fleet.
 
-**Real measured crossover K — the phase detector working, honestly, on live GPUs.** Every
-run below is committed with raw provenance in
-[`docs/measured-runs/`](docs/measured-runs/README.md) — no number here is claimed without an
-auditable record behind it (see that index's own template-vs-complete distinction):
-
-- **g7e.2xlarge / RTX PRO 6000 (the spike's target card), spot, N-ramp 1/100/1000:**
-  `@enter` loaded once (~173–207s), **0.36–0.40s/item**, occupancy climbing 0.4%→12%→45%
-  as N grows — **STAY ON MODAL at every rung.** At these single-stream occupancies AWS's
-  per-item cost never undercuts Modal's; this is the phase detector saying "not yet," not a
-  failure. See [`2026-07-28-qwen-g7e-spot-ramp.md`](docs/measured-runs/2026-07-28-qwen-g7e-spot-ramp.md).
-- **Same card, N=1000, `--batch-size 32`:** micro-batching made inference ~24x faster
-  per item (0.015s/item) — and *still* **STAY ON MODAL**, because batching cuts Modal's bill too
-  (busy-GPU-seconds billing). See [`2026-07-29-qwen-g7e-batch32.md`](docs/measured-runs/2026-07-29-qwen-g7e-batch32.md).
-- **L4 / g6.2xlarge, N=1:** 1.70s/item, 5% occupancy — **STAY ON MODAL**. See
-  [`2026-07-16-qwen-l4-n1.md`](docs/measured-runs/2026-07-16-qwen-l4-n1.md).
-
-**No committed run has crossed yet.** An on-demand N≈100 CROSS verdict (K ≈ 73 items) was
-reported here previously without a backing raw artifact — that was a process failure (a
-claimed number that skipped this project's own provenance discipline), not a measured result.
-It's been retracted pending an actual run against the
-[open template](docs/measured-runs/TEMPLATE-qwen-l4-n100.md); every occupancy figure above is
-a `whole_run` mean (#71) — see the caveat in
-[`docs/measured-runs/README.md`](docs/measured-runs/README.md) for why that's conservative in
-Modal's favor, not AWS's.
-
-The N=1→N=1000 occupancy climb (0.4%→45%) across the g7e ramp is the phase detector working: same
-code, same model, honest verdict at each scale (§9) — no crossover yet, reported plainly rather than
-rounded up. Getting real inference end-to-end surfaced five genuine deployment findings, each caught
-fast and fixed: worker dir `/opt`→`/tmp`, docker needs `sudo`, IMDSv2 hop-limit 2 for container creds,
-200 GiB root volume for the vLLM image, and vLLM's stdout logs colliding with the warm-worker JSON
-protocol (the §6 "socket draws blood" edge — now isolated + regression-tested).
+**Real inference, verified on live GPUs.** Getting real inference end-to-end across the runs
+in [`docs/measured-runs/`](docs/measured-runs/README.md) surfaced five genuine deployment
+findings, each caught fast and fixed: worker dir `/opt`→`/tmp`, docker needs `sudo`, IMDSv2
+hop-limit 2 for container creds, 200 GiB root volume for the vLLM image, and vLLM's stdout
+logs colliding with the warm-worker JSON protocol (the §6 "socket draws blood" edge — now
+isolated + regression-tested).
 
 **Corpus census (§16.4)** across the test scripts: Bedrock 1 exact-eligible / 1 self-hosted / 4
 identity-hidden; gpu guard 4 clean-swaps / 1 multi-GPU flag / 1 coupled flag / 1 no-gpu.
@@ -185,8 +162,8 @@ script.py
                    [worker] warmd supervises warm Python: @enter once, drain → S3
                    [--shards N] shard items → N instances in parallel → union collect
            └─ collect   gather from S3, ordered by GLOBAL input index (+ global missing[])
-             └─ measure per-item cost + occupancy (tach hook); fleet K sums per-box overhead
-               └─ report cost comparison + crossover K + leaks
+             └─ measure per-item cost + occupancy (tach hook)
+               └─ report leaks
 ```
 
 The Go control plane understands **decorators** (configuration). It does **not** parse function
@@ -200,7 +177,7 @@ The Go control plane understands **decorators** (configuration). It does **not**
 
 ```
 calque analyze <script.py> [...]                      # static passes (gate, gpu, leaks, census)
-calque run [--n N] [--region R] [--dry-run] <script.py>   # full pipeline → crossover K (dry-run default)
+calque run [--n N] [--region R] [--dry-run] <script.py>   # full pipeline, unchanged script (dry-run default)
 ```
 
 The three commands below acquire billable GPU hardware and are gated behind an explicit
@@ -225,7 +202,7 @@ Bedrock API call, calque prints the offer and stops **before** acquiring anythin
 Decisions that shape what the spike *doesn't* do live in `docs/` as durable records:
 
 - [`docs/serve-architecture.md`](docs/serve-architecture.md) — why serve entrypoints are detected +
-  leaked but the long-lived server is not built (§16 success is batch + a measured K).
+  leaked but the long-lived server is not built.
 - [`docs/behind-the-seam-register.md`](docs/behind-the-seam-register.md) — every §1/§4/§18 non-goal
   with the attach point a future build would touch, so "won't-port" stays a documented decision, not a
   silent gap.

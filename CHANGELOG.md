@@ -13,10 +13,9 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 First versioned release ([#61](https://github.com/spore-host/calque/issues/61)).
 calque is still a **spike**: it exists to prove Modal-shaped GPU code runs
-unchanged on AWS and to produce a real measured crossover K, not to be a
-finished product. This tag marks the point where the supported-idiom surface
-and the recognize-and-leak discipline around it are stable enough to be worth
-naming.
+unchanged on AWS, not to be a finished product. This tag marks the point
+where the supported-idiom surface and the recognize-and-leak discipline
+around it are stable enough to be worth naming.
 
 ### Supported today
 
@@ -43,16 +42,13 @@ naming.
   synchronous invocation kinds `.map`/`.starmap`/`.for_each`/`.remote`,
   `.spawn()` classified + block-and-wait fan-out driver, cross-app
   `Function.from_name`/`Cls.from_name` recognized-and-leaked.
-- **Cost + crossover K** (§9): rate asymmetry between the card asked for and
-  the card actually substituted to, `measured`/`proxy` flagged throughout,
-  willing to report "stay on Modal."
 - **Acquisition**: block-and-wait single-target capacity acquire via
   `lagotto/pkg/snipe.Snipe` (AZ-sweep, capacity retry/backoff, deadline).
 - **Volumes** (§3/§15): `Volume.from_name` → S3 prefix, delta-synced before
   `@enter`; `volume.commit()` persisted as an end-of-run write-back.
 - **Multi-instance `.map()` fan-out** (§15): shard N items across S
   independently-acquired instances, collect the ordered union, re-drive one
-  dead shard, fold a fleet-level K.
+  dead shard.
 - **Tenancy**: fixed-layout MIG slice provisioning and MPS trusted-tenant
   sharing for non-MIG cards, plus sticky-worker pool mode (`calque real
   --pool`) keeping a warm process resident across claims.
@@ -76,7 +72,3 @@ structured leak naming the gap — never a silent drop or a mysterious crash.
   today, [#92](https://github.com/spore-host/calque/issues/92)).
 - N=100k multi-instance rung not yet run at real scale
   ([#18](https://github.com/spore-host/calque/issues/18)).
-- No committed run has crossed yet — every completed, provenance-recorded run
-  (see [`docs/measured-runs/`](docs/measured-runs/README.md)) verdicts STAY ON
-  MODAL. An earlier README claim of an on-demand N≈100 CROSS (K≈73) was never
-  backed by a raw artifact and has been retracted.
