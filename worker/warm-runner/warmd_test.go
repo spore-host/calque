@@ -339,3 +339,89 @@ func TestExtrasShippedAndCallable(t *testing.T) {
 		t.Errorf("helper_b.local(10) (which itself calls helper_a) = %v, want 22", m["via_local"])
 	}
 }
+
+// TestStarmapSplatsRealTuples (calque#93): a .starmap()'d unit's method takes
+// TWO positional params (a, b); each item's payload is a real 2-element
+// tuple, e.g. [3, 4]. Config.Starmap=true + MethodArgs=["a","b"] must compile
+// __calque_method__(self, a, b) and call it as fn(self.state, *payload) —
+// proven by asserting the actual SUM comes out correct for every item, not
+// just that nothing crashed (a bug that bound only `a` and left `b` unbound
+// would NameError, but a bug that silently bound the wrong values could still
+// "succeed" with a wrong sum — this test would catch both).
+func TestStarmapSplatsRealTuples(t *testing.T) {
+	sink := newMemSink()
+	sup := &Supervisor{
+		Python: python(t),
+		Script: runnerScript(t),
+		Sink:   sink,
+		Config: Config{
+			EnterBody:  `self.ok = True`,
+			MethodBody: "return a + b",
+			MethodArg:  "a",
+			MethodArgs: []string{"a", "b"},
+			Starmap:    true,
+		},
+	}
+	its := items([]any{1, 2}, []any{3, 4}, []any{10, 20})
+	failed, err := sup.Run(context.Background(), its)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %v, want none", failed)
+	}
+	if len(sink.results) != 3 {
+		t.Fatalf("results = %d, want 3", len(sink.results))
+	}
+	wantSums := []float64{3, 7, 30}
+	for i, want := range wantSums {
+		r, ok := sink.results[i]
+		if !ok {
+			t.Fatalf("missing result for index %d", i)
+		}
+		got, ok := r.Result.(float64)
+		if !ok || got != want {
+			t.Errorf("index %d: sum=%v, want %v (tuple-splat bound the wrong values, or didn't splat at all)", i, r.Result, want)
+		}
+	}
+}
+
+// TestNonStarmapUnaffectedBySplatFields is a regression guard (calque#93): a
+// unit that leaves Starmap unset (the default, every existing map/for_each/
+// remote caller) must keep binding a single positional value even when
+// MethodArgs happens to be populated — Starmap, not MethodArgs' mere
+// presence, is what gates the splat path. This is the exact shape a caller
+// would produce if it always threaded the full arg list but only some units
+// are actually starmap'd.
+func TestNonStarmapUnaffectedBySplatFields(t *testing.T) {
+	sink := newMemSink()
+	sup := &Supervisor{
+		Python: python(t),
+		Script: runnerScript(t),
+		Sink:   sink,
+		Config: Config{
+			EnterBody:  `self.ok = True`,
+			MethodBody: "return payload",
+			MethodArg:  "payload",
+			MethodArgs: []string{"payload"}, // present, but Starmap is false
+			Starmap:    false,
+		},
+	}
+	// A list-shaped payload must NOT be splatted when Starmap is false — it
+	// must come through as the single bound value, unchanged.
+	failed, err := sup.Run(context.Background(), items([]any{1, 2}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %v, want none", failed)
+	}
+	r, ok := sink.results[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	got, ok := r.Result.([]any)
+	if !ok || len(got) != 2 {
+		t.Errorf("result = %#v, want the list [1,2] bound whole (not splatted) since Starmap=false", r.Result)
+	}
+}

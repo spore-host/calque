@@ -170,14 +170,40 @@ func TestPickWarmUnitUnscopedWhenNotAmbiguous(t *testing.T) {
 	}
 }
 
-// TestCheckInvokeSupportStarmapRefuses (calque#83): the warm runner only binds
-// one positional arg per item — a .starmap'd unit (tuple-splat) would crash
-// every item if run silently as .map. Must refuse with a clear reason.
-func TestCheckInvokeSupportStarmapRefuses(t *testing.T) {
+// TestCheckInvokeSupportStarmapRefusesWithoutRealItems (calque#83, narrowed by
+// calque#93): a .starmap'd unit with NO statically-resolvable iterable
+// (fn.Items nil) has no real tuple data to splat — falling back to a
+// synthesized single-value placeholder would crash just as badly as never
+// splatting did, so this must still refuse.
+func TestCheckInvokeSupportStarmapRefusesWithoutRealItems(t *testing.T) {
 	rep := &leak.Report{}
 	fn := ir.Function{Name: "combine", Invoke: ir.InvokeStarmap}
 	if err := checkInvokeSupport("script.py", fn, rep); err == nil {
-		t.Fatal("expected an error refusing a .starmap'd warm unit, got nil")
+		t.Fatal("expected an error refusing a .starmap'd warm unit with no real Items, got nil")
+	}
+}
+
+// TestCheckInvokeSupportStarmapRunsWithRealItems (calque#93): a .starmap'd
+// unit WITH real tuple data extracted at parse time (fn.Items non-empty) must
+// no longer refuse — the runner can now splat real tuples. This is a leak
+// (informational), not an error.
+func TestCheckInvokeSupportStarmapRunsWithRealItems(t *testing.T) {
+	rep := &leak.Report{}
+	fn := ir.Function{
+		Name: "combine", Invoke: ir.InvokeStarmap, Line: 12,
+		Items: []any{[]any{float64(1), float64(2)}, []any{float64(3), float64(4)}},
+	}
+	if err := checkInvokeSupport("script.py", fn, rep); err != nil {
+		t.Fatalf("checkInvokeSupport(.starmap with real Items) must not error, got: %v", err)
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "combine") && strings.Contains(l.Detail, "starmap") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf(".starmap-with-real-data should still be noted in the leak report; leaks=%+v", rep.Leaks)
 	}
 }
 

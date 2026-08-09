@@ -9,6 +9,18 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+### Added
+
+- **`.starmap()` tuple-splat execution** (calque#93): a `.starmap()`'d warm
+  unit now actually RUNS instead of refusing, when the script's real iterable
+  was statically resolved at parse time (calque#136) — the warm runner
+  (`worker/warm-runner/runner.py`) binds every one of the callable's
+  positional params and splats each item's tuple (`fn(self.state, *payload)`)
+  rather than binding only the first arg. `checkInvokeSupport`
+  (`cmd/calque/run.go`) narrows its refusal to the one case that's still
+  genuinely unsafe: a `.starmap`'d unit with no statically-resolvable
+  iterable at all (nothing real to splat).
+
 ## [0.1.0] - 2026-08-09
 
 First versioned release ([#61](https://github.com/spore-host/calque/issues/61)).

@@ -443,20 +443,33 @@ func swapLegal(glog *gpu.Log, owner string) bool {
 	return false
 }
 
-// checkInvokeSupport reports whether the warm runner's single-arg,
-// always-collects-a-result protocol (§6) can faithfully drive fn's invocation
-// idiom (calque#83). .starmap needs tuple-splat (multiple positional args per
-// item) — running it as .map would bind only the first and crash every item
-// (confirmed via a live repro: a raw NameError for the unbound second+ arg,
-// with nothing pointing at the real cause) — so this returns a hard error
-// naming the mismatch instead. .for_each shares .map's single-arg signature
-// and runs correctly; the only difference is Modal discards the return value
-// where calque collects+reports it — a leak, not a refusal, since nothing
-// crashes and the mismatch is honest but minor.
+// checkInvokeSupport reports whether the warm runner's protocol (§6) can
+// faithfully drive fn's invocation idiom. .for_each shares .map's single-arg
+// signature and runs correctly; the only difference is Modal discards the
+// return value where calque collects+reports it — a leak, not a refusal,
+// since nothing crashes and the mismatch is honest but minor.
+//
+// .starmap needed tuple-splat (multiple positional args per item), which the
+// runner now supports (calque#93, worker/warm-runner/runner.py's
+// _compile_method/item()) whenever there's REAL tuple data to splat — a
+// literal list-of-tuples or range() the parser statically resolved into
+// fn.Items (calque#136). What .starmap still can't survive is the OTHER
+// half of #83's original finding: no real tuple data at all, meaning the
+// run would have to fall back to a synthesized SINGLE-value placeholder
+// (dry-run-item-%d, a canned sentence, ...) — splatting a plain string
+// crashes just as badly as never splatting did (confirmed by #83's original
+// live repro). So the refusal narrows from "any .starmap'd unit" to "a
+// .starmap'd unit with no statically-resolvable iterable" — the one case
+// realOrSyntheticItems (items.go) can't make splat-safe on its own, because
+// there is no real per-item shape to consult.
 func checkInvokeSupport(script string, fn ir.Function, rep *leak.Report) error {
 	switch fn.Invoke {
 	case ir.InvokeStarmap:
-		return fmt.Errorf("%s is .starmap()'d (tuple-splat args); the warm runner only binds one positional arg per item (§6) and would crash every item — not yet supported, see leak report", fn.Name)
+		if len(fn.Items) == 0 {
+			return fmt.Errorf("%s is .starmap()'d but its iterable wasn't statically resolvable (not a literal list of tuples or range()); the warm runner has no real tuple data to splat and refuses rather than crash on a synthesized single-value placeholder — see leak report", fn.Name)
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, fn.Line,
+			"%s is .starmap()'d; the warm runner splats each item's tuple across %s's positional args (calque#93) using the real iterable data extracted at parse time", fn.Name, fn.Name)
 	case ir.InvokeForEach:
 		rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, fn.Line,
 			"%s is .for_each()'d (side-effects only, no result collection in real Modal); calque collects+reports a result per item anyway — harmless but not a faithful .for_each", fn.Name)
@@ -478,6 +491,16 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 	if arg == "" {
 		arg = "item"
 	}
+	// calque#93: a .starmap()'d unit needs the FULL non-self/cls arg list (not
+	// just the first) so the runner can bind every one of them, and a
+	// tuple-shaped fallback synth closure so a too-short/unresolvable real
+	// iterable still produces something splat-compatible instead of crashing
+	// on a single-string payload. checkInvokeSupport already refused any
+	// starmap unit with NO real Items at all — reaching here means there's
+	// real tuple data, but realOrSyntheticItems can still fall back per-call
+	// if `sample` asks for more items than the real data has.
+	isStarmap := unit.method.Invoke == ir.InvokeStarmap
+	methodArgs := nonSelfArgs(unit.method.Args)
 	// The real @enter/@method bodies need a GPU + model weights we don't have
 	// locally. A dry-run proves the PLUMBING (warm-once, framing, ordered collect,
 	// per-item timing), not the model — so we substitute trivial CPU stand-in
@@ -514,18 +537,22 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 		Script: runnerScriptPath(),
 		Sink:   sink,
 		Leak:   leakAdapter{rep},
-		Config: warm.Config{EnterBody: enterBody, MethodBody: methodBody, MethodArg: arg, Extras: extras},
+		Config: warm.Config{
+			EnterBody: enterBody, MethodBody: methodBody, MethodArg: arg, Extras: extras,
+			MethodArgs: methodArgs, Starmap: isStarmap,
+		},
 		// B3: retries= (portable config) caps the warm supervisor's crash re-drive.
 		// 0 leaves warmd's sane default.
 		MaxRestarts: unit.class.Config.Retries,
 	}
-	// calque#136: drive the script's REAL .map()/.starmap() iterable when pyast
-	// statically resolved one long enough for `sample` items, else fall back to
-	// the pre-existing synthesized placeholder (unchanged behavior for every
-	// script whose iterable wasn't statically resolvable).
-	items := realOrSyntheticItems(unit, sample, func(i int) any {
-		return fmt.Sprintf("dry-run-item-%d", i)
-	}, rep)
+	// calque#136/#93: drive the script's REAL .map()/.starmap() iterable when
+	// pyast statically resolved one long enough for `sample` items, else fall
+	// back to a synthesized placeholder. A .starmap()'d unit's fallback must
+	// ALSO be tuple-shaped (one element per methodArgs entry) — a bare string
+	// would crash item()'s *payload splat rather than silently mis-bind, so
+	// the fallback closure differs by invocation kind (unchanged for
+	// map/for_each/remote, which still get the original single string).
+	items := realOrSyntheticItems(unit, sample, starmapAwareSynth(isStarmap, methodArgs), rep)
 	start := time.Now()
 	failed, err := sup.Run(ctx, items)
 	if err != nil {
@@ -539,6 +566,47 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 	fmt.Printf("[DRY-RUN] warm unit ran %d items, %d failed; @enter x%d (%.3fs), mean %.4fs/item\n",
 		sample, len(failed), sup.EnterCount, sup.EnterSeconds, m.PerItem.MeanSecs)
 	return nil
+}
+
+// nonSelfArgs filters "self"/"cls" out of a Function.Args list (calque#93),
+// giving the runner the FULL ordered per-item parameter list a .starmap()'d
+// method binds — e.g. ["a","b"] for combine(self, a, b). Mirrors
+// internal/parse.firstItemArg's self/cls skip, but keeps every remaining name
+// instead of just the first.
+func nonSelfArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "self" || a == "cls" {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// starmapAwareSynth returns the per-index fallback payload closure
+// realOrSyntheticItems falls back to when the picked unit's real Items are
+// nil or shorter than the requested sample (calque#93). A non-starmap unit
+// keeps the pre-existing single-string placeholder, byte-identical to before
+// this change. A starmap unit's fallback must ALSO be tuple-shaped — one
+// synthesized element per methodArgs entry (e.g. (i, i) for two params) — so
+// that even the "no real tuple data" fallback path stays splat-compatible:
+// runner.py's item() splats *payload whenever starmap is set, and splatting a
+// single string would crash (or silently iterate its characters) rather than
+// bind cleanly. checkInvokeSupport already refuses a starmap unit with NO
+// real Items at all, so this closure only ever fires for the narrower
+// "some real Items, but --n/sample asked for more" case.
+func starmapAwareSynth(isStarmap bool, methodArgs []string) func(i int) any {
+	if !isStarmap || len(methodArgs) == 0 {
+		return func(i int) any { return fmt.Sprintf("dry-run-item-%d", i) }
+	}
+	return func(i int) any {
+		tuple := make([]any, len(methodArgs))
+		for j := range methodArgs {
+			tuple[j] = i
+		}
+		return tuple
+	}
 }
 
 // bodyNeedsGPU is a heuristic: does this verbatim body import/use something that

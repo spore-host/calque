@@ -39,6 +39,19 @@ type Config struct {
 	EnterBody  string `json:"enter_body"`
 	MethodBody string `json:"method_body"`
 	MethodArg  string `json:"method_arg"`
+	// MethodArgs carries every non-self/cls parameter name from the picked
+	// @method/@function's real signature (calque#93), in order — e.g.
+	// ["a","b"] for combine(self, a, b). Only consulted when Starmap is true:
+	// the runner binds ALL of them (tuple-splat), not just MethodArg (the
+	// first). Nil/empty for every other invocation kind, where MethodArg
+	// alone still fully describes the existing single-arg bind path.
+	MethodArgs []string `json:"method_args,omitempty"`
+	// Starmap tells the runner this unit is .starmap()'d (calque#93): compile
+	// __calque_method__ with ALL of MethodArgs bound, and call it as
+	// fn(self.state, *payload) instead of fn(self.state, payload) whenever
+	// payload is list/tuple-shaped. false (the default) reproduces the
+	// original single-arg bind path byte-for-byte.
+	Starmap bool `json:"starmap,omitempty"`
 	// Extras are sibling functions referenced via .local() from EnterBody or
 	// MethodBody (calque#92) — compiled into the runner's shared globals
 	// alongside @enter/@method so the verbatim calling body's helper(...) /
@@ -566,6 +579,7 @@ func (s *Supervisor) warmUp(rn *runner) error {
 	if err := rn.send(map[string]any{
 		"kind": "config", "enter_body": s.Config.EnterBody,
 		"method_body": s.Config.MethodBody, "method_arg": s.Config.MethodArg,
+		"method_args": s.Config.MethodArgs, "starmap": s.Config.Starmap,
 		"concurrency": conc, "extras": extras,
 	}); err != nil {
 		return err

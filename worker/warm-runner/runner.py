@@ -58,10 +58,27 @@ class Runner:
     across items. See _exec_body.
     """
 
-    def __init__(self, enter_body: str, method_body: str, method_arg: str, extras: list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        enter_body: str,
+        method_body: str,
+        method_arg: str,
+        extras: list[dict] | None = None,
+        method_args: list[str] | None = None,
+        starmap: bool = False,
+    ) -> None:
         self.enter_body = enter_body
         self.method_body = method_body
         self.method_arg = method_arg  # the @method's item parameter name, e.g. "prompt"
+        # method_args (calque#93) is the FULL non-self/cls parameter list, e.g.
+        # ["a","b"] for combine(self,a,b) — only meaningful when starmap is True.
+        # Falls back to [method_arg] so _compile_method has something to bind
+        # even if a caller sets starmap without also setting method_args.
+        self.method_args = method_args or ([method_arg] if method_arg else [])
+        # starmap (calque#93): this unit is .starmap()'d — bind EVERY name in
+        # method_args (tuple-splat), not just the first. False (the default)
+        # is the original single-arg bind path, byte-for-byte unchanged.
+        self.starmap = starmap
         self.extras = extras or []  # .local()-referenced sibling functions (calque#92)
         self.entered = False
         # The warm namespace: a stand-in for the @cls instance `self`. Bodies see
@@ -105,7 +122,17 @@ class Runner:
         fn = self._method_fn
         if fn is None:  # method body compiled lazily at first enter
             raise RuntimeError("method not compiled; enter did not run")
-        result = fn(self.state, payload)
+        # calque#93: a .starmap()'d unit's payload is a tuple/list of the
+        # callable's real positional args (e.g. [1, 2] for combine(1, 2)) —
+        # splat it so every one of __calque_method__'s params binds, matching
+        # Modal's own tuple-unpack semantics. Every other invocation kind
+        # (map/for_each/remote) is unaffected: starmap defaults False, so this
+        # branch is simply never taken and fn(self.state, payload) runs exactly
+        # as before.
+        if self.starmap and isinstance(payload, (list, tuple)):
+            result = fn(self.state, *payload)
+        else:
+            result = fn(self.state, payload)
         return result, time.perf_counter() - t0
 
     def batch(self, payloads: list) -> Any:
@@ -149,7 +176,16 @@ class Runner:
         """
         body = self.method_body
         indented = "\n".join("    " + ln for ln in body.splitlines()) or "    pass"
-        src = f"def __calque_method__(self, {self.method_arg}):\n{indented}\n"
+        # calque#93: a .starmap()'d unit's real signature takes MULTIPLE
+        # positional args (e.g. combine(self, a, b)) — bind every name in
+        # method_args, not just the first, so item()'s *payload splat has
+        # somewhere to land. Every other invocation kind keeps the original
+        # single-param signature, unchanged.
+        if self.starmap and self.method_args:
+            params = ", ".join(self.method_args)
+        else:
+            params = self.method_arg
+        src = f"def __calque_method__(self, {params}):\n{indented}\n"
         code = compile(src, "<calque-method>", "exec")
         exec(code, self.globals)
         self._method_fn = self.globals["__calque_method__"]
@@ -296,6 +332,8 @@ def main(argv: list[str] | None = None) -> int:
                     method_body=msg.get("method_body", ""),
                     method_arg=msg.get("method_arg", "item"),
                     extras=msg.get("extras") or [],
+                    method_args=msg.get("method_args") or None,
+                    starmap=bool(msg.get("starmap", False)),
                 )
                 # concurrency=C>1 => items run in a C-wide thread pool so inference
                 # overlaps (vLLM batches in-flight requests). Absent/1 => the serial
