@@ -67,7 +67,11 @@ type pyFunc struct {
 	Args       []string      `json:"args"`
 	Decorators []pyDecorator `json:"decorators"`
 	EntryKind  string        `json:"entry_kind"` // "serve" for a serve entrypoint, else "" (§F)
-	Body       string        `json:"body"`
+	// LocalCalls are .local()-called sibling targets referenced ANYWHERE inside
+	// this function/method's own body (calque#92) — dotted call targets, leaf-
+	// resolved the same way every other invoke target is (see leafName).
+	LocalCalls []string `json:"local_calls"`
+	Body       string   `json:"body"`
 }
 
 type pyDecorator struct {
@@ -487,7 +491,11 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 		Line:      f.Lineno,
 		Invoke:    invokes[f.Name],
 		EntryKind: ir.EntryKind(f.EntryKind), // "serve" or "" (§F)
+		Args:      f.Args,
 		ItemArg:   firstItemArg(f.Args),
+	}
+	for _, lc := range f.LocalCalls {
+		fn.LocalCalls = append(fn.LocalCalls, leafName(lc))
 	}
 	fn.IsMap = fn.Invoke == ir.InvokeMap // back-compat: IsMap tracks the .map() idiom
 	// The function-config decorator is the one named "*.function" (or "*.method"
@@ -514,6 +522,9 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 	cls.GPU, cls.Volumes, cls.Timeout, cls.Config = gpu, vols, timeout, cfg
 	if c.Enter != nil {
 		cls.EnterBody = c.Enter.Body
+		for _, lc := range c.Enter.LocalCalls {
+			cls.EnterLocalCalls = append(cls.EnterLocalCalls, leafName(lc))
+		}
 	} else {
 		// A @cls with no @enter still runs, but the warm-load-once economics (§6)
 		// don't apply — worth noting since it changes the amortization story.

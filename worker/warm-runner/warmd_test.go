@@ -296,3 +296,46 @@ func TestPartialFailureDoesNotReload(t *testing.T) {
 		t.Errorf("EnterCount = %d, want 1 (a bad ITEM must not reload the model)", sup.EnterCount)
 	}
 }
+
+// TestExtrasShippedAndCallable (calque#92): a .local()-referenced sibling
+// function shipped via Config.Extras must be callable from @method BOTH as a
+// bare call (helper(x), how real Modal code sometimes writes it) and as
+// helper.local(x) (the explicit same-process form) — real scripts use both
+// styles, and calque's bodies-are-payload rule means neither call site's
+// verbatim text is rewritten. A second extra (helper_b) calls the first
+// (helper_a), proving extras share self.globals and can call each other.
+func TestExtrasShippedAndCallable(t *testing.T) {
+	sink := newMemSink()
+	sup := &Supervisor{
+		Python: python(t),
+		Script: runnerScript(t),
+		Sink:   sink,
+		Config: Config{
+			EnterBody:  `self.ok = True`,
+			MethodBody: "bare = helper_a(payload)\nviaLocal = helper_b.local(payload)\nreturn {'bare': bare, 'via_local': viaLocal}",
+			MethodArg:  "payload",
+			Extras: []ExtraFunc{
+				{Name: "helper_a", Args: []string{"x"}, Body: "return x + 1"},
+				{Name: "helper_b", Args: []string{"y"}, Body: "return helper_a(y) * 2"},
+			},
+		},
+	}
+	failed, err := sup.Run(context.Background(), items(10))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %v, want none", failed)
+	}
+	r, ok := sink.results[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	m := r.Result.(map[string]any)
+	if int(m["bare"].(float64)) != 11 {
+		t.Errorf("bare helper_a(10) = %v, want 11", m["bare"])
+	}
+	if int(m["via_local"].(float64)) != 22 {
+		t.Errorf("helper_b.local(10) (which itself calls helper_a) = %v, want 22", m["via_local"])
+	}
+}

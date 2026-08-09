@@ -83,8 +83,13 @@ type Function struct {
 	Invoke    InvokeKind        // how the callable is invoked (map/starmap/for_each/remote); §C
 	EntryKind EntryKind         // execution shape: batch (default) or serve (§F)
 	Body      string            // verbatim payload, shipped to the worker
+	Args      []string          // verbatim parameter names, incl. self/cls (calque#92: needed to reconstruct a .local()-referenced sibling's call signature)
 	ItemArg   string            // first non-self parameter name — the per-item arg the warm runner binds
-	Line      int               // source line of the def, for leak attribution
+	// LocalCalls are the leaf names of sibling callables THIS function's own
+	// body references via .local() (calque#92) — a property of the body, not
+	// of how this function itself is invoked (distinct from Invoke/IsMap).
+	LocalCalls []string
+	Line       int // source line of the def, for leak attribution
 }
 
 // EntryKind is a callable's execution shape (§F). Serve entrypoints are long-lived
@@ -126,7 +131,11 @@ type Class struct {
 	EnterBody string     // @modal.enter body — runs ONCE in the warm runner (§6)
 	HasExit   bool       // @modal.exit() present (calque#86); teardown is not reproduced
 	Methods   []Function // @modal.method bodies
-	Line      int
+	// EnterLocalCalls are sibling callables the @enter body itself references
+	// via .local() (calque#92) — EnterBody is a bare string with no other Function
+	// to carry this on.
+	EnterLocalCalls []string
+	Line            int
 }
 
 // GPUSpec is the parsed form of a raw gpu= string: card plus requested count.

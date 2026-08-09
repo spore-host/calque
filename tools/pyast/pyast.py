@@ -141,6 +141,23 @@ def _arg_names(node: ast.FunctionDef) -> list[str]:
     return names
 
 
+def _local_calls(node: ast.FunctionDef) -> list[str]:
+    """.local() call targets referenced ANYWHERE inside node's own body
+    (calque#92) — a nested-function-scoped scan, unlike visit_Call's
+    module-wide walk, so each function/method carries exactly the sibling
+    names IT ITSELF references. Same target-extraction as visit_Call's
+    "local" branch (the trailing attribute before .local is the callee)."""
+    targets: set[str] = set()
+    for n in ast.walk(node):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "local"
+        ):
+            targets.add(".".join(_attr_chain(n.func)[:-1]))
+    return sorted(targets)
+
+
 # Serve decorators (§F): long-lived request-driven entrypoints. Detected so the Go
 # side can gate/leak them (build is deferred — §16 success is batch+K), never
 # silently treated as batch. Matched by the trailing decorator name.
@@ -173,6 +190,7 @@ def _describe_fn(src: str, node: ast.FunctionDef) -> dict[str, Any]:
         "args": _arg_names(node),
         "decorators": decos,
         "entry_kind": _entry_kind([d["name"] for d in decos]),
+        "local_calls": _local_calls(node),
         # PAYLOAD — verbatim, never interpreted:
         "body": _body_source(src, node),
     }

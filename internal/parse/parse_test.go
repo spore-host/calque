@@ -493,3 +493,52 @@ func TestSpawnCallSitesCapturesStringAndNumericArgs(t *testing.T) {
 		t.Errorf("expected at least one worker_a call site with a nil arg (the variable-arg spawn from caller); sites=%+v", sites)
 	}
 }
+
+// TestLocalCallsPopulatedFromFixture (calque#92): each function/method's own
+// LocalCalls carries exactly the sibling names ITS OWN body references via
+// .local() — run_blend reaches both a plain function (stage_one) and a @cls
+// method (score) directly, and stage_one itself reaches stage_two one hop
+// deeper (proving the field is per-function, not a whole-script union).
+func TestLocalCallsPopulatedFromFixture(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/local_chain.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	runBlend, ok := app.FindFunction("run_blend")
+	if !ok {
+		t.Fatal(`FindFunction("run_blend") = false, want true`)
+	}
+	wantRunBlend := map[string]bool{"stage_one": true, "score": true}
+	if len(runBlend.LocalCalls) != len(wantRunBlend) {
+		t.Errorf("run_blend.LocalCalls = %v, want %v", runBlend.LocalCalls, wantRunBlend)
+	}
+	for _, lc := range runBlend.LocalCalls {
+		if !wantRunBlend[lc] {
+			t.Errorf("run_blend.LocalCalls contains unexpected %q", lc)
+		}
+	}
+
+	stageOne, ok := app.FindFunction("stage_one")
+	if !ok {
+		t.Fatal(`FindFunction("stage_one") = false, want true`)
+	}
+	if len(stageOne.LocalCalls) != 1 || stageOne.LocalCalls[0] != "stage_two" {
+		t.Errorf("stage_one.LocalCalls = %v, want [stage_two]", stageOne.LocalCalls)
+	}
+	if len(stageOne.Args) == 0 || stageOne.Args[0] != "y" {
+		t.Errorf("stage_one.Args = %v, want first arg %q", stageOne.Args, "y")
+	}
+
+	stageTwo, ok := app.FindFunction("stage_two")
+	if !ok {
+		t.Fatal(`FindFunction("stage_two") = false, want true`)
+	}
+	if len(stageTwo.LocalCalls) != 0 {
+		t.Errorf("stage_two.LocalCalls = %v, want empty (it calls nothing via .local())", stageTwo.LocalCalls)
+	}
+}

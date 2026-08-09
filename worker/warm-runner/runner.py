@@ -58,10 +58,11 @@ class Runner:
     across items. See _exec_body.
     """
 
-    def __init__(self, enter_body: str, method_body: str, method_arg: str) -> None:
+    def __init__(self, enter_body: str, method_body: str, method_arg: str, extras: list[dict] | None = None) -> None:
         self.enter_body = enter_body
         self.method_body = method_body
         self.method_arg = method_arg  # the @method's item parameter name, e.g. "prompt"
+        self.extras = extras or []  # .local()-referenced sibling functions (calque#92)
         self.entered = False
         # The warm namespace: a stand-in for the @cls instance `self`. Bodies see
         # it as `self`; whatever @enter assigns (self.llm = ...) lives here and is
@@ -78,6 +79,10 @@ class Runner:
             # refuse rather than silently reload (which would destroy the economics).
             raise RuntimeError("enter called twice; model would reload (see spec §6)")
         t0 = time.perf_counter()
+        # Extras go into self.globals FIRST — before @enter itself runs — so an
+        # @enter body that .local()-calls a sibling (calque#92) can resolve it too,
+        # not just @method.
+        self._compile_extras()
         self._exec_body(self.enter_body, extra_locals={})
         # Compile the @method body once, AFTER @enter (so any imports @enter added to
         # self.globals are in scope for the method). Reused for every item, incl.
@@ -149,11 +154,53 @@ class Runner:
         exec(code, self.globals)
         self._method_fn = self.globals["__calque_method__"]
 
+    def _compile_extras(self) -> None:
+        """Compile every .local()-referenced sibling function (calque#92) into
+        self.globals, so the CALLING body's verbatim `helper(x)` or
+        `helper.local(x)` text resolves unmodified — bodies stay payload, never
+        rewritten. Unlike @enter/@method, an extra's own real Modal signature has
+        NO `self` (it's a plain @app.function, not a @cls method) — its args are
+        used exactly as captured.
+
+        All extras land in self.globals before any of them (or @enter/@method)
+        actually runs, and Python resolves bare names at CALL time — so extras
+        can reference each other, including self-reference and cycles, with no
+        compile-order requirement here (calque#92's Go-side transitive-closure
+        walk already bounds WHICH extras are shipped; this just binds them).
+        """
+        for i, extra in enumerate(self.extras):
+            name = extra["name"]
+            args = extra.get("args") or []
+            body = extra.get("body") or ""
+            indented = "\n".join("    " + ln for ln in body.splitlines()) or "    pass"
+            fn_name = f"__calque_extra_{i}__"
+            src = f"def {fn_name}({', '.join(args)}):\n{indented}\n"
+            code = compile(src, f"<calque-extra:{name}>", "exec")
+            exec(code, self.globals)
+            self.globals[name] = _LocalCallable(self.globals[fn_name])
+
 
 class _Namespace:
     """A permissive attribute bag standing in for the @cls `self`."""
 
     pass
+
+
+class _LocalCallable:
+    """Wraps a compiled .local()-referenced sibling function (calque#92) so a
+    verbatim Modal call site works UNCHANGED whether written as `helper(x)`
+    (a bare call — same process either way in real Modal) or `helper.local(x)`
+    (explicit same-process call) — real Python functions have no `.local`
+    attribute, only Modal's SDK-wrapped callables do, so this stands in for
+    that wrapper.
+    """
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+        self.local = fn  # `.local(...)` call sites bind straight to the same fn
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
 
 
 # The protocol channel. warmd frames responses as newline-JSON on our stdout —
@@ -248,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
                     enter_body=msg.get("enter_body", ""),
                     method_body=msg.get("method_body", ""),
                     method_arg=msg.get("method_arg", "item"),
+                    extras=msg.get("extras") or [],
                 )
                 # concurrency=C>1 => items run in a C-wide thread pool so inference
                 # overlaps (vLLM batches in-flight requests). Absent/1 => the serial

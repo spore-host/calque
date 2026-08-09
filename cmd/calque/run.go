@@ -153,7 +153,7 @@ func run(o runOpts) error {
 
 	if o.dryRun {
 		fmt.Println("\n[DRY-RUN] not launching a billable instance; driving warm worker locally on a synthetic sample")
-		if err := dryRunWarm(ctx, unit, o.n, &m, rep); err != nil {
+		if err := dryRunWarm(ctx, app, unit, o.n, &m, rep); err != nil {
 			return fmt.Errorf("dry-run warm: %w", err)
 		}
 	} else {
@@ -283,6 +283,66 @@ func syntheticClass(f ir.Function) ir.Class {
 	return ir.Class{Name: f.Name, GPU: f.GPU, Config: f.Config, Line: f.Line}
 }
 
+// collectLocalExtras resolves the transitive closure of sibling functions the
+// picked warm unit's own body references via .local() (calque#92) — real
+// idiomatic Modal code (confirmed on AI-Almanac's blending_app.py, calque#79)
+// chains plain @app.functions together this way, and calque previously shipped
+// only the picked unit's own body, guaranteeing a NameError.
+//
+// Only plain @app.function targets are resolved and shipped. A .local() call
+// that resolves to a @cls METHOD is deliberately left unsupported (leaked, not
+// shipped): that method would need its own warm @enter state, a materially
+// bigger feature this pass doesn't attempt (see calque#92's own "approach 1 is
+// more robust... revisit if a real adopter needs it" framing).
+//
+// visited is checked (and set) BEFORE enqueueing a name, not just before
+// shipping — this is what bounds a self-referential (f calling f.local(...))
+// or cyclic (a->b->a) chain to one visit per name rather than looping forever.
+func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) []warm.ExtraFunc {
+	visited := map[string]bool{}
+	var queue []string
+	enqueue := func(names []string) {
+		for _, n := range names {
+			if !visited[n] {
+				visited[n] = true
+				queue = append(queue, n)
+			}
+		}
+	}
+	enqueue(unit.method.LocalCalls)
+	enqueue(unit.class.EnterLocalCalls)
+
+	var extras []warm.ExtraFunc
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if fn, ok := app.FindFunction(name); ok {
+			extras = append(extras, warm.ExtraFunc{Name: fn.Name, Args: fn.Args, Body: fn.Body})
+			enqueue(fn.LocalCalls)
+			continue
+		}
+		if resolvesToClassMethod(app, name) {
+			rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, 0,
+				"%s.local(...): resolves to a @cls method — not shipped (no warm @enter state outside the picked unit); will NameError", name)
+		}
+	}
+	return extras
+}
+
+// resolvesToClassMethod reports whether name matches any @cls method across
+// app.Classes — a flat leaf-name scan, matching every other invoke-target
+// lookup's convention (leafName-keyed, no per-class disambiguation).
+func resolvesToClassMethod(app ir.App, name string) bool {
+	for _, c := range app.Classes {
+		for _, m := range c.Methods {
+			if m.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // serveApp reports whether the app has any serve-shaped entrypoint (§F). Serve is
 // detected and gated/leaked, but the long-lived server is not built in the spike.
 func serveApp(app ir.App) bool {
@@ -338,7 +398,7 @@ func checkInvokeSupport(script string, fn ir.Function, rep *leak.Report) error {
 // dryRunWarm drives the real warmd supervisor + runner.py LOCALLY over a small
 // synthetic sample, so we exercise the warm-once path and collect real per-item
 // wall-clock without any AWS. Occupancy stays unmeasured (no GPU) -> proxy flag.
-func dryRunWarm(ctx context.Context, unit warmUnit, n int, m *measure.Measurement, rep *leak.Report) error {
+func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measure.Measurement, rep *leak.Report) error {
 	sample := n
 	if sample > 50 {
 		sample = 50 // a dry-run measures per-item on a small sample; scale is modeled, not run
@@ -365,13 +425,27 @@ func dryRunWarm(ctx context.Context, unit warmUnit, n int, m *measure.Measuremen
 		// only comes from the acquired-instance run; this K is plumbing proof only.
 		methodBody = "import time\ntime.sleep(0.05)\nself.calls += 1\nreturn {'dry_run': True, 'n': self.calls}"
 	}
+	// calque#92: ship any sibling functions the picked unit's body reaches via
+	// .local() — previously only leaked, now actually shipped so the dry-run
+	// doesn't NameError on real in-container pipeline chaining (confirmed
+	// blocking on AI-Almanac's blending_app.py, calque#79).
+	extras := collectLocalExtras(app, unit, rep)
+	if len(extras) > 0 {
+		names := make([]string, len(extras))
+		for i, e := range extras {
+			names[i] = e.Name
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"shipped %d sibling function(s) referenced via .local(): %s", len(extras), strings.Join(names, ", "))
+	}
+
 	sink := warm.NewMemSink()
 	sup := &warm.Supervisor{
 		Python: pythonBin(),
 		Script: runnerScriptPath(),
 		Sink:   sink,
 		Leak:   leakAdapter{rep},
-		Config: warm.Config{EnterBody: enterBody, MethodBody: methodBody, MethodArg: arg},
+		Config: warm.Config{EnterBody: enterBody, MethodBody: methodBody, MethodArg: arg, Extras: extras},
 		// B3: retries= (portable config) caps the warm supervisor's crash re-drive.
 		// 0 leaves warmd's sane default.
 		MaxRestarts: unit.class.Config.Retries,

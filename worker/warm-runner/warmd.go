@@ -39,6 +39,22 @@ type Config struct {
 	EnterBody  string `json:"enter_body"`
 	MethodBody string `json:"method_body"`
 	MethodArg  string `json:"method_arg"`
+	// Extras are sibling functions referenced via .local() from EnterBody or
+	// MethodBody (calque#92) — compiled into the runner's shared globals
+	// alongside @enter/@method so the verbatim calling body's helper(...) /
+	// helper.local(...) text resolves, exactly as it would in the same Modal
+	// container process.
+	Extras []ExtraFunc `json:"extras,omitempty"`
+}
+
+// ExtraFunc is one .local()-referenced sibling function's verbatim shape
+// (calque#92): its own parameter names (no self/cls — these are plain
+// @app.function bodies, not @cls methods) and its own body, shipped alongside
+// the picked warm unit's Config so the runner can compile and bind it.
+type ExtraFunc struct {
+	Name string   `json:"name"`
+	Args []string `json:"args"`
+	Body string   `json:"body"`
 }
 
 // Item is one unit of work, keyed by input index for ordered collection.
@@ -543,10 +559,14 @@ func (s *Supervisor) warmUp(rn *runner) error {
 	if conc < 1 {
 		conc = 1
 	}
+	extras := make([]map[string]any, len(s.Config.Extras))
+	for i, e := range s.Config.Extras {
+		extras[i] = map[string]any{"name": e.Name, "args": e.Args, "body": e.Body}
+	}
 	if err := rn.send(map[string]any{
 		"kind": "config", "enter_body": s.Config.EnterBody,
 		"method_body": s.Config.MethodBody, "method_arg": s.Config.MethodArg,
-		"concurrency": conc,
+		"concurrency": conc, "extras": extras,
 	}); err != nil {
 		return err
 	}
