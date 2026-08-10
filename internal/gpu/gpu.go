@@ -1,14 +1,15 @@
 // Package gpu implements the gpu= rewrite rule and its guard (spec §7).
 //
-// Modal scripts say gpu="H100", gpu="A100", etc. We rewrite to RTX PRO 6000
-// (96GB) — memory is "same-ish" vs 80GB A100/H100, so the model still fits. BUT
-// the swap is only legal if the original job was memory-bound or single-card. We
-// FLAG (never silently substitute) jobs that genuinely needed the big card's
-// bandwidth/interconnect:
+// Modal scripts say gpu="H100", gpu="A100", etc. Whether that request actually
+// gets CARRIED to the seam (target.StubRecommender.Recommend reads the real
+// fn.GPU) or discarded is this package's own guard's job: the swap is only
+// legal to carry forward if the original job was memory-bound or single-card.
+// We FLAG (never silently carry it forward) jobs that genuinely needed the big
+// card's bandwidth/interconnect:
 //
 //	>1 GPU (e.g. "H100:8")                       -> FLAG multi-GPU, out of single-node scope
 //	torchrun / NVLink / tensor-parallel in body  -> FLAG coupled, out of scope
-//	else                                         -> substitute -> RTX PRO 6000, log substitution
+//	else                                         -> clean swap, log the card carried forward
 //
 // The ratio (clean-swaps : flags) across a corpus is itself a finding (§16.4):
 // most Modal inference is B=1 request-response and lands swap-legal by construction.
@@ -21,7 +22,6 @@ import (
 
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
-	"github.com/spore-host/calque/internal/target"
 )
 
 // Disposition is the outcome of evaluating one gpu= site.
@@ -136,9 +136,10 @@ func evaluate(raw, body string) (ir.GPUSpec, Disposition, string) {
 
 // RewriteApp evaluates every gpu= site in the app, appends to the substitution
 // log, emits leaks for flags, and returns the log. It does NOT mutate the IR's
-// raw GPU strings — downstream reads target.DefaultCard via the seam for clean
-// swaps; the raw value is preserved for cost's rate-asymmetry (R_m uses the card
-// the script ASKED for, §9). Flagged sites are left for the caller to refuse.
+// raw GPU strings — downstream reads fn.GPU directly via the seam
+// (target.StubRecommender.Recommend) for clean swaps; the raw value is
+// preserved for cost's rate-asymmetry (R_m uses the card the script ASKED
+// for, §9). Flagged sites are left for the caller to refuse.
 func RewriteApp(app ir.App, rep *leak.Report) *Log {
 	log := &Log{}
 	eval := func(owner, raw, body string, line int) {
@@ -149,7 +150,7 @@ func RewriteApp(app ir.App, rep *leak.Report) *Log {
 		}
 		switch disp {
 		case CleanSwap:
-			sub.Substituted = target.DefaultCard
+			sub.Substituted = spec.Card
 		case FlagMulti:
 			rep.Addf(leak.PrimGPU, leak.KindSemanticGap, app.Script, line,
 				"%s: %s — NOT substituted", owner, reason)

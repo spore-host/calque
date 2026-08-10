@@ -180,8 +180,14 @@ func runSpawnShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Cl
 		Username: "ubuntu", AMI: o.ami,
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
-	tgt := &target.Target{Card: target.DefaultCard, Instance: o.instance}
-	acquired, err := acq.Acquire(ctx, tgt, o.region)
+	// calque#134: carry THIS callable's own requested card (parsed at #111's
+	// resolver into SpawnCallable.GPU) through Recommend, instead of always
+	// hardcoding DefaultCard regardless of what the .spawn()'d callable asked
+	// for. Most .spawn()'d callables are plain CPU functions with no gpu= at
+	// all (GPU == ""), in which case Recommend's own fallback applies.
+	tgt := target.StubRecommender{}.Recommend(ir.App{}, ir.Function{GPU: callable.GPU})
+	tgt.Instance = o.instance
+	acquired, err := acq.Acquire(ctx, &tgt, o.region)
 	if err != nil {
 		return fmt.Errorf("shard %q acquire: %w", sh.Key, err)
 	}

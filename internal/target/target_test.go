@@ -82,3 +82,26 @@ func TestStubRecommenderFillsSharingMode(t *testing.T) {
 		t.Errorf("SharingMode = %q, want %q (defaultCardFamily=%q)", tgt.SharingMode, want, defaultCardFamily)
 	}
 }
+
+// TestRecommendCarriesRequestedCard (calque#134): Recommend must carry the
+// script's own requested card (fn.GPU) through to Target.Card, not always the
+// hardcoded DefaultCard constant regardless of what the script asked for —
+// this is the core fix: calque never used to pass a script's real gpu= value
+// to truffle at all.
+func TestRecommendCarriesRequestedCard(t *testing.T) {
+	tgt := StubRecommender{}.Recommend(ir.App{}, ir.Function{GPU: "H100"})
+	if tgt.Card != "H100" {
+		t.Errorf("Card = %q, want %q (the script's own requested card, not DefaultCard)", tgt.Card, "H100")
+	}
+}
+
+// TestRecommendFallsBackToDefaultCardWhenNoGPU is the regression guard: a
+// function with no gpu= declared at all (fn.GPU == "", the common "spike
+// default" case, and every testdata/analysis script with no gpu=) must still
+// fall back to DefaultCard exactly as before this change.
+func TestRecommendFallsBackToDefaultCardWhenNoGPU(t *testing.T) {
+	tgt := StubRecommender{}.Recommend(ir.App{}, ir.Function{GPU: ""})
+	if tgt.Card != DefaultCard {
+		t.Errorf("Card = %q, want %q (fn.GPU==\"\" must fall back to DefaultCard)", tgt.Card, DefaultCard)
+	}
+}

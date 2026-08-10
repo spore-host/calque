@@ -9,6 +9,28 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+### Fixed
+
+- **calque now passes a script's real requested GPU card to truffle**
+  (calque#134): `target.StubRecommender.Recommend` used to ignore its `fn
+  ir.Function` argument entirely and always return the hardcoded
+  `DefaultCard` constant ("RTX PRO 6000") — every script's `gpu=` request,
+  whatever it asked for, silently resolved to the same g7e instance. It now
+  carries `fn.GPU` through (falling back to `DefaultCard` only when no
+  `gpu=` was declared at all), and every `cmd/calque` real-AWS call site
+  that used to hardcode `target.DefaultCard` now calls `Recommend` on its
+  parsed script's warm unit when one was parsed (`--script`), unchanged
+  otherwise. `internal/plan.TruffleResolver.Resolve` also now normalizes
+  Modal's documented `-80GB`/`-40GB` memory-suffix spelling (e.g.
+  `gpu="A100-80GB"`) before the bare card fails to resolve via truffle
+  (truffle#130) — this closes calque's own side of that gap independent of
+  truffle's fix, leaking when the normalization fires. Resolving to an
+  instance family with no live-verified MIG/MPS sharing-mode entry
+  (`docs/gpu-sharing-support-matrix.md` covers g6/g6e/g7/g7e only) now
+  emits an informational leak in `plan.FillTarget` rather than staying
+  silent — the run still succeeds; this is a documentation gap, not an
+  error.
+
 ### Added
 
 - **`.starmap()` tuple-splat execution** (calque#93): a `.starmap()`'d warm

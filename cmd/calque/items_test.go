@@ -6,6 +6,7 @@ import (
 
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
+	"github.com/spore-host/calque/internal/target"
 )
 
 // synthOf builds the standard "dry-run-item-%d"-shaped synth closure used by
@@ -84,5 +85,35 @@ func TestRealOrSyntheticItems_FallsBackWhenNil(t *testing.T) {
 	}
 	if !strings.Contains(rep.Leaks[0].Detail, "wasn't statically extractable") {
 		t.Errorf("leak detail = %q, want the nil-Items wording", rep.Leaks[0].Detail)
+	}
+}
+
+// TestRecommendedTarget_CarriesParsedUnitsCard (calque#134): the real-AWS
+// commands' shared Target-building helper must carry a parsed unit's own
+// requested card (unit.method.GPU) rather than always hardcoding
+// target.DefaultCard, and must still pin the caller's own --instance
+// regardless of which card Recommend picked (these commands never call
+// plan.FillTarget to derive Instance from Card).
+func TestRecommendedTarget_CarriesParsedUnitsCard(t *testing.T) {
+	unit := warmUnit{method: ir.Function{Name: "generate", GPU: "H100"}}
+	tgt := recommendedTarget(unit, "p5.48xlarge")
+	if tgt.Card != "H100" {
+		t.Errorf("Card = %q, want %q", tgt.Card, "H100")
+	}
+	if tgt.Instance != "p5.48xlarge" {
+		t.Errorf("Instance = %q, want %q (caller's pinned --instance)", tgt.Instance, "p5.48xlarge")
+	}
+}
+
+// TestRecommendedTarget_FallsBackToDefaultCardForZeroUnit: the zero warmUnit{}
+// (no --script parsed) must fall back to target.DefaultCard exactly as
+// before this change — regression guard for the common no-script case.
+func TestRecommendedTarget_FallsBackToDefaultCardForZeroUnit(t *testing.T) {
+	tgt := recommendedTarget(warmUnit{}, "g7e.2xlarge")
+	if tgt.Card != target.DefaultCard {
+		t.Errorf("Card = %q, want %q (zero warmUnit must fall back to DefaultCard)", tgt.Card, target.DefaultCard)
+	}
+	if tgt.Instance != "g7e.2xlarge" {
+		t.Errorf("Instance = %q, want %q", tgt.Instance, "g7e.2xlarge")
 	}
 }

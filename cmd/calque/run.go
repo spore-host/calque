@@ -132,7 +132,7 @@ func run(o runOpts) error {
 	tgt := target.StubRecommender{}.Recommend(app, unit.method)
 
 	// 4. plan: truffle card -> instance (offline), guard the .* fallback.
-	if err := plan.FillTarget(&tgt, plan.NewTruffleResolver(rep)); err != nil {
+	if err := plan.FillTarget(&tgt, plan.NewTruffleResolver(rep), rep); err != nil {
 		return fmt.Errorf("plan/resolve: %w", err)
 	}
 	fmt.Printf("recommend+resolve: card=%q -> instance=%q\n", tgt.Card, tgt.Instance)

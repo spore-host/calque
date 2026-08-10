@@ -24,10 +24,17 @@ the census stays honest.
 
 ## Non-goals that carry NO code (would-be attach points)
 
-- **Real card selection.** The `StubRecommender` (`internal/target/target.go`) is a
-  single constant by design (§4). Real phase-detection / right-sizing is the whole
-  point of the seam and is deferred. Attach point: swap `StubRecommender` for a real
-  `Recommender` — the plumbing never notices.
+- **Real card selection.** UPDATED (calque#134): `StubRecommender`
+  (`internal/target/target.go`) now carries the script's own requested card
+  (`fn.GPU`) through to `Target.Card` — a plumbing pass-through, not a
+  decision — instead of always returning the single `DefaultCard` constant
+  regardless of what the script asked for. It still adds NO selection logic
+  (no cost/right-sizing, no choosing a DIFFERENT card than what was asked
+  for): the DefaultCard constant only remains as the fallback for a script
+  with no `gpu=` declared at all. Real phase-detection / right-sizing is
+  still the whole point of the seam and is still deferred. Attach point:
+  swap `StubRecommender` for a real `Recommender` — the plumbing never
+  notices.
 - **Cost/latency frontier optimization.** The spike does not search the
   price/latency Pareto frontier or otherwise optimize instance choice on cost.
   Attach point: `internal/cost`.

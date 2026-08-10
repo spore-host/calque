@@ -116,13 +116,41 @@ const defaultCardFamily = "g7e"
 // StubRecommender is the ENTIRE faked brain. Do not add logic here (spec §4).
 type StubRecommender struct{}
 
-// Recommend returns the constant Target. It deliberately ignores its inputs:
-// the spike proves the plumbing carries the semantics, not that the choice is good.
-func (StubRecommender) Recommend(_ ir.App, _ ir.Function) Target {
-	// defaultCardFamily always has an entry — enforced by
-	// TestDefaultCardFamilyHasSharingModeEntry, not a runtime fallback here.
-	mode := sharingModeByFamily[defaultCardFamily]
-	return Target{Card: DefaultCard, SharingMode: mode}
+// Recommend returns a Target carrying the card the script actually asked for
+// (fn.GPU, e.g. "H100" or "A100-80GB") — a plumbing pass-through, not a
+// selection decision (spec §4's seam discipline still holds: this is not
+// cost-optimization or right-sizing, just carrying the caller's own request
+// downstream instead of discarding it). Falls back to DefaultCard when fn.GPU
+// is "" (no gpu= declared at all — the common "spike default" case, and
+// every testdata/analysis script with no gpu= at all).
+//
+// It deliberately does NOT re-parse fn.GPU via gpu.ParseSpec's multi-GPU-count
+// handling (":N" suffix) — that would invert this package's dependency
+// direction (internal/gpu already imports internal/target) and create an
+// import cycle. It doesn't need to: by the time Recommend runs, gpu.RewriteApp
+// has already evaluated every gpu= site and any illegal multi-GPU/coupled
+// request has been flagged and the run refused (see cmd/calque/run.go's call
+// order) — so a raw fn.GPU reaching here is either legal-as-is, or (on some
+// path that skips that guard) fails safe: truffle's find.ResolveCard returns
+// ErrNoMatch for a card string that still carries a ":N" suffix, never a wrong
+// match.
+func (StubRecommender) Recommend(_ ir.App, fn ir.Function) Target {
+	card := fn.GPU
+	tgt := Target{Card: card}
+	if card == "" {
+		card = DefaultCard
+		tgt.Card = card
+	}
+	if card == DefaultCard {
+		// defaultCardFamily always has an entry — enforced by
+		// TestDefaultCardFamilyHasSharingModeEntry, not a runtime fallback here.
+		// This provisional guess only applies to the one card this package
+		// actually knows the family of; any other card's SharingMode is left
+		// unset here and filled later by plan.FillTarget once truffle resolves
+		// the real instance (calque#105).
+		tgt.SharingMode = sharingModeByFamily[defaultCardFamily]
+	}
+	return tgt
 }
 
 // Compile-time assertion that the stub satisfies the interface — so a signature

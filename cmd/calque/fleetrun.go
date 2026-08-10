@@ -116,6 +116,11 @@ func fleetRun(o realOpts, shards int) (err error) {
 			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
 	}
 
+	// calque#134: carry the script's real requested card (when --script
+	// parsed one) through Recommend for every shard's Target, instead of
+	// always hardcoding DefaultCard.
+	tgt := recommendedTarget(unit, o.instance)
+
 	// D2: launch every shard's acquire+bootstrap IN PARALLEL. Each shard is fully
 	// independent; a leak.Report is shared, so guard it with a mutex.
 	var repMu sync.Mutex
@@ -127,7 +132,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			m, serr := runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, safeRep)
+			m, serr := runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
 			measurements[i] = m
 			shardErrs[i] = serr
 		}(i)
@@ -140,7 +145,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	for i := range shs {
 		if shardErrs[i] != nil {
 			fmt.Fprintf(os.Stderr, "[fleet] shard %d failed (%v); re-driving once on a fresh instance\n", shs[i].ID, shardErrs[i])
-			m, serr := runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, safeRep)
+			m, serr := runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
 			measurements[i], shardErrs[i] = m, serr
 			if serr != nil {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
@@ -181,8 +186,12 @@ func fleetRun(o realOpts, shards int) (err error) {
 // waits for the summary, and returns the shard's Measurement. Deferred terminate so
 // a mid-run failure never leaks the instance. The returned error is non-nil when
 // the shard produced no summary (so the fleet can re-drive it).
+// baseTgt carries the Card (+ SharingMode) every shard shares; runShard takes
+// its OWN copy since plan.Acquirer.Acquire mutates Target.Region and this is
+// called from concurrent goroutines (calque#134: a shared *target.Target
+// pointer across shards would race on that mutation).
 func runShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Client, o realOpts,
-	sh calexec.Shard, places []plan.Placement, pricePerHr float64, rep *syncReport) (measure.Measurement, error) {
+	sh calexec.Shard, places []plan.Placement, pricePerHr float64, baseTgt *target.Target, rep *syncReport) (measure.Measurement, error) {
 	shardLayout := calexec.RunLayout{
 		Bucket: o.bucket, ArtifactPfx: "fleet/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
@@ -202,8 +211,9 @@ func runShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Client,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
-	tgt := &target.Target{Card: target.DefaultCard, Instance: o.instance}
-	acquired, err := acq.Acquire(ctx, tgt, o.region)
+	tgt := *baseTgt // per-shard copy — Acquire mutates Region; avoid a cross-goroutine race
+	tgt.Instance = o.instance
+	acquired, err := acq.Acquire(ctx, &tgt, o.region)
 	if err != nil {
 		return measure.Measurement{}, fmt.Errorf("shard %d acquire: %w", sh.ID, err)
 	}

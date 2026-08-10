@@ -19,7 +19,6 @@ import (
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
-	"github.com/spore-host/calque/internal/target"
 )
 
 // realOpts controls a real GPU inference run — the headline-K vehicle.
@@ -171,7 +170,11 @@ func realRun(o realOpts) (err error) {
 			fmt.Printf("      ...swept %d attempt(s), no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 		},
 	}
-	tgt := &target.Target{Card: target.DefaultCard, Instance: o.instance}
+	// calque#134: when --script named a real parsed unit, carry its actual
+	// requested card through Recommend instead of hardcoding DefaultCard;
+	// --instance already pins the concrete instance type here regardless (this
+	// path never calls plan.FillTarget), so only Card changes.
+	tgt := recommendedTarget(unit, o.instance)
 	fmt.Printf("[4/8] acquiring %s in %s (block-and-wait, AZ-sweep)...\n", o.instance, o.region)
 	acquired, err := acq.Acquire(ctx, tgt, o.region)
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	truffleaws "github.com/spore-host/truffle/pkg/aws"
@@ -55,8 +56,28 @@ func NewTruffleResolver(rep *leak.Report) *TruffleResolver { return &TruffleReso
 // find.ResolveCard, which returns find.ErrNoMatch rather than falling back to
 // a `.*` match-all pattern (truffle#90). ResolveCard is card-oriented and
 // never match-all by construction, so no separate guard is needed here.
+//
+// Before giving up on an ErrNoMatch, it tries normalizeMemorySuffix (calque#134):
+// Modal's documented gpu="A100-80GB"/"A100-40GB" spelling doesn't resolve via
+// truffle today (truffle#130 tracks the upstream fix), but the bare card name
+// without the suffix does. This is calque's own translation responsibility —
+// "how Modal spells a GPU name" — not truffle's, so the normalization lives
+// here rather than waiting on truffle's resolver to grow Modal-specific
+// vocabulary.
 func (r *TruffleResolver) Resolve(card string) ([]Candidate, error) {
 	instances, err := find.ResolveCard(card)
+	if err != nil && errors.Is(err, find.ErrNoMatch) {
+		if bare, ok := normalizeMemorySuffix(card); ok {
+			if bareInstances, bareErr := find.ResolveCard(bare); bareErr == nil {
+				if r.rep != nil {
+					r.rep.Addf(leak.PrimGPU, leak.KindIntegrationEdge, card, 0,
+						"gpu=%q doesn't resolve via truffle as spelled (truffle#130); normalized to %q, which does — using %q",
+						card, bare, bare)
+				}
+				instances, err = bareInstances, nil
+			}
+		}
+	}
 	if err != nil {
 		if errors.Is(err, find.ErrNoMatch) {
 			if r.rep != nil {
@@ -73,6 +94,25 @@ func (r *TruffleResolver) Resolve(card string) ([]Candidate, error) {
 		out = append(out, Candidate{Instance: it, Family: instanceFamily(it)})
 	}
 	return out, nil
+}
+
+// memorySuffixRe matches a trailing hyphenated memory-size spelling Modal's
+// gpu= strings document (e.g. "-80GB", "-40gb") — calque#134/truffle#130.
+// Anchored at the end so it only strips a genuine suffix, not a memory token
+// that happens to appear mid-string.
+var memorySuffixRe = regexp.MustCompile(`(?i)-\d+gb$`)
+
+// normalizeMemorySuffix strips a trailing "-80GB"/"-40GB"-shaped memory
+// suffix from card, returning the bare form and true if a suffix was found —
+// it does NOT itself check whether the bare form resolves; the caller tries
+// that and only uses the normalization on success, keeping this a narrow,
+// specific fix for the one confirmed-real gap (truffle#130's memory-suffix
+// spelling) rather than a general fuzzy-matching layer.
+func normalizeMemorySuffix(card string) (bare string, ok bool) {
+	if !memorySuffixRe.MatchString(card) {
+		return "", false
+	}
+	return memorySuffixRe.ReplaceAllString(card, ""), true
 }
 
 // instanceFamily extracts the family prefix from an instance type string, e.g.
@@ -104,8 +144,11 @@ func PickSmallest(cands []Candidate) (Candidate, error) {
 }
 
 // FillTarget resolves a Target's Instance from its Card via the resolver, picking
-// the smallest candidate. Region is left for acquisition to fill (§4).
-func FillTarget(t *target.Target, r Resolver) error {
+// the smallest candidate. Region is left for acquisition to fill (§4). rep may
+// be nil (e.g. in tests that don't care about leaks); when non-nil, an
+// instance family with no live-verified SharingMode entry is noted via rep
+// (calque#134) — informational, not an error, since FillTarget still succeeds.
+func FillTarget(t *target.Target, r Resolver, rep *leak.Report) error {
 	cands, err := r.Resolve(t.Card)
 	if err != nil {
 		return err
@@ -122,6 +165,10 @@ func FillTarget(t *target.Target, r Resolver) error {
 	// than silently clearing it to the zero value.
 	if mode, ok := target.SharingModeFor(t.Instance); ok {
 		t.SharingMode = mode
+	} else if rep != nil {
+		rep.Addf(leak.PrimGPU, leak.KindIntegrationEdge, t.Card, 0,
+			"instance family %q (resolved from card %q) has no live-verified MIG/MPS sharing-mode data (docs/gpu-sharing-support-matrix.md covers g6/g6e/g7/g7e only) — run continues, SharingMode left unset",
+			pick.Family, t.Card)
 	}
 	return nil
 }

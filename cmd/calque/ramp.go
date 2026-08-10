@@ -17,7 +17,6 @@ import (
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
-	"github.com/spore-host/calque/internal/target"
 )
 
 // rampOpts controls an acquire-once / hold / run-many session.
@@ -138,6 +137,12 @@ func runRamp(o rampOpts) (err error) {
 	}
 	places := placementsByRegion[o.region]
 
+	// calque#136/#134: parse --script (if any) ONCE, up front — its real
+	// .map()/.starmap() iterable doesn't change between rungs (only how many
+	// of its items each rung's own --n draws from), and its GPU card (if any)
+	// is what the Target below should carry instead of always DefaultCard.
+	unit, _ := warmUnitForScript(ctx, o.script, rep)
+
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: prep.PrepCommand(artifactPfx), TTL: o.ttl,
 		OnComplete: "", // do NOT terminate on command completion — we hold the box
@@ -175,7 +180,7 @@ func runRamp(o rampOpts) (err error) {
 			}
 		},
 	}
-	tgt := &target.Target{Card: target.DefaultCard, Instance: o.instance}
+	tgt := recommendedTarget(unit, o.instance)
 	var acquired plan.Acquired
 	if len(o.fallbackRegions) > 0 {
 		fmt.Printf("[acquire] sniping %s in %s, falling back to %v (patient — up to %s; $0 until it lands)...\n",
@@ -216,12 +221,8 @@ func runRamp(o rampOpts) (err error) {
 	}
 	fmt.Printf("[prep] image pulled; instance ready. Running ramp %v.\n", o.rungs)
 
-	// Run each rung on the held instance via SSM. calque#136: parse --script (if
-	// any) ONCE, up front, rather than per-rung — its real .map()/.starmap()
-	// iterable doesn't change between rungs, only how many of its items each
-	// rung's own --n draws from.
+	// Run each rung on the held instance via SSM (unit already parsed above).
 	rates, _ := cost.LoadRates(o.ratesFP)
-	unit, _ := warmUnitForScript(ctx, o.script, rep)
 	for _, n := range o.rungs {
 		if rerr := runRung(ctx, spawnClient, s3c, o, acquired, sessBase, n, rates, rep, unit); rerr != nil {
 			fmt.Fprintf(os.Stderr, "rung N=%d failed: %v (continuing to teardown)\n", n, rerr)

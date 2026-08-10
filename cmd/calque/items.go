@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 
+	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/parse"
+	"github.com/spore-host/calque/internal/target"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
@@ -66,4 +68,21 @@ func warmUnitForScript(ctx context.Context, scriptPath string, rep *leak.Report)
 		return warmUnit{}, false
 	}
 	return pickWarmUnit(app, "")
+}
+
+// recommendedTarget builds the Target these real-AWS commands (real/ramp/
+// fleetrun/spawn-run/smoke/gpuprobe) launch against, by calling
+// target.StubRecommender.Recommend on unit.method so the Target carries the
+// card the script actually asked for (calque#134) instead of always
+// hardcoding target.DefaultCard regardless of what any parsed script
+// requested. When no script was parsed, unit is the zero warmUnit{}, whose
+// method.GPU is "" exactly like ir.Function{} — Recommend's own DefaultCard
+// fallback applies identically either way, so no separate branch is needed
+// here. instance is always the caller's own pinned --instance — these
+// commands never call plan.FillTarget to derive it from the card, so
+// Instance is set here directly regardless of which card Recommend picked.
+func recommendedTarget(unit warmUnit, instance string) *target.Target {
+	tgt := target.StubRecommender{}.Recommend(ir.App{}, unit.method)
+	tgt.Instance = instance
+	return &tgt
 }
