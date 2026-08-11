@@ -13,7 +13,7 @@ require (
 	github.com/aws/smithy-go v1.27.3
 	github.com/spore-host/cohort v0.2.0
 	github.com/spore-host/lagotto v0.53.0
-	github.com/spore-host/spawn v0.99.0
+	github.com/spore-host/spawn v0.100.0
 	github.com/spore-host/truffle v0.49.0
 )
 
