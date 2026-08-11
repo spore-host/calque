@@ -33,6 +33,33 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Added
 
+- **Fleet runs are now quota-aware: pre-flight check + wave-based launching**
+  (calque#141): a real N=100k fleet run (calque#18) found out about the
+  account's real Spot quota ceiling (64 vCPUs = 8 concurrent `g7e.2xlarge`
+  instances) only via a live `MaxSpotInstanceCountExceeded` error, after
+  `cmd/calque/fleetrun.go`'s unbounded goroutine fan-out had already
+  committed to launching all `--shards N` at once — 2 of 10 shards failed
+  immediately, and a later mass re-drive of 9 failed shards against a
+  quota that hadn't fully freed up yet left 64,207/100,000 items in
+  `missing[]`. `internal/plan.QuotaCeiling` now queries truffle's quota
+  client (`quotas.GetQuotas` + `aws.Client.GetCapabilities`) for the
+  account's real headroom (quota − usage, converted to an instance count
+  via the instance type's real vCPU count) before `fleetRun` commits to a
+  shard count. `fleetRun`'s D2 fan-out and D4 re-drive pass now both run
+  through a buffered-channel semaphore (`runWaves`) sized to that ceiling
+  instead of firing unboundedly: when the ceiling covers every requested
+  shard, behavior is unchanged; when it doesn't, shards launch in waves
+  (ceiling-many at a time, topping up as earlier shards' instances
+  terminate). A shard whose D4 re-drive failure was specifically a
+  quota-exceeded error (`lagotto/pkg/failure.IsQuotaExceeded`) now backs
+  off `quotaExceededBackoff` (3 minutes) before that re-drive attempt,
+  since a quota wall clears when OTHER instances terminate, not through
+  retrying at the normal pace — this is the exact mechanism that turned
+  the real incident's partial failure into a near-total one. A failed
+  quota pre-flight check doesn't block the run: it leaks the failure and
+  falls back to the requested `--shards` count unclamped (today's
+  pre-#141 behavior).
+
 - **`.starmap()` tuple-splat execution** (calque#93): a `.starmap()`'d warm
   unit now actually RUNS instead of refusing, when the script's real iterable
   was statically resolved at parse time (calque#136) — the warm runner

@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/spore-host/lagotto/pkg/failure"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 
 	"github.com/spore-host/calque/internal/cost"
@@ -121,29 +122,52 @@ func fleetRun(o realOpts, shards int) (err error) {
 	// always hardcoding DefaultCard.
 	tgt := recommendedTarget(unit, o.instance)
 
-	// D2: launch every shard's acquire+bootstrap IN PARALLEL. Each shard is fully
-	// independent; a leak.Report is shared, so guard it with a mutex.
+	// Pre-flight quota check (calque#141): query the account's real quota
+	// headroom for o.instance/o.region/o.spot BEFORE committing to `shards`
+	// concurrent acquisitions, instead of finding out via a live
+	// MaxSpotInstanceCountExceeded error — the exact shape of calque#18's
+	// real N=100k fleet run incident this issue tracks (2 of 10 shards failed
+	// immediately against a 64-vCPU G/VT Spot quota that only fit 8 concurrent
+	// g7e.2xlarge instances).
 	var repMu sync.Mutex
 	safeRep := &syncReport{rep: rep, mu: &repMu}
+	rawCeiling, qerr := plan.QuotaCeiling(ctx, cfg, o.instance, o.region, o.spot)
+	ceiling := resolveFleetCeiling(safeRep, o.model, o.instance, o.region, o.spot, shards, rawCeiling, qerr)
+
+	// D2: launch every shard's acquire+bootstrap concurrently, bounded by the
+	// quota ceiling (calque#141) — a buffered-channel semaphore instead of
+	// unbounded fan-out. When ceiling >= shards this is unchanged behavior
+	// (every shard launches at once); when it's less, shards launch in WAVES
+	// (ceiling-many at a time, topping up as earlier shards' instances
+	// terminate) instead of firing all N acquisitions in parallel and letting
+	// the excess fail.
 	measurements := make([]measure.Measurement, len(shs))
 	shardErrs := make([]error, len(shs))
-	var wg sync.WaitGroup
-	for i := range shs {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			m, serr := runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
-			measurements[i] = m
-			shardErrs[i] = serr
-		}(i)
-	}
-	wg.Wait()
+	runWaves(ceiling, len(shs), func(i int) {
+		measurements[i], shardErrs[i] = runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
+	})
 
-	// D4: fleet-level partial-failure re-drive. A shard whose instance never
-	// produced a summary is re-driven ONCE onto a fresh acquire; if it still fails,
-	// its items surface in the global missing[] (below) rather than being lost.
+	// D4: fleet-level partial-failure re-drive, through the SAME quota
+	// ceiling (calque#141) rather than firing every failed shard's re-drive
+	// in parallel — that mass-collision (9 failed shards re-launched at once
+	// against a quota that hadn't fully freed up yet) is exactly what turned
+	// a partial failure into 64,207/100,000 missing items in the real
+	// incident. Kept as a SEPARATE pass after the first wave fully drains
+	// (not interleaved with it) — same structure as before #141, per the
+	// design's explicit recommendation against a bigger restructuring.
+	var failedIdx []int
 	for i := range shs {
 		if shardErrs[i] != nil {
+			failedIdx = append(failedIdx, i)
+		}
+	}
+	if len(failedIdx) > 0 {
+		runWaves(ceiling, len(failedIdx), func(j int) {
+			i := failedIdx[j]
+			if wait := redriveBackoff(shardErrs[i]); wait > 0 {
+				fmt.Fprintf(os.Stderr, "[fleet] shard %d failed with a quota-exceeded error; backing off %s before re-drive so OTHER shards' instances have time to terminate (calque#141)\n", shs[i].ID, wait)
+				fleetSleep(wait)
+			}
 			fmt.Fprintf(os.Stderr, "[fleet] shard %d failed (%v); re-driving once on a fresh instance\n", shs[i].ID, shardErrs[i])
 			m, serr := runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
 			measurements[i], shardErrs[i] = m, serr
@@ -151,7 +175,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
 					"fleet shard %d permanently failed after one re-drive (%v); its %d items surface in global missing[]", shs[i].ID, serr, len(shs[i].Items))
 			}
-		}
+		})
 	}
 
 	// D3: collect the union across all shards + one global missing[].
@@ -181,6 +205,95 @@ func fleetRun(o realOpts, shards int) (err error) {
 	rep.Summary(os.Stdout)
 	return nil
 }
+
+// resolveFleetCeiling turns a QuotaCeiling query result into the concurrency
+// ceiling fleetRun should actually use (calque#141). A query failure doesn't
+// block the run — it leaks the failure and falls back to `shards` unclamped
+// (today's pre-#141 behavior); a ceiling that already covers every requested
+// shard is also left unclamped (no waves needed); only a genuine shortfall
+// triggers wave-based launching, logged both as a leak and to stdout.
+func resolveFleetCeiling(rep *syncReport, model, instance, region string, spot bool, shards, rawCeiling int, qerr error) int {
+	switch {
+	case qerr != nil:
+		rep.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, model, 0,
+			"quota pre-flight check failed (%v); proceeding with requested --shards %d unclamped", qerr, shards)
+		return shards
+	case rawCeiling < shards:
+		market := "on-demand"
+		if spot {
+			market = "spot"
+		}
+		rep.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, model, 0,
+			"requested %d shards but %s quota headroom in %s supports %d concurrent %s instance(s); launching in waves of %d (calque#141)",
+			shards, market, region, rawCeiling, instance, rawCeiling)
+		fmt.Printf("[fleet] quota ceiling: %d concurrent (requested %d) — launching in waves\n", rawCeiling, shards)
+		return rawCeiling
+	default:
+		return shards // fits entirely, no clamping needed, unchanged behavior
+	}
+}
+
+// runWaves runs n index-callbacks (indices [0,n)) with at most ceiling
+// running concurrently, via a buffered-channel semaphore — the wave
+// mechanism calque#141 needs both for the initial D2 fan-out and the D4
+// re-drive pass, so it's shared rather than duplicated.
+//
+// This works because runShard's own deferred spawnClient.Terminate releases
+// the instance BEFORE its goroutine returns — releasing the semaphore there
+// naturally means "the next queued index launches once this instance tears
+// down," i.e. exactly the wave behavior (launch ceiling-many now, top up as
+// earlier ones finish/free capacity) without runShard itself needing to
+// change at all.
+//
+// ceiling <= 0 is treated as n (no clamping) — a defensive fallback; callers
+// (resolveFleetCeiling) already guarantee a positive ceiling on every path,
+// but a semaphore sized 0 would deadlock forever, which is worse than simply
+// not clamping.
+func runWaves(ceiling, n int, run func(i int)) {
+	if ceiling <= 0 || ceiling > n {
+		ceiling = n
+	}
+	sem := make(chan struct{}, ceiling)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			run(i)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// quotaExceededBackoff is how long the D4 re-drive pass waits before
+// re-driving a shard whose failure was specifically a quota-exceeded error
+// (calque#141) — a quota wall clears when OTHER instances terminate, not
+// through retrying at the normal pace, so re-driving immediately (like a
+// non-quota failure does) just re-collides with the same wall. This is the
+// exact failure mode that turned calque#18's real incident into
+// 64,207/100,000 missing items: 9 failed shards re-driven at once against a
+// quota that hadn't fully freed up yet.
+const quotaExceededBackoff = 3 * time.Minute
+
+// redriveBackoff returns how long to wait before re-driving a shard that
+// failed with err, or 0 for no wait. Only a quota-exceeded failure
+// (lagotto/pkg/failure.IsQuotaExceeded) gets the longer backoff; any other
+// failure re-drives immediately, unchanged from before #141.
+func redriveBackoff(err error) time.Duration {
+	if failure.IsQuotaExceeded(err) {
+		return quotaExceededBackoff
+	}
+	return 0
+}
+
+// fleetSleep sleeps for d before a backed-off re-drive. A package var so
+// tests can inject a fake to observe the backoff decision without actually
+// waiting minutes — mirroring internal/pool/queue.go's poolOpenRetryDelay
+// and internal/pool/pool.go's heartbeatInterval package-var-for-testability
+// pattern already used elsewhere in this codebase.
+var fleetSleep = time.Sleep
 
 // runShard acquires ONE instance for a shard, writes its manifest, drives warmd,
 // waits for the summary, and returns the shard's Measurement. Deferred terminate so
