@@ -32,9 +32,9 @@ type runOpts struct {
 
 // run wires the full pipeline (spec §3). In --dry-run it stops short of the one
 // billable action (instance acquisition) and instead drives the warm worker
-// LOCALLY over a small synthetic sample, so the crossover K is produced end-to-end
-// with its inputs honestly flagged measured|proxy. This is the "build up to
-// launch, then pause" boundary made runnable.
+// LOCALLY over a small synthetic sample, so the cost verdict is produced
+// end-to-end with its inputs honestly flagged measured|proxy. This is the
+// "build up to launch, then pause" boundary made runnable.
 func run(o runOpts) error {
 	ctx := context.Background()
 	rep := &leak.Report{}
@@ -170,7 +170,7 @@ func run(o runOpts) error {
 		return fmt.Errorf("real run (acquire+spawn) is gated: launch not yet authorized in this build path")
 	}
 
-	// 8. cost + crossover K (§9)
+	// 8. cost model (§9)
 	rates, err := cost.LoadRates(o.ratesFP)
 	if err != nil {
 		return fmt.Errorf("rates: %w", err)
@@ -182,7 +182,7 @@ func run(o runOpts) error {
 		SecPerItem: m.PerItem.MeanSecs, Occupancy: occ, SampleItems: m.PerItem.Count,
 		AWSRateMeasured: awsMeasured, AcquireSeconds: m.AcquireWaitSeconds, EnterSeconds: m.EnterSeconds,
 	}}
-	fmt.Println("\n--- crossover K (§9) ---")
+	fmt.Println("\n--- cost model (§9) ---")
 	verdict, err := model.Verdict(o.n)
 	switch {
 	case err == cost.ErrNoComputeMeasured:

@@ -112,9 +112,9 @@ func fleetRun(o realOpts, shards int) (err error) {
 			bidCap = "on-demand price"
 		}
 		fmt.Printf("[spot] fleet acquiring on the SPOT market (max bid %s). NOTE: any shard's instance is "+
-			"interruptible mid-run; any K measured here is against a SPOT rate, NOT the on-demand headline K.\n", bidCap)
+			"interruptible mid-run; any cost verdict measured here is against a SPOT rate, not the on-demand one.\n", bidCap)
 		rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "fleet", 0,
-			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
+			"spot acquisition: R_a is a spot rate and the instance is interruptible — this is a spot-rate cost measurement, not the on-demand one")
 	}
 
 	// calque#134: carry the script's real requested card (when --script
@@ -372,7 +372,7 @@ func emitFleetK(o realOpts, perInstance []measure.Measurement, priceHr float64) 
 		return fmt.Errorf("rates: %w", err)
 	}
 	if len(perInstance) == 0 {
-		fmt.Println("\n--- crossover K (§9) — FLEET ---\nno instance produced a measurement; K undefined")
+		fmt.Println("\n--- cost model (§9) — FLEET ---\nno instance produced a measurement; K undefined")
 		return nil
 	}
 	agg := measure.FleetFold(perInstance)
@@ -384,7 +384,7 @@ func emitFleetK(o realOpts, perInstance []measure.Measurement, priceHr float64) 
 		AcquireSeconds: agg.AcquireWaitSeconds, EnterSeconds: agg.EnterSeconds,
 		OccupancyScope: agg.Occupancy.ScopeOrWholeRun(),
 	}}
-	fmt.Printf("\n--- crossover K (§9) — FLEET of %d instances, MEASURED ---\n", len(perInstance))
+	fmt.Printf("\n--- cost model (§9) — FLEET of %d instances, MEASURED ---\n", len(perInstance))
 	verdict, verr := model.Verdict(o.n)
 	switch {
 	case verr == cost.ErrNoComputeMeasured:

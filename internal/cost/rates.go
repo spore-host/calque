@@ -1,6 +1,9 @@
-// Package cost implements the cost model and crossover K (spec §9) — the headline
-// deliverable. Both sides are per-second and grounded in the SAME measured
-// per-item compute from a real run; they differ only in the billing model applied.
+// Package cost implements the AWS-vs-Modal cost model (spec §9), including the
+// crossover K if AWS ever undercuts Modal at scale — real, still-reported
+// functionality, though not calque's headline claim (that's unchanged-idiom
+// fidelity; see README). Both sides are per-second and grounded in the SAME
+// measured per-item compute from a real run; they differ only in the billing
+// model applied.
 //
 // The comparison must survive a hostile read (a skeptical PI or a Modal advocate
 // will attack it). So: rates are dated/cited/swappable (config/rates.json), Modal

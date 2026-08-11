@@ -152,7 +152,7 @@ func emitKForPoolClaim(o realOpts, results []warm.Result, summary calpool.Summar
 		OccupancyScope: occScope,
 		WarmHit:        summary.WarmHit,
 	}}
-	fmt.Println("\n--- crossover K (§9) — POOL claim ---")
+	fmt.Println("\n--- cost model (§9) — POOL claim ---")
 	verdict, err := model.Verdict(100000)
 	switch {
 	case err == cost.ErrNoComputeMeasured:

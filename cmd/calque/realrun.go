@@ -66,7 +66,7 @@ return [o.outputs[0].text for o in outs]`
 
 // realRun acquires a GPU, runs real vLLM inference over N prompts under the warm
 // runner (model loaded once), collects results + the tach summary from S3, folds
-// them into the cost model, and emits the crossover K (§9). Deferred terminate so
+// them into the cost model, and emits a verdict (§9). Deferred terminate so
 // a mid-run failure never leaks the instance.
 func realRun(o realOpts) (err error) {
 	ctx := context.Background()
@@ -160,9 +160,9 @@ func realRun(o realOpts) (err error) {
 			bidCap = "on-demand price"
 		}
 		fmt.Printf("[spot] acquiring on the SPOT market (max bid %s). NOTE: interruptible mid-run; "+
-			"any K measured here is against a SPOT rate, NOT the on-demand headline K.\n", bidCap)
+			"any cost verdict measured here is against a SPOT rate, not the on-demand one.\n", bidCap)
 		rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "real", 0,
-			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
+			"spot acquisition: R_a is a spot rate and the instance is interruptible — this is a spot-rate cost measurement, not the on-demand one")
 	}
 	acq := &plan.Acquirer{
 		LaunchConfig: launchCfg, Report: rep, Deadline: o.deadline, Placements: places,
@@ -266,7 +266,7 @@ func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.Occupanc
 		AcquireSeconds: m.AcquireWaitSeconds, EnterSeconds: enterSec,
 		OccupancyScope: m.Occupancy.ScopeOrWholeRun(),
 	}}
-	fmt.Println("\n--- crossover K (§9) — MEASURED on real GPU ---")
+	fmt.Println("\n--- cost model (§9) — MEASURED on real GPU ---")
 	verdict, err := model.Verdict(100000)
 	switch {
 	case err == cost.ErrNoComputeMeasured:

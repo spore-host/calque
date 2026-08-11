@@ -138,7 +138,7 @@ func smoke(o smokeOpts) (err error) {
 		}
 		fmt.Printf("[spot] acquiring on the SPOT market (max bid %s). NOTE: interruptible mid-run.\n", bidCap)
 		rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "smoke", 0,
-			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
+			"spot acquisition: R_a is a spot rate and the instance is interruptible — this is a spot-rate cost measurement, not the on-demand one")
 	}
 	acq := &plan.Acquirer{
 		LaunchConfig: launchCfg, Report: rep, Deadline: o.deadline, Placements: places,

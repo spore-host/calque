@@ -159,9 +159,9 @@ func runRamp(o rampOpts) (err error) {
 			bidCap = "on-demand price"
 		}
 		fmt.Printf("[spot] acquiring on the SPOT market (max bid %s). NOTE: interruptible mid-ramp; "+
-			"any K measured here is against a SPOT rate, NOT the on-demand headline K.\n", bidCap)
+			"any cost verdict measured here is against a SPOT rate, not the on-demand one.\n", bidCap)
 		rep.Addf(leak.PrimAcquire, leak.KindSemanticGap, "session", 0,
-			"spot acquisition: R_a is a spot rate and the instance is interruptible — K is not the on-demand crossover")
+			"spot acquisition: R_a is a spot rate and the instance is interruptible — this is a spot-rate cost measurement, not the on-demand one")
 	}
 	round := 0
 	lastDetail := ""
@@ -350,7 +350,7 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o rampOpt
 		OccupancyScope: summary.Occupancy.ScopeOrWholeRun(),
 	}}
 	if v, verr := model.Verdict(100000); verr == nil {
-		fmt.Printf("[N=%d] --- crossover K ---\n%s", n, v)
+		fmt.Printf("[N=%d] --- cost model ---\n%s", n, v)
 	} else if verr == cost.ErrNoComputeMeasured {
 		fmt.Printf("[N=%d] K undefined (per-item ~0)\n", n)
 	}

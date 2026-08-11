@@ -3,11 +3,11 @@
 // Usage:
 //
 //	calque analyze <script.py> [<script.py> ...]        # static passes over a corpus
-//	calque run [--n N] [--region R] [--dry-run] <script.py>   # full pipeline -> crossover K
+//	calque run [--n N] [--region R] [--dry-run] <script.py>   # parse -> warm exec -> cost model
 //
 // `run --dry-run` exercises every stage end-to-end WITHOUT launching a billable
 // instance: it drives the warm worker locally on a synthetic sample and emits a
-// crossover K with its inputs honestly flagged measured|proxy. Dropping --dry-run
+// cost verdict with its inputs honestly flagged measured|proxy. Dropping --dry-run
 // (a real launch) is gated pending explicit authorization.
 package main
 
@@ -148,8 +148,9 @@ func parseSmokeArgs(args []string) (smokeOpts, bool, error) {
 	}, *confirm, nil
 }
 
-// realCmd runs a REAL GPU inference run — the measured-K vehicle. Gated behind
-// --i-understand-this-spends-money (launches a billable GPU instance).
+// realCmd runs a REAL GPU inference run against actual acquired capacity.
+// Gated behind --i-understand-this-spends-money (launches a billable GPU
+// instance).
 func realCmd(args []string) error {
 	opts, shards, pool, confirm, err := parseRealArgs(args)
 	if err != nil {

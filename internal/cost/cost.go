@@ -52,9 +52,10 @@ type SideCost struct {
 	Detail  string
 }
 
-// Model computes both sides at scale and locates the crossover K. It never
-// linearly extrapolates Modal from a tiny run (spec §9): Modal-at-scale is
-// R_m x (per-item compute x items + one-time enter), built up honestly.
+// Model computes both sides at scale and, if AWS ever undercuts Modal, the N
+// at which that happens (K). It never linearly extrapolates Modal from a tiny
+// run (spec §9): Modal-at-scale is R_m x (per-item compute x items + one-time
+// enter), built up honestly.
 type Model struct {
 	Rates *Rates
 	M     Measured
