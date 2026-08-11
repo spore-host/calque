@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	warm "github.com/spore-host/calque/worker/warm-runner"
@@ -127,6 +128,22 @@ func (e *ErrBootstrapFailed) Error() string {
 	return "bootstrap exited without writing a summary (see bootstrap log)"
 }
 
+// ErrInstanceStale means the instance's spawn:last-heartbeat tag (spawn#497,
+// spored v0.100.0+) hasn't advanced for longer than the caller's staleAfter
+// window — the instance is hung or gone, not just slow. LastHeartbeat is the
+// most recent heartbeat timestamp observed (zero if never seen at all).
+type ErrInstanceStale struct {
+	InstanceID    string
+	LastHeartbeat time.Time
+}
+
+func (e *ErrInstanceStale) Error() string {
+	if e.LastHeartbeat.IsZero() {
+		return fmt.Sprintf("instance %s: spawn:last-heartbeat never observed", e.InstanceID)
+	}
+	return fmt.Sprintf("instance %s: spawn:last-heartbeat stale since %s", e.InstanceID, e.LastHeartbeat.Format(time.RFC3339))
+}
+
 // WaitForSummary polls S3 for the run summary warmd writes on completion. It ALSO
 // watches for the bootstrap log: that uploads only on the bootstrap's EXIT
 // (success or failure), so if the log appears but no summary follows within a
@@ -134,6 +151,86 @@ func (e *ErrBootstrapFailed) Error() string {
 // (carrying the log) instead of waiting out the whole timeout. Returns the summary
 // bytes on success.
 func WaitForSummary(ctx context.Context, c *s3.Client, l RunLayout, timeout, poll time.Duration, onWait func(elapsed time.Duration)) ([]byte, error) {
+	return waitForSummary(ctx, c, l, timeout, poll, onWait, nil)
+}
+
+// heartbeatGetter is the slice of *ec2.Client this file depends on to read
+// spawn:last-heartbeat (spawn#497) — kept as an interface so tests can inject
+// a fake instead of requiring live AWS credentials, mirroring
+// internal/plan/quota.go's quotaGetter/capsGetter seam pattern.
+type heartbeatGetter interface {
+	DescribeInstances(ctx context.Context, in *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
+}
+
+// WaitForSummaryLiveness is WaitForSummary plus a liveness check (spawn#497):
+// spored stamps instanceID's spawn:last-heartbeat EC2 tag every monitor tick
+// (throttled to once/minute) REGARDLESS of any completion-webhook config —
+// an always-on signal, present on any spawn v0.100.0+ instance. Alongside
+// polling for the summary/bootstrap-log artifacts, this also checks that
+// tag; if it goes stale for longer than staleAfter, the wait fails fast with
+// ErrInstanceStale instead of dead-waiting the full timeout on an instance
+// that's actually hung or gone — the exact ambiguity ("still legitimately
+// running" vs. "stuck") that made calque#141/#142/#143's re-verification
+// runs need a guessed wall-clock deadline in the first place.
+//
+// A missing/unparsable heartbeat tag (an older spawn, or the instance hasn't
+// ticked yet) is NOT treated as staleness — the liveness check simply
+// reports "not stale" for that tick, falling back to today's timeout-only
+// behavior. This is purely additive: a caller who can't supply an
+// instanceID/EC2 client still gets WaitForSummary's original behavior.
+func WaitForSummaryLiveness(ctx context.Context, c *s3.Client, ec2c heartbeatGetter, instanceID string, l RunLayout, timeout, poll, staleAfter time.Duration, onWait func(elapsed time.Duration)) ([]byte, error) {
+	var lastSeen time.Time
+	check := func() error {
+		if hb, ok := instanceHeartbeat(ctx, ec2c, instanceID); ok && hb.After(lastSeen) {
+			lastSeen = hb
+		}
+		if heartbeatStale(time.Now(), lastSeen, staleAfter) {
+			return &ErrInstanceStale{InstanceID: instanceID, LastHeartbeat: lastSeen}
+		}
+		return nil
+	}
+	return waitForSummary(ctx, c, l, timeout, poll, onWait, check)
+}
+
+// heartbeatStale is WaitForSummaryLiveness's staleness decision, extracted
+// as a pure function (now/lastSeen injected rather than time.Now()/a
+// closure-captured var) so it's unit-testable without a real clock. A
+// lastSeen that's still its zero value (no heartbeat ever observed) is NOT
+// staleness on its own — an older spawn, or one that hasn't ticked yet,
+// must not fail a run that's otherwise progressing fine; staleness only
+// fires once a REAL heartbeat has been seen and then stopped advancing.
+func heartbeatStale(now, lastSeen time.Time, staleAfter time.Duration) bool {
+	if lastSeen.IsZero() {
+		return false
+	}
+	return now.Sub(lastSeen) > staleAfter
+}
+
+// instanceHeartbeat returns instanceID's spawn:last-heartbeat tag value
+// (spawn#497), parsed as RFC3339, or (zero time, false) if the tag is
+// absent, unparsable, or the DescribeInstances call itself fails — any of
+// which just means "no liveness signal available," not "instance is dead."
+func instanceHeartbeat(ctx context.Context, c heartbeatGetter, instanceID string) (time.Time, bool) {
+	out, err := c.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{instanceID}})
+	if err != nil || len(out.Reservations) == 0 || len(out.Reservations[0].Instances) == 0 {
+		return time.Time{}, false
+	}
+	for _, t := range out.Reservations[0].Instances[0].Tags {
+		if t.Key != nil && *t.Key == "spawn:last-heartbeat" && t.Value != nil {
+			if ts, perr := time.Parse(time.RFC3339, *t.Value); perr == nil {
+				return ts, true
+			}
+			return time.Time{}, false
+		}
+	}
+	return time.Time{}, false
+}
+
+// waitForSummary is WaitForSummary/WaitForSummaryLiveness's shared core.
+// liveness is nil for the plain (no-heartbeat) case; when non-nil, it's
+// called once per tick and any error it returns ends the wait immediately —
+// the same fail-fast treatment as ErrBootstrapFailed.
+func waitForSummary(ctx context.Context, c *s3.Client, l RunLayout, timeout, poll time.Duration, onWait func(elapsed time.Duration), liveness func() error) ([]byte, error) {
 	deadlineHit := time.NewTimer(timeout)
 	defer deadlineHit.Stop()
 	ticker := time.NewTicker(poll)
@@ -158,6 +255,11 @@ func WaitForSummary(ctx context.Context, c *s3.Client, l RunLayout, timeout, pol
 		} else if startedTicks-logSeenAt >= graceTicks {
 			logBuf, _ := tryGet(ctx, c, l.Bucket, l.LogKey)
 			return nil, &ErrBootstrapFailed{BootstrapLog: string(logBuf)}
+		}
+		if liveness != nil {
+			if lerr := liveness(); lerr != nil {
+				return nil, lerr
+			}
 		}
 
 		select {

@@ -196,10 +196,18 @@ func realRun(o realOpts) (err error) {
 
 	// Wait for warmd's summary. Real vLLM model load + N generations takes minutes
 	// (model download + load), so allow a generous window bounded by the deadline.
+	// spawn#497 (spored v0.100.0+): also check the instance's spawn:last-heartbeat
+	// tag, so a genuinely hung/gone instance fails fast instead of dead-waiting the
+	// whole deadline — the exact ambiguity ("still legitimately running" vs.
+	// "stuck") a real N=100 fleet re-verification run hit (calque#141/#142/#143).
 	fmt.Printf("[5/8] waiting for warmd summary (vLLM load + %d generations)...\n", o.n)
-	summaryBytes, err := calexec.WaitForSummary(ctx, s3c, layout, o.deadline, 15*time.Second,
+	summaryBytes, err := calexec.WaitForSummaryLiveness(ctx, s3c, ec2.NewFromConfig(cfg), acquired.InstanceID, layout, o.deadline, 15*time.Second, staleHeartbeatAfter,
 		func(elapsed time.Duration) { fmt.Printf("      ...running (%s)\n", elapsed.Round(time.Second)) })
 	if err != nil {
+		var stale *calexec.ErrInstanceStale
+		if errors.As(err, &stale) {
+			return fmt.Errorf("instance went unresponsive mid-run (%w) — its spawn:last-heartbeat tag stopped advancing; not a work-in-progress timeout", stale)
+		}
 		// Fast-failure: the bootstrap exited without a summary — its log tells us why.
 		var bf *calexec.ErrBootstrapFailed
 		if errors.As(err, &bf) {

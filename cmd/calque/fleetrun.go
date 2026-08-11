@@ -94,9 +94,12 @@ func fleetRun(o realOpts, shards int) (err error) {
 			pricePerHr = rate
 		}
 	}
+	// Shared EC2 client (stateless, safe for concurrent shard goroutines) — used
+	// both for the AZ sweep below and each shard's spawn#497 liveness check.
+	ec2c := ec2.NewFromConfig(cfg)
 	// AZ sweep shared across shards (each acquire tries every offered AZ).
 	var places []plan.Placement
-	if found, aerr := calexec.AZsForInstance(ctx, ec2.NewFromConfig(cfg), o.instance); aerr == nil {
+	if found, aerr := calexec.AZsForInstance(ctx, ec2c, o.instance); aerr == nil {
 		for _, f := range found {
 			places = append(places, plan.Placement{AZ: f.AZ, Subnet: f.Subnet})
 		}
@@ -144,7 +147,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	measurements := make([]measure.Measurement, len(shs))
 	shardErrs := make([]error, len(shs))
 	runWaves(ceiling, len(shs), func(i int) {
-		measurements[i], shardErrs[i] = runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
+		measurements[i], shardErrs[i] = runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
 	})
 
 	// D4: fleet-level partial-failure re-drive, through the SAME quota
@@ -169,7 +172,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 				fleetSleep(wait)
 			}
 			fmt.Fprintf(os.Stderr, "[fleet] shard %d failed (%v); re-driving once on a fresh instance\n", shs[i].ID, shardErrs[i])
-			m, serr := runShard(ctx, s3c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
+			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
 			measurements[i], shardErrs[i] = m, serr
 			if serr != nil {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
@@ -303,7 +306,7 @@ var fleetSleep = time.Sleep
 // its OWN copy since plan.Acquirer.Acquire mutates Target.Region and this is
 // called from concurrent goroutines (calque#134: a shared *target.Target
 // pointer across shards would race on that mutation).
-func runShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Client, o realOpts,
+func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o realOpts,
 	sh calexec.Shard, places []plan.Placement, pricePerHr float64, baseTgt *target.Target, rep *syncReport) (measure.Measurement, error) {
 	shardLayout := calexec.RunLayout{
 		Bucket: o.bucket, ArtifactPfx: "fleet/" + o.runID + "/artifacts",
@@ -337,8 +340,15 @@ func runShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Client,
 		}
 	}()
 
-	summaryBytes, err := calexec.WaitForSummary(ctx, s3c, shardLayout, o.deadline, 15*time.Second, nil)
+	// spawn#497 (spored v0.100.0+): also check spawn:last-heartbeat, so a
+	// genuinely hung/gone shard fails fast instead of dead-waiting the whole
+	// deadline — see realrun.go's identical wiring for the incident this closes.
+	summaryBytes, err := calexec.WaitForSummaryLiveness(ctx, s3c, ec2c, acquired.InstanceID, shardLayout, o.deadline, 15*time.Second, staleHeartbeatAfter, nil)
 	if err != nil {
+		var stale *calexec.ErrInstanceStale
+		if errors.As(err, &stale) {
+			return measure.Measurement{}, fmt.Errorf("shard %d went unresponsive mid-run (%w)", sh.ID, stale)
+		}
 		var bf *calexec.ErrBootstrapFailed
 		if errors.As(err, &bf) {
 			return measure.Measurement{}, fmt.Errorf("shard %d bootstrap failed", sh.ID)

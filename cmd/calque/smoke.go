@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -43,6 +44,14 @@ type smokeOpts struct {
 // user, not root) — /opt is root-owned, which failed with "Permission denied"
 // (diagnosed from the bootstrap.log of run smoke-use1-220821). /tmp always works.
 const hostWorkerDir = "/tmp/calque"
+
+// staleHeartbeatAfter bounds how long spawn:last-heartbeat (spawn#497,
+// spored v0.100.0+) can go without advancing before a WaitForSummaryLiveness
+// caller treats the instance as hung/gone rather than "still legitimately
+// running." Longer than spored's own tag-write throttle (once/minute) with
+// real margin for a missed tick or two under load, short enough to actually
+// catch a hang well before any --deadline-min a real fleet/GPU run would set.
+const staleHeartbeatAfter = 5 * time.Minute
 
 func smoke(o smokeOpts) (err error) {
 	ctx := context.Background()
@@ -167,11 +176,16 @@ func smoke(o smokeOpts) (err error) {
 		}
 	}()
 
-	// 4. wait for warmd to write its summary to S3.
+	// 4. wait for warmd to write its summary to S3. spawn#497 (spored v0.100.0+):
+	// also check spawn:last-heartbeat, so a hung/gone instance fails fast.
 	fmt.Printf("[5/7] waiting for warmd summary at s3://%s/%s ...\n", layout.Bucket, layout.SummaryKey)
-	summaryBytes, err := calexec.WaitForSummary(ctx, s3c, layout, o.deadline, 10*time.Second,
+	summaryBytes, err := calexec.WaitForSummaryLiveness(ctx, s3c, ec2.NewFromConfig(cfg), acquired.InstanceID, layout, o.deadline, 10*time.Second, staleHeartbeatAfter,
 		func(elapsed time.Duration) { fmt.Printf("      ...still waiting (%s)\n", elapsed.Round(time.Second)) })
 	if err != nil {
+		var stale *calexec.ErrInstanceStale
+		if errors.As(err, &stale) {
+			return fmt.Errorf("instance went unresponsive mid-run (%w)", stale)
+		}
 		return fmt.Errorf("wait for summary: %w", err)
 	}
 	var summary struct {

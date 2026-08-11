@@ -97,8 +97,11 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 		byKey[c.Key] = c
 	}
 
+	// Shared EC2 client (stateless, safe for concurrent shard goroutines) — used
+	// both for the AZ sweep below and each shard's spawn#497 liveness check.
+	ec2c := ec2.NewFromConfig(cfg)
 	var places []plan.Placement
-	if found, aerr := calexec.AZsForInstance(ctx, ec2.NewFromConfig(cfg), o.instance); aerr == nil {
+	if found, aerr := calexec.AZsForInstance(ctx, ec2c, o.instance); aerr == nil {
 		for _, f := range found {
 			places = append(places, plan.Placement{AZ: f.AZ, Subnet: f.Subnet})
 		}
@@ -114,7 +117,7 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			shardErrs[i] = runSpawnShard(ctx, s3c, spawnClient, o, shs[i], byKey[shs[i].Key], places, safeRep)
+			shardErrs[i] = runSpawnShard(ctx, s3c, ec2c, spawnClient, o, shs[i], byKey[shs[i].Key], places, safeRep)
 		}(i)
 	}
 	wg.Wait()
@@ -123,7 +126,7 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 	for i := range shs {
 		if shardErrs[i] != nil {
 			fmt.Fprintf(os.Stderr, "[spawn] shard %q failed (%v); re-driving once on a fresh instance\n", shs[i].Key, shardErrs[i])
-			serr := runSpawnShard(ctx, s3c, spawnClient, o, shs[i], byKey[shs[i].Key], places, safeRep)
+			serr := runSpawnShard(ctx, s3c, ec2c, spawnClient, o, shs[i], byKey[shs[i].Key], places, safeRep)
 			shardErrs[i] = serr
 			if serr != nil {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, app.Script, 0,
@@ -158,7 +161,7 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 // like testdata/scripts/spawn_fanout.py's worker_a/worker_b, not
 // necessarily a vLLM inference call), waits for the summary, and
 // terminates. Mirrors fleetRun's runShard structurally.
-func runSpawnShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Client, o spawnOpts,
+func runSpawnShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o spawnOpts,
 	sh calexec.NamedShard, callable calexec.SpawnCallable, places []plan.Placement, rep *syncReport) error {
 	shardLayout := calexec.RunLayout{
 		Bucket: o.bucket, ArtifactPfx: "spawn/" + o.runID + "/artifacts",
@@ -198,8 +201,15 @@ func runSpawnShard(ctx context.Context, s3c *s3.Client, spawnClient *spawnaws.Cl
 		}
 	}()
 
-	_, err = calexec.WaitForSummary(ctx, s3c, shardLayout, o.deadline, 15*time.Second, nil)
+	// spawn#497 (spored v0.100.0+): also check spawn:last-heartbeat, so a
+	// genuinely hung/gone shard fails fast instead of dead-waiting the whole
+	// deadline.
+	_, err = calexec.WaitForSummaryLiveness(ctx, s3c, ec2c, acquired.InstanceID, shardLayout, o.deadline, 15*time.Second, staleHeartbeatAfter, nil)
 	if err != nil {
+		var stale *calexec.ErrInstanceStale
+		if errors.As(err, &stale) {
+			return fmt.Errorf("shard %q went unresponsive mid-run (%w)", sh.Key, stale)
+		}
 		var bf *calexec.ErrBootstrapFailed
 		if errors.As(err, &bf) {
 			return fmt.Errorf("shard %q bootstrap failed", sh.Key)
