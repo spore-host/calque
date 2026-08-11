@@ -9,6 +9,229 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-10
+
+32 commits since v0.1.0: quota-aware fleet launching, spot support, multi-
+region acquisition fallback, institutional-tenancy fixes (MIG/MPS/pool),
+several parser/runner correctness fixes found via a real-world script
+corpus, and a thesis-level reframing of what calque is for.
+
+### Changed
+
+- **Dropped crossover-K as calque's headline claim; thesis reframed around
+  unchanged idiom fidelity** (979e743, aab4542, ba61a4c, fa3fbee):
+  crossover-K — the point at which a workload's real per-item AWS cost
+  undercuts Modal's — was never the project's actual goal ("that was
+  something invented by Claude," per Scott). The real thesis is that Modal
+  code runs on AWS *unchanged*, because groups hit cases where Modal
+  doesn't scale for them and need a faithful migration path off it. K's
+  cost model is still real, still-shipped code (`internal/cost`) and can
+  still be reported, but it no longer leads the README, isn't presented as
+  "the one number," and no longer anchors calque's measured-run provenance
+  story. Concretely:
+  - The README's headline on-demand N≈100, K≈73, CROSS claim is retracted
+    — it was never backed by a raw artifact (`docs/measured-runs/README.md`
+    had been flagging it as an unfilled TEMPLATE since #57/#58 while the
+    README kept presenting it as achieved). Every completed,
+    provenance-recorded run to date (L4 N=1, g7e spot N=1/100/1000, g7e
+    batch-32 N=1000) verdicts STAY ON MODAL — none has crossed yet.
+  - `docs/measured-runs/` (a whole directory whose sole purpose was
+    provenance-backing K numbers) is deleted; its actual results are now
+    cited inline where relevant instead.
+  - README/CHANGELOG, `examples/README.md`, `docs/tenancy-vs-session.md`,
+    `docs/serve-architecture.md`, `docs/modal-compatibility-matrix.md`,
+    `docs/behind-the-seam-register.md`, `docs/m12-m13-boundary.md`, and
+    `docs/pool-queue-contract.md` all had K-flavored framing reworded or
+    removed (found via an adversarial audit of every `.md` file in the
+    repo, the calque-docs-auditor pass).
+  - README gains a first-class "Institutional GPU sharing" section (warm
+    pools, MIG slice provisioning, MPS trusted-tenant sharing) — real,
+    tested, shipped functionality that was previously undiscoverable from
+    the front page despite being a second differentiating thesis alongside
+    unchanged-code portability.
+  - `docs/README.md` is rewritten into an actual index of what each design
+    doc answers (calque#122), rather than a pointer to GitHub tracking
+    policy.
+  - Other staleness fixed in the same pass: the README's acquisition
+    description now credits `lagotto/pkg/snipe.Snipe` as the real owner of
+    the retry/backoff/AZ-sweep loop (calque's `Acquirer` is a thin adapter,
+    since the #106 migration); the compatibility matrix's `.spawn()` row no
+    longer says "not yet executed" now that `cmd/calque/spawnrun.go` is
+    live-verified on real AWS; `.local()`'s status is upgraded now that
+    calque#92 ships sibling bodies, not just leaks them.
+
+- **`calque session` renamed to `calque ramp`** (calque#117; c69ed19,
+  0513323): frees "session" for the institutional MIG/MPS tenancy
+  check-out/check-in verb described in `docs/tenancy-vs-session.md` (see
+  Added, below), which this rename was blocking. Pure rename —
+  `cmd/calque/session.go` → `ramp.go`, `sessionOpts` → `rampOpts`,
+  `runSession` → `runRamp`, CLI verb `session` → `ramp` — no behavior,
+  flag, or logic changes. README and docs cross-references updated to
+  describe the rename as shipped rather than pending.
+
+- **Compatibility-matrix legend now distinguishes "fully supported
+  (executed)" from "recognized, correct behavior is to refuse"**
+  (calque#121; 10bb15e, 8bc3884): the previous ✅/🟨/❌/⬜ legend conflated
+  the two — the multi-GPU `gpu=` swap guard and `.starmap()`'s old refusal
+  (calque#83) both carried a bare ✅ despite neither actually running. Adds
+  a distinct 🛑 symbol and re-marks both rows; also fixes a stale claim that
+  `@app.cls`+`@modal.enter()`+`.map()` was calque's ONLY runnable shape,
+  directly contradicted by the plain `@app.function` row above it (fixed by
+  calque#80, also runnable).
+
+### Added
+
+- **Fleet runs are now quota-aware: pre-flight check + wave-based
+  launching** (calque#141): a real N=100k fleet run (calque#18) found out
+  about the account's real Spot quota ceiling (64 vCPUs = 8 concurrent
+  `g7e.2xlarge` instances) only via a live `MaxSpotInstanceCountExceeded`
+  error, after `cmd/calque/fleetrun.go`'s unbounded goroutine fan-out had
+  already committed to launching all `--shards N` at once — 2 of 10 shards
+  failed immediately, and a later mass re-drive of 9 failed shards against
+  a quota that hadn't fully freed up yet left 64,207/100,000 items in
+  `missing[]`. `internal/plan.QuotaCeiling` now queries truffle's quota
+  client (`quotas.GetQuotas` + `aws.Client.GetCapabilities`) for the
+  account's real headroom (quota − usage, converted to an instance count
+  via the instance type's real vCPU count) before `fleetRun` commits to a
+  shard count. `fleetRun`'s D2 fan-out and D4 re-drive pass now both run
+  through a buffered-channel semaphore (`runWaves`) sized to that ceiling
+  instead of firing unboundedly: when the ceiling covers every requested
+  shard, behavior is unchanged; when it doesn't, shards launch in waves
+  (ceiling-many at a time, topping up as earlier shards' instances
+  terminate). A shard whose D4 re-drive failure was specifically a
+  quota-exceeded error (`lagotto/pkg/failure.IsQuotaExceeded`) now backs
+  off `quotaExceededBackoff` (3 minutes) before that re-drive attempt,
+  since a quota wall clears when OTHER instances terminate, not through
+  retrying at the normal pace — this is the exact mechanism that turned
+  the real incident's partial failure into a near-total one. A failed
+  quota pre-flight check doesn't block the run: it leaks the failure and
+  falls back to the requested `--shards` count unclamped (today's
+  pre-#141 behavior). Docs now also clarify that `--ttl` bounds a shard's
+  WHOLE runtime, not just acquisition — `--deadline-min` only bounds the
+  acquire/wait-for-capacity phase, and conflating the two compounded the
+  real incident (calque#18): `--deadline-min` was raised to 60m to give
+  shards room to acquire, but `--ttl` was left at its 40m default, so every
+  running shard's instance was reaped mid-work at ~40 minutes regardless.
+  Also bumps truffle v0.48.1→v0.49.0 (`Capabilities.VCPUs`, Spot-usage
+  tracking, truffle#132), lagotto v0.52.1→v0.53.0 (`IsQuotaExceeded` signal,
+  lagotto#116), and spawn v0.98.0→v0.99.0 (`launch --max-concurrent-auto`,
+  spawn#492) as prerequisites.
+
+- **`.starmap()` tuple-splat execution** (calque#93): a `.starmap()`'d warm
+  unit now actually RUNS instead of refusing, when the script's real iterable
+  was statically resolved at parse time (calque#136) — the warm runner
+  (`worker/warm-runner/runner.py`) binds every one of the callable's
+  positional params and splats each item's tuple (`fn(self.state, *payload)`)
+  rather than binding only the first arg. `checkInvokeSupport`
+  (`cmd/calque/run.go`) narrows its refusal to the one case that's still
+  genuinely unsafe: a `.starmap`'d unit with no statically-resolvable
+  iterable at all (nothing real to splat).
+
+- **`.map()`/`.starmap()` now driven from a script's real iterable data, not
+  synthesized placeholder items** (calque#136): every run command used to
+  synthesize fake item payloads (`fmt.Sprintf("dry-run-item-%d", i)`, a
+  canned sentence) instead of reading a script's actual `.map()`/`.starmap()`
+  argument. `pyast`'s `_iterable_literal` statically resolves a literal
+  list/tuple/str argument, or a `range()` call whose own args are literal
+  ints; `ir.Function.Items` carries the resolved list, and `cmd/calque`'s
+  `realOrSyntheticItems` uses it directly when long enough for the
+  requested `--n`, else falls back to the pre-existing synthesis closure
+  unchanged. `realrun.go`/`ramp.go`/`fleetrun.go` gain an opt-in `--script`
+  flag so they can draw real items when one is supplied (they previously
+  never parsed a script at all, driven only by `--model` against a
+  hardcoded reference body); leaving it unset reproduces prior behavior
+  exactly. Deliberately does not attempt dynamic values (variables,
+  comprehensions, non-`range` calls) — out of scope, an honest leak instead.
+
+- **Call sites now attributed to their enclosing `@app.local_entrypoint()`,
+  steering warm-unit selection** (calque#98): `--entrypoint` was validated
+  (calque#90) but never actually changed which callable `pickWarmUnit`
+  selected — it scanned the whole script for the best `.map()`'d
+  `@cls`+`@enter` callable regardless of which entrypoint was chosen, so a
+  script with `do_train()` calling `train.map(...)` and `do_evaluate()`
+  calling `evaluate.remote(1)` always picked `train` even under
+  `--entrypoint do_evaluate`. `pyast`'s `Collector` now tracks an
+  entrypoint-scope stack and tags every `invoke_calls`/`map_calls` entry
+  with its enclosing entrypoint; `ir.App.EntrypointInvokes` partitions the
+  same evidence by entrypoint, additive to the existing whole-script-flat
+  map. `pickWarmUnit` restricts its scan to the resolved entrypoint's own
+  evidence once a script has 2+ entrypoints; 0-or-1-entrypoint scripts take
+  the original unscoped path unchanged.
+
+- **Spot support on `calque real`/`smoke`/`fleetrun`, plus a spot-
+  interruption poller** (calque#94): `--spot`/`--spot-max-price` now exist
+  on `calque real`, `calque smoke`, and `calque fleetrun` (previously only
+  `calque ramp`), following `ramp.go`'s established flag/honesty-leak
+  pattern; `fleetrun`'s leak fires once for the whole fleet since the flag
+  is shared fleet-wide, not per-shard. A spot acquire failure flows through
+  `fleetrun`'s existing re-drive-then-`missing[]` mechanism unchanged.
+  `warmd`'s `runOnInstance` now runs a lightweight goroutine polling EC2's
+  2-minute spot-interruption-notice metadata endpoint alongside the
+  occupancy sampler, leaking a distinct `spot_interruption` record on
+  detection, then letting the existing summary-write and crash-restart/
+  re-drive machinery handle it — no new recovery protocol.
+
+- **Multi-region acquisition fallback** (calque#95):
+  `Acquirer.AcquireMultiRegion` builds one `snipe.Target` per candidate
+  region (primary + fallbacks, in preference order) using lagotto's
+  existing `snipe.Options.Fallbacks` — `Snipe` sweeps the primary region's
+  placements then each fallback region's, in order, within one round,
+  before backing off; no new calque-side sweep loop. `Acquire` is now a
+  thin single-region wrapper (zero `Fallbacks`, byte-for-byte identical
+  `snipe.Target` to before), so existing single-region callers are
+  unaffected. `calque ramp` gains a `--fallback-regions` flag wiring this
+  end-to-end as a proof-of-concept, resolving AZs/subnets per candidate
+  region since an AZ in one region says nothing about another.
+
+- **`calque session checkout`/`checkin`/`status`/`list`** (M16, attach
+  point for calque#118/#119): binds ONE user to ONE MIG slice or MPS
+  client-slot on an instance that's ALREADY acquired and running — never
+  calls `plan.Acquirer`; checkout/checkin operate strictly within an
+  instance the fleet layer already handed over. `internal/tenancy.Registry`
+  itself is unchanged (execution-layer-agnostic by design, doesn't
+  authenticate releases); identity enforcement lives at the CLI layer:
+  checkout mints a random session token the caller must present to check
+  in. Since `Registry` is in-memory and each CLI invocation is a separate
+  process, a small per-instance JSON state file persists the fixed slice
+  layout plus current holds, and `rebuildRegistry` replays them on each
+  invocation. Also warns of compounding spot blast-radius at checkout
+  (calque#119): `checkout --spot` (operator-supplied — checkout never
+  calls EC2 describe) warns that a spot reclaim would end every other
+  concurrent tenant's session too, not just the new one, when the caller
+  isn't the sole tenant.
+
+- **5 rare Modal constructs now tagged with a distinct leak instead of
+  silently vanishing or being miscategorized** (calque#91): before this,
+  `modal.Dict.from_name`/`Queue.from_name`/`NetworkFileSystem.from_name`
+  vanished entirely (no matching branch at all), and `modal.CloudBucketMount(...)`
+  used inline as a `volumes=` value was silently miscategorized as an
+  ordinary `Volume` mount. `App.include`/`.deploy` call sites also fell
+  through untouched. None of these are modeled — this only makes their
+  presence distinguishable (a named "where" in the leak report) so a real
+  script using one is a clean grep hit instead of silence or a false
+  `Volume` classification. Also recognizes `schedule=modal.Cron(...)`/
+  `modal.Period(...)` object forms (previously only the bare cron-string
+  kwarg was recognized; object forms fell through to a generic stringify
+  path that landed garbage JSON text while the leak misleadingly implied a
+  clean string was recorded) — still recorded-not-honored, no scheduler
+  exists in the spike.
+
+- **Real-world Modal script corpus, 7 scripts sourced from GitHub**
+  (calque#79): pressure-tests calque beyond AI-Almanac's original 3 scripts
+  (all batch-shaped) with a deliberate mix — 2 pure-batch, 3 serve+batch, 2
+  pure-serve — for materially better serve-shape coverage. Every script run
+  through `calque analyze`/`calque run --dry-run` (zero-cost, zero-AWS-call).
+  3 genuinely new findings filed as calque#138/#139/#140 (all fixed below);
+  everything else mapped onto already-tracked or already-closed gaps.
+  `testdata/real-world/README.md` indexes provenance, shape, and triage
+  outcome per script, plus a re-run recipe.
+
+- **Task-oriented Modal→AWS porting guide** (calque#133): new
+  `docs/porting-modal-to-aws.md`, built around running `calque analyze` and
+  reading its actual free-text output (verified against real output from
+  the `testdata/scripts/` corpus) rather than an imagined status-emitting
+  CLI mode.
+
 ### Fixed
 
 - **calque now passes a script's real requested GPU card to truffle**
@@ -29,46 +252,114 @@ per [semver.org](https://semver.org/#spec-item-4).
   (`docs/gpu-sharing-support-matrix.md` covers g6/g6e/g7/g7e only) now
   emits an informational leak in `plan.FillTarget` rather than staying
   silent — the run still succeeds; this is a documentation gap, not an
-  error.
+  error. `fleetrun.go`'s `runShard` now takes a shared `*target.Target` per
+  fleet run instead of building a fresh one per shard, taking its own copy
+  per goroutine to avoid a cross-goroutine race on `Target.Region` mutated
+  by `Acquire` (confirmed via `-race`).
 
-### Added
+- **Multi-statement `Image` chains no longer overwrite earlier layers**
+  (calque#140): `image = image.step(...)` — a fresh statement reassigning
+  an already-known image variable — previously overwrote the prior
+  statement's fully-resolved `{base, steps}` record with a base-less one,
+  discarding every earlier layer including the real base constructor.
+  Found auditing a real production ComfyUI-on-Modal deployment, where this
+  pattern lost `apt_install`/`pip_install_from_requirements`/`run_function`
+  entirely, leaving the rendered Dockerfile on a generic CUDA base with
+  none of the real build steps applied. `visit_Assign`'s image branch now
+  merges when the chain's root name is already a known image variable
+  (keeping the prior base, appending the new statement's steps) instead of
+  overwriting; a root name that isn't already known stays base-unresolved,
+  unchanged from before.
 
-- **Fleet runs are now quota-aware: pre-flight check + wave-based launching**
-  (calque#141): a real N=100k fleet run (calque#18) found out about the
-  account's real Spot quota ceiling (64 vCPUs = 8 concurrent `g7e.2xlarge`
-  instances) only via a live `MaxSpotInstanceCountExceeded` error, after
-  `cmd/calque/fleetrun.go`'s unbounded goroutine fan-out had already
-  committed to launching all `--shards N` at once — 2 of 10 shards failed
-  immediately, and a later mass re-drive of 9 failed shards against a
-  quota that hadn't fully freed up yet left 64,207/100,000 items in
-  `missing[]`. `internal/plan.QuotaCeiling` now queries truffle's quota
-  client (`quotas.GetQuotas` + `aws.Client.GetCapabilities`) for the
-  account's real headroom (quota − usage, converted to an instance count
-  via the instance type's real vCPU count) before `fleetRun` commits to a
-  shard count. `fleetRun`'s D2 fan-out and D4 re-drive pass now both run
-  through a buffered-channel semaphore (`runWaves`) sized to that ceiling
-  instead of firing unboundedly: when the ceiling covers every requested
-  shard, behavior is unchanged; when it doesn't, shards launch in waves
-  (ceiling-many at a time, topping up as earlier shards' instances
-  terminate). A shard whose D4 re-drive failure was specifically a
-  quota-exceeded error (`lagotto/pkg/failure.IsQuotaExceeded`) now backs
-  off `quotaExceededBackoff` (3 minutes) before that re-drive attempt,
-  since a quota wall clears when OTHER instances terminate, not through
-  retrying at the normal pace — this is the exact mechanism that turned
-  the real incident's partial failure into a near-total one. A failed
-  quota pre-flight check doesn't block the run: it leaks the failure and
-  falls back to the requested `--shards` count unclamped (today's
-  pre-#141 behavior).
+- **Pre-1.0 `__enter__`/`__exit__` class lifecycle now recognized**
+  (calque#138): before `@modal.enter()`/`@modal.exit()` existed, Modal's
+  class-based lifecycle was expressed via Python's own context-manager
+  dunders on a `@stub.cls(...)`-decorated class — Modal's ORIGINAL API, not
+  a rare edge case, found in a real, still-online production repo. This
+  previously fell into the generic "plain method" bucket, and calque
+  refused to run the script at all ("no mapped `@cls`+`@enter` warm unit
+  found"); worse, the dunders were exposed on `methods[]` with no special
+  marking, risking the same load-once/teardown-hook misclassification
+  calque#86 already fixed for `@modal.exit()`. `visit_ClassDef` now
+  recognizes bare `__enter__`/`__exit__` as a fallback (deferring to real
+  decorators when present) and excludes both from the methods list; a
+  distinct leak notes when the legacy dunder form was recognized.
 
-- **`.starmap()` tuple-splat execution** (calque#93): a `.starmap()`'d warm
-  unit now actually RUNS instead of refusing, when the script's real iterable
-  was statically resolved at parse time (calque#136) — the warm runner
-  (`worker/warm-runner/runner.py`) binds every one of the callable's
-  positional params and splats each item's tuple (`fn(self.state, *payload)`)
-  rather than binding only the first arg. `checkInvokeSupport`
-  (`cmd/calque/run.go`) narrows its refusal to the one case that's still
-  genuinely unsafe: a `.starmap`'d unit with no statically-resolvable
-  iterable at all (nothing real to splat).
+- **Module-level helpers/constants referenced by bare name are now
+  shipped** (calque#139): calque#92 taught dry-run to ship sibling
+  `@app.function`s referenced via explicit `.local(...)` call syntax. Real
+  Modal code overwhelmingly references module-level helpers/constants via a
+  plain, undecorated name instead, since they're ordinary Python globals
+  never registered as an `@app.function` — the warm-runner execs bodies in
+  an isolated globals dict seeded only with `.local()`-resolved extras, so
+  every such reference was a guaranteed `NameError` at dry-run time.
+  Recurred independently across 3 of 7 real-world corpus scripts — the
+  single highest-leverage finding from that pass. `pyast`'s new
+  `_FreeRefFinder` walks `@enter`/`@method` bodies with real scope tracking
+  and collects every free `Name` load that resolves to a module-level
+  def/assign in the same script; `collectLocalExtras` seeds its existing
+  transitive-closure BFS from these free references too, alongside
+  `.local()` calls. Deliberately does not attempt to resolve imports (a
+  bare re-exported name stays an honest leak, not a false positive).
+
+- **`Volume` caching now correctly credited on the plain-`@app.function`
+  leak** (calque#124): the leak said flatly "no warm-reuse economics" even
+  when the function mounts a `Volume` — `VolumeSync`'s existing delta-only
+  sync still avoids re-downloading cached weights across separate runs,
+  just not via `@enter`'s per-item in-memory reuse within one run. Wording
+  fix only; no new caching mechanism needed.
+
+- **SQS-safe model-name slugging for pool queues** (calque#129):
+  `PoolQueueName` concatenated `"calque-pool-" + model` with no
+  sanitization — SQS queue names disallow `/`, which calque's own
+  default/showcased model (`Qwen/Qwen2.5-1.5B-Instruct`) contains, so
+  `calque pool create` against that exact model would fail `CreateQueue`
+  outright. `PoolQueueName` now slugs the model internally (lowercase,
+  replace disallowed chars, collapse/trim dashes, cap length); every
+  existing caller is sanitized automatically with no call-site changes.
+
+- **Pool heartbeat visibility, per-claim occupancy sampling, correct
+  scale-up count, and `delete`/`status`/`list`** (calque#131, #116, #115,
+  #130): `Worker.runOne` now heartbeats SQS visibility
+  (`ChangeMessageVisibility` every `VisibilityTimeout/3`) around
+  `DrainBatch` so long-running claims don't get redelivered mid-drain
+  (#131). Pool claims now sample GPU occupancy scoped to just their own
+  `DrainBatch` window, mirroring `warmd`'s whole-run sampler but per-claim,
+  so `emitKForPoolClaim` reads a real number instead of hardcoding
+  full-fill (#116). `ScaleWorkers` now queries cohort's `Observer` for the
+  current worker count before provisioning more, so scale-up numbers new
+  workers from N instead of colliding with already-running ones (#115).
+  `calque pool delete`/`status`/`list` added — delete tears down the
+  cohort (`Reconciler.Drain`) and the SQS queue; status/list report worker
+  count and queue depth (#130).
+
+- **Tenancy TTL expiry supports an optional termination hook**
+  (calque#128): `sweepExpiredLocked` only deleted the registry's own
+  bookkeeping on TTL expiry, with no guarantee the prior holder's actual
+  warm process had stopped — a slice became checkout-eligible again
+  immediately even if the old tenant's workload was still running on it.
+  `NewRegistryWithExpiryHook` fires a caller-supplied hook synchronously
+  (while still holding the registry's lock) before an expired slice is
+  freed; `NewRegistry`'s existing signature and behavior are unchanged
+  (nil hook).
+
+- **MPS `Coordinator` is now concurrency-safe; `NewCoordinator` validates
+  its policy up front** (calque#126, calque#127): `Coordinator.clients` was
+  read/written unguarded by `Register`/`Unregister`/`NotifyCrash` — added a
+  mutex mirroring `tenancy.Registry`'s existing pattern, plus a `-race`
+  concurrency test. `NewCoordinator` previously accepted any
+  `BlastRadiusPolicy` value and only failed later via a panic inside
+  `NotifyCrash` when a crash actually occurred; it now validates at
+  construction time and returns an error for anything but `Conservative`,
+  and the now-unreachable panic branches were removed.
+
+- **MIG `PickLayout` supports memory-aware slice selection** (calque#125):
+  `PickLayout` always maximized tenant count (most instances, smallest
+  memory tiebreak) with no way to request a larger slice for a bigger
+  workload. Adds a `minMemoryGiB` parameter: greater than 0 picks the
+  smallest profile that satisfies it (erroring via a new
+  `ErrNoProfileFits` if none does); 0 preserves the existing
+  maximize-count default unchanged.
 
 ## [0.1.0] - 2026-08-09
 
