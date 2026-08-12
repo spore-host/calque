@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -270,6 +272,66 @@ func TestMeasurementFromPoolSummaryFields_CarriesOccupancy(t *testing.T) {
 	}
 	if m.Occupancy.MeanOccupancy == nil || *m.Occupancy.MeanOccupancy != 0.75 {
 		t.Errorf("Occupancy.MeanOccupancy = %v, want 0.75", m.Occupancy.MeanOccupancy)
+	}
+}
+
+// TestNeedsItemRedrive_CleanClaimWithFailedItemsQualifies (calque#145
+// slice 3, D4a): the core case this pass exists for — a claim that
+// completed (shardErr == nil) but reported permanently-failed item
+// indices should be routed to item-level re-drive, not D4's dedicated-
+// instance fallback.
+func TestNeedsItemRedrive_CleanClaimWithFailedItemsQualifies(t *testing.T) {
+	if !needsItemRedrive(nil, []int{3, 7}) {
+		t.Error("needsItemRedrive(nil, [3,7]) = false, want true")
+	}
+}
+
+// TestNeedsItemRedrive_ClaimLevelFailureFallsThroughToD4 proves a shard
+// whose D2 wait itself errored (including a stale-fleet ErrFleetStale) is
+// NOT selected for item-level re-drive even if shardFailed happens to be
+// non-empty (it shouldn't be populated in that case, but the predicate
+// must not depend on that) — it must fall through to D4's existing
+// dedicated-instance selection unchanged.
+func TestNeedsItemRedrive_ClaimLevelFailureFallsThroughToD4(t *testing.T) {
+	if needsItemRedrive(errors.New("shard wait summary: boom"), []int{3}) {
+		t.Error("needsItemRedrive with a non-nil shardErr = true, want false (must route to D4, not D4a)")
+	}
+}
+
+// TestNeedsItemRedrive_CleanClaimNoFailedItemsSkipsBothPasses proves the
+// common happy-path case (everything landed) triggers neither D4a nor D4.
+func TestNeedsItemRedrive_CleanClaimNoFailedItemsSkipsBothPasses(t *testing.T) {
+	if needsItemRedrive(nil, nil) {
+		t.Error("needsItemRedrive(nil, nil) = true, want false (no failed items to redrive)")
+	}
+}
+
+// TestD4aFlowsThroughToD4_OnFailure simulates D4a's own failure path
+// (e.g. the item-redrive's WaitForSummaryLivenessAny call itself errors)
+// setting shardErrs[i] — proving that shard THEN gets picked up by D4's
+// existing, unchanged failedIdx selection (the same `shardErrs[i] != nil`
+// check D4 has always used), exactly as fleetRun's D4a comment claims.
+func TestD4aFlowsThroughToD4_OnFailure(t *testing.T) {
+	shardErrs := make([]error, 3)
+	shardFailed := [][]int{nil, {2}, nil} // only shard 1 needed a D4a redrive
+
+	// Simulate D4a's loop: shard 1 qualifies, its redrive attempt fails.
+	for i := range shardErrs {
+		if !needsItemRedrive(shardErrs[i], shardFailed[i]) {
+			continue
+		}
+		shardErrs[i] = errors.New("item-redrive wait summary: fleet went stale")
+	}
+
+	// D4's existing selection logic, verbatim.
+	var failedIdx []int
+	for i := range shardErrs {
+		if shardErrs[i] != nil {
+			failedIdx = append(failedIdx, i)
+		}
+	}
+	if !reflect.DeepEqual(failedIdx, []int{1}) {
+		t.Errorf("D4 failedIdx = %v, want [1] (only the shard whose D4a redrive failed)", failedIdx)
 	}
 }
 

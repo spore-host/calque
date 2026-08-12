@@ -234,6 +234,77 @@ func WaitForSummaryLiveness(ctx context.Context, c *s3.Client, ec2c heartbeatGet
 	return waitForSummary(ctx, c, l, timeout, poll, onWait, check)
 }
 
+// ErrFleetStale means EVERY worker instance in instanceIDs has gone stale
+// on spawn:last-heartbeat (calque#145 slice 3) — the fleet-wide counterpart
+// to ErrInstanceStale, for a shard whose claim is served by ANY of a pool
+// of workers rather than one dedicated instance. LastHeartbeat is the MOST
+// RECENT heartbeat observed across all of them (zero if none was ever
+// seen at all).
+type ErrFleetStale struct {
+	InstanceIDs   []string
+	LastHeartbeat time.Time
+}
+
+func (e *ErrFleetStale) Error() string {
+	if e.LastHeartbeat.IsZero() {
+		return fmt.Sprintf("fleet: all %d worker instance(s) never observed a spawn:last-heartbeat", len(e.InstanceIDs))
+	}
+	return fmt.Sprintf("fleet: all %d worker instance(s) stale since %s", len(e.InstanceIDs), e.LastHeartbeat.Format(time.RFC3339))
+}
+
+// WaitForSummaryLivenessAny is WaitForSummaryLiveness's fleet-wide sibling
+// (calque#145 slice 3): instead of one instanceID pinned to this shard, it
+// takes every worker instance currently believed live for the RUN (a pool
+// of workers any of which might serve this shard's claim), and fails fast
+// ONLY when every one of them is stale — a single dead worker among
+// survivors is NOT fleet death; SQS's own visibility-timeout redelivery
+// already recovers that case by routing the claim to a survivor
+// (internal/pool.Worker's claim loop, unmodified by this). This function's
+// entire job is detecting the case that recovery mechanism can't handle:
+// every worker gone, so no survivor will ever claim the redelivered
+// message and the shard would otherwise dead-wait the full timeout.
+//
+// instanceIDs is a snapshot taken ONCE by the caller before submitting
+// shard claims (calque#145 slice 3 deliberately does not re-discover
+// workers mid-wait — fleet size is fixed at ProvisionFleetWorkers time,
+// there is no scale-up-mid-run mechanism to make a mid-wait refresh
+// meaningful). An empty instanceIDs (e.g. discovery itself failed) falls
+// back to WaitForSummary's plain timeout-only behavior rather than
+// treating "no IDs to check" as "all IDs stale."
+func WaitForSummaryLivenessAny(ctx context.Context, c *s3.Client, ec2c heartbeatGetter, instanceIDs []string, l RunLayout, timeout, poll, staleAfter time.Duration, onWait func(elapsed time.Duration)) ([]byte, error) {
+	if len(instanceIDs) == 0 {
+		return waitForSummary(ctx, c, l, timeout, poll, onWait, nil)
+	}
+	// lastSeen must persist ACROSS ticks via this closure, exactly like
+	// WaitForSummaryLiveness's single lastSeen variable — a value
+	// recomputed fresh each tick would make every tick look like "never
+	// seen," and heartbeatStale treats a zero-value lastSeen as NOT stale,
+	// so that bug would silently manifest as "this check never fires,"
+	// not a crash. See orchestrate_test.go's persistence test.
+	lastSeen := make(map[string]time.Time, len(instanceIDs))
+	check := func() error {
+		seen := instanceHeartbeats(ctx, ec2c, instanceIDs)
+		allStale := true
+		var newest time.Time
+		for _, id := range instanceIDs {
+			if hb, ok := seen[id]; ok && hb.After(lastSeen[id]) {
+				lastSeen[id] = hb
+			}
+			if !heartbeatStale(time.Now(), lastSeen[id], staleAfter) {
+				allStale = false
+			}
+			if lastSeen[id].After(newest) {
+				newest = lastSeen[id]
+			}
+		}
+		if allStale {
+			return &ErrFleetStale{InstanceIDs: append([]string{}, instanceIDs...), LastHeartbeat: newest}
+		}
+		return nil
+	}
+	return waitForSummary(ctx, c, l, timeout, poll, onWait, check)
+}
+
 // heartbeatStale is WaitForSummaryLiveness's staleness decision, extracted
 // as a pure function (now/lastSeen injected rather than time.Now()/a
 // closure-captured var) so it's unit-testable without a real clock. A
@@ -253,19 +324,43 @@ func heartbeatStale(now, lastSeen time.Time, staleAfter time.Duration) bool {
 // absent, unparsable, or the DescribeInstances call itself fails — any of
 // which just means "no liveness signal available," not "instance is dead."
 func instanceHeartbeat(ctx context.Context, c heartbeatGetter, instanceID string) (time.Time, bool) {
-	out, err := c.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{instanceID}})
-	if err != nil || len(out.Reservations) == 0 || len(out.Reservations[0].Instances) == 0 {
-		return time.Time{}, false
+	out, ok := instanceHeartbeats(ctx, c, []string{instanceID})[instanceID]
+	return out, ok
+}
+
+// instanceHeartbeats is instanceHeartbeat's batched sibling (calque#145
+// slice 3): ONE DescribeInstances call for every id in instanceIDs, instead
+// of N separate calls — WaitForSummaryLivenessAny checks every fleet worker
+// on every poll tick, and issuing N individual API calls per tick (rather
+// than one call carrying N ids, which EC2's DescribeInstances already
+// supports natively) would multiply needlessly with fleet size. Missing/
+// unparsable entries are simply absent from the returned map (same "no
+// signal available" contract as instanceHeartbeat's (zero, false)).
+func instanceHeartbeats(ctx context.Context, c heartbeatGetter, instanceIDs []string) map[string]time.Time {
+	out := make(map[string]time.Time, len(instanceIDs))
+	if len(instanceIDs) == 0 {
+		return out
 	}
-	for _, t := range out.Reservations[0].Instances[0].Tags {
-		if t.Key != nil && *t.Key == "spawn:last-heartbeat" && t.Value != nil {
-			if ts, perr := time.Parse(time.RFC3339, *t.Value); perr == nil {
-				return ts, true
+	resp, err := c.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: instanceIDs})
+	if err != nil {
+		return out
+	}
+	for _, res := range resp.Reservations {
+		for _, inst := range res.Instances {
+			if inst.InstanceId == nil {
+				continue
 			}
-			return time.Time{}, false
+			for _, t := range inst.Tags {
+				if t.Key != nil && *t.Key == "spawn:last-heartbeat" && t.Value != nil {
+					if ts, perr := time.Parse(time.RFC3339, *t.Value); perr == nil {
+						out[*inst.InstanceId] = ts
+					}
+					break
+				}
+			}
 		}
 	}
-	return time.Time{}, false
+	return out
 }
 
 // waitForSummary is WaitForSummary/WaitForSummaryLiveness's shared core.

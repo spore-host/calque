@@ -171,6 +171,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	// the actual gap calque#145 tracks.
 	measurements := make([]measure.Measurement, len(shs))
 	shardErrs := make([]error, len(shs))
+	shardFailed := make([][]int, len(shs))
 	sqsClient := sqs.NewFromConfig(cfg)
 	// The queue must exist before any worker boots and tries to OpenRunQueue
 	// it — mirrors calque pool create's own create-queue-before-provision
@@ -207,6 +208,21 @@ func fleetRun(o realOpts, shards int) (err error) {
 	q, err := calpool.OpenRunQueue(ctx, sqsClient, o.runID)
 	if err != nil {
 		return fmt.Errorf("open just-created run queue: %w", err)
+	}
+	// calque#145 slice 3: snapshot the fleet's real EC2 instance IDs ONCE,
+	// for WaitForSummaryLivenessAny's fleet-wide staleness check below — a
+	// discovery failure degrades to nil (WaitForSummaryLivenessAny's own
+	// empty-instanceIDs fallback is plain timeout-only, never a false
+	// "all stale"), not a fatal error; fleet size is fixed at provision
+	// time, so no mid-wait re-discovery is needed (see the plan's
+	// exclusions).
+	var liveInstanceIDs []string
+	if workers, derr := calpool.DiscoverFleetWorkerInstances(ctx, spawnClient, o.runID, o.region); derr != nil {
+		fmt.Fprintf(os.Stderr, "[fleet] WARNING: discover fleet worker instances failed for run %s: %v (falling back to timeout-only liveness)\n", o.runID, derr)
+	} else {
+		for _, w := range workers {
+			liveInstanceIDs = append(liveInstanceIDs, w.InstanceID)
+		}
 	}
 	// Fleet-pool acquire cost is a per-RUN fixed cost (ceiling workers'
 	// worth of provisioning), not attributable to any one shard — mirrors
@@ -247,16 +263,78 @@ func fleetRun(o realOpts, shards int) (err error) {
 			shardLayout := calexec.RunLayout{
 				Bucket: o.bucket, ResultPrefix: shs[i].ResultPrefix, SummaryKey: shs[i].SummaryKey,
 			}
-			summaryBytes, werr := calexec.WaitForSummary(ctx, s3c, shardLayout, o.deadline, 15*time.Second, nil)
+			// calque#145 slice 3: fleet-wide liveness check (fails fast only
+			// if EVERY worker in liveInstanceIDs has gone stale — a single
+			// dead worker among survivors is not fleet death, since SQS's
+			// own visibility-timeout redelivery already routes this claim
+			// to a survivor).
+			summaryBytes, werr := calexec.WaitForSummaryLivenessAny(ctx, s3c, ec2c, liveInstanceIDs, shardLayout, o.deadline, 15*time.Second, staleHeartbeatAfter, nil)
 			if werr != nil {
+				var fleetStale *calexec.ErrFleetStale
+				if errors.As(werr, &fleetStale) {
+					shardErrs[i] = fmt.Errorf("shard %d: fleet went unresponsive mid-run (%w)", shs[i].ID, fleetStale)
+					return
+				}
 				shardErrs[i] = fmt.Errorf("shard %d wait summary: %w", shs[i].ID, werr)
 				return
 			}
-			m, merr := measurementFromPoolSummary(ctx, s3c, o, shs[i], summaryBytes)
-			measurements[i], shardErrs[i] = m, merr
+			m, failed, merr := measurementFromPoolSummary(ctx, s3c, o, shs[i], summaryBytes)
+			measurements[i], shardFailed[i], shardErrs[i] = m, failed, merr
 		}(i)
 	}
 	wg.Wait()
+
+	// D4a (calque#145 slice 3): item-level re-drive. A shard whose CLAIM
+	// completed but reported some permanently-failed item indices
+	// (calpool.Summary.Failed) doesn't need D4's expensive dedicated-
+	// instance fallback — the pool is healthy in this case, so just
+	// resubmit ONLY those indices to the SAME pool. The re-drive writes to
+	// the ORIGINAL shard's ResultPrefix (a fresh manifest/summary/log key,
+	// distinguished by a "-redrive" shard key), so its results merge into
+	// D3's collection for free via CollectShards' existing index-keyed
+	// union — zero changes needed there. One attempt only, mirroring D4's
+	// own "re-drive once" semantics; any failure here (including a stale
+	// fleet) falls through to shardErrs[i], which D4 below already
+	// selects on unchanged.
+	for i := range shs {
+		if !needsItemRedrive(shardErrs[i], shardFailed[i]) {
+			continue
+		}
+		sub := calexec.SubShard(shs[i].ID, shs[i].Items, shardFailed[i])
+		redriveKey := fmt.Sprintf("%d-redrive", shs[i].ID)
+		mk, _, sk, lk := calexec.ShardLayout(base, sharedLayout.ArtifactPfx, redriveKey)
+		sub.ManifestKey, sub.ResultPrefix, sub.SummaryKey, sub.LogKey = mk, shs[i].ResultPrefix, sk, lk
+		fmt.Fprintf(os.Stderr, "[fleet] shard %d completed with %d permanently-failed item(s); re-driving just those on the SAME pool\n", shs[i].ID, len(shardFailed[i]))
+		if werr := calexec.WriteManifestBody(ctx, s3c, calexec.RunLayout{
+			Bucket: o.bucket, ArtifactPfx: sharedLayout.ArtifactPfx,
+			ManifestKey: sub.ManifestKey, ResultPrefix: sub.ResultPrefix, SummaryKey: sub.SummaryKey, LogKey: sub.LogKey,
+		}, shardBody, hostWorkerDir, sub.Items, nil, nil); werr != nil {
+			shardErrs[i] = fmt.Errorf("shard %d item-redrive write manifest: %w", shs[i].ID, werr)
+			continue
+		}
+		manifestURI := fmt.Sprintf("s3://%s/%s", o.bucket, sub.ManifestKey)
+		if werr := q.Submit(ctx, calpool.ClaimRef{RunID: o.runID, Model: o.runID, ManifestURI: manifestURI}); werr != nil {
+			shardErrs[i] = fmt.Errorf("shard %d item-redrive submit claim: %w", shs[i].ID, werr)
+			continue
+		}
+		redriveLayout := calexec.RunLayout{Bucket: o.bucket, ResultPrefix: sub.ResultPrefix, SummaryKey: sub.SummaryKey}
+		summaryBytes, werr := calexec.WaitForSummaryLivenessAny(ctx, s3c, ec2c, liveInstanceIDs, redriveLayout, o.deadline, 15*time.Second, staleHeartbeatAfter, nil)
+		if werr != nil {
+			shardErrs[i] = fmt.Errorf("shard %d item-redrive wait summary: %w", shs[i].ID, werr)
+			continue
+		}
+		// The redriven items' results now live at the ORIGINAL shard's
+		// ResultPrefix (sub.ResultPrefix == shs[i].ResultPrefix), so D3's
+		// existing CollectShards call picks them up automatically — no
+		// re-fold of measurements[i] needed; its EnterSecondsPaid/WarmHit/
+		// occupancy already correctly describe the original claim's fixed
+		// costs, and per-item timing is re-derived from Collect at D3
+		// regardless of which claim produced which item.
+		_, _, merr := measurementFromPoolSummary(ctx, s3c, o, sub, summaryBytes)
+		if merr != nil {
+			shardErrs[i] = fmt.Errorf("shard %d item-redrive: %w", shs[i].ID, merr)
+		}
+	}
 
 	// D4: fleet-level partial-failure re-drive, through the SAME quota
 	// ceiling (calque#141) rather than firing every failed shard's re-drive
@@ -493,6 +571,16 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 	}, nil
 }
 
+// needsItemRedrive is D4a's shard-selection predicate (calque#145 slice 3),
+// factored out as a pure function for unit-testability: a shard qualifies
+// for item-level re-drive only when its D2 claim completed cleanly
+// (shardErr == nil — a claim-level failure, including a stale fleet, goes
+// straight to D4's dedicated-instance fallback instead) AND it reported at
+// least one permanently-failed item index.
+func needsItemRedrive(shardErr error, failed []int) bool {
+	return shardErr == nil && len(failed) > 0
+}
+
 // measurementFromPoolSummary builds a shard's D5 measure.Measurement from a
 // WORKER-POOL claim's completion summary (calque#145 slice 2) — the D2
 // counterpart to runShard's own tail (used only by D4's dedicated-instance
@@ -504,20 +592,26 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 // all (it carries no per-item series), so it's derived from the shard's own
 // collected S3 results instead — mirroring poolsubmit.go's emitKForPoolClaim
 // precedent exactly (calque#102).
-func measurementFromPoolSummary(ctx context.Context, s3c *s3.Client, o realOpts, sh calexec.Shard, summaryBytes []byte) (measure.Measurement, error) {
+//
+// The returned []int (calque#145 slice 3) is the claim's OWN
+// calpool.Summary.Failed — global item indices (warm.Item.Index, per
+// DrainBatch) that permanently failed within an otherwise-completed claim.
+// Non-empty alongside a nil error means the shard needs D4a's item-level
+// re-drive, not D4's whole-shard dedicated-instance fallback.
+func measurementFromPoolSummary(ctx context.Context, s3c *s3.Client, o realOpts, sh calexec.Shard, summaryBytes []byte) (measure.Measurement, []int, error) {
 	var summary calpool.Summary
 	if err := json.Unmarshal(summaryBytes, &summary); err != nil {
-		return measure.Measurement{}, fmt.Errorf("shard %d decode pool summary: %w", sh.ID, err)
+		return measure.Measurement{}, nil, fmt.Errorf("shard %d decode pool summary: %w", sh.ID, err)
 	}
 	results, _, err := calexec.Collect(ctx, s3c, o.bucket, sh.ResultPrefix, 0)
 	if err != nil {
-		return measure.Measurement{}, fmt.Errorf("shard %d collect for measurement: %w", sh.ID, err)
+		return measure.Measurement{}, nil, fmt.Errorf("shard %d collect for measurement: %w", sh.ID, err)
 	}
 	perItemSecs := make([]float64, len(results))
 	for i, r := range results {
 		perItemSecs[i] = r.Seconds
 	}
-	return measurementFromPoolSummaryFields(summary, perItemSecs, o.instance), nil
+	return measurementFromPoolSummaryFields(summary, perItemSecs, o.instance), summary.Failed, nil
 }
 
 // measurementFromPoolSummaryFields is measurementFromPoolSummary's pure

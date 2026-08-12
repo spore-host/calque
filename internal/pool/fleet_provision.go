@@ -244,10 +244,14 @@ func ProvisionFleetWorkers(ctx context.Context, client *spawnaws.Client, cfg Fle
 
 // DiscoverFleetWorkerIDs lists every instance currently tagged as belonging
 // to this fleet run (calque:fleet-run == runID) and returns their
-// EntityIDs — discoverPoolWorkerIDs' run-scoped sibling. Exported (unlike
-// discoverPoolWorkerIDs) since fleetrun.go, outside this package, needs it
-// both for DrainFleetWorkers and for computing the live worker-instance-ID
-// list a liveness check would poll.
+// EntityIDs — discoverPoolWorkerIDs' run-scoped sibling. Used by
+// DrainFleetWorkers for teardown, which wants EntityIDs (Reconciler.Drain's
+// own argument type) and every state (stopped/pending included, not just
+// running) so a not-yet-terminated worker in ANY state still gets drained.
+// For a LIVENESS check's instance-ID list, use DiscoverFleetWorkerInstances
+// instead (calque#145 slice 3) — this function discards the real EC2
+// InstanceID a liveness check needs (spawn:last-heartbeat is stamped on the
+// instance, not the cohort entity name).
 func DiscoverFleetWorkerIDs(ctx context.Context, client taskcohort.LaunchAPI, runID, region string) ([]cohort.EntityID, error) {
 	insts, err := client.ListInstances(ctx, region, "")
 	if err != nil {
@@ -260,6 +264,36 @@ func DiscoverFleetWorkerIDs(ctx context.Context, client taskcohort.LaunchAPI, ru
 		}
 	}
 	return ids, nil
+}
+
+// LiveFleetWorker pairs a fleet worker's cohort EntityID (its Name tag)
+// with its real EC2 InstanceID (calque#145 slice 3) — DiscoverFleetWorkerIDs
+// only keeps the former, but a fleet-wide liveness check needs the latter to
+// read spawn:last-heartbeat, which is stamped on the INSTANCE, not the name.
+type LiveFleetWorker struct {
+	EntityID   cohort.EntityID
+	InstanceID string
+}
+
+// DiscoverFleetWorkerInstances is DiscoverFleetWorkerIDs' liveness-check
+// sibling (calque#145 slice 3): keeps the InstanceID ListInstances already
+// returns instead of discarding it. Filtered to RUNNING instances only —
+// unlike DiscoverFleetWorkerIDs/DrainFleetWorkers, which deliberately want
+// every state for teardown, a liveness check only cares about instances
+// that could still be alive to claim work; a stopped/terminated instance
+// is definitionally not a candidate worker.
+func DiscoverFleetWorkerInstances(ctx context.Context, client taskcohort.LaunchAPI, runID, region string) ([]LiveFleetWorker, error) {
+	insts, err := client.ListInstances(ctx, region, "running")
+	if err != nil {
+		return nil, fmt.Errorf("list running instances for fleet run %q: %w", runID, err)
+	}
+	out := make([]LiveFleetWorker, 0, len(insts))
+	for _, in := range insts {
+		if in.Tags[fleetWorkerTag] == runID {
+			out = append(out, LiveFleetWorker{EntityID: cohort.EntityID(in.Name), InstanceID: in.InstanceID})
+		}
+	}
+	return out, nil
 }
 
 // DrainFleetWorkers terminates every worker instance belonging to a fleet

@@ -64,6 +64,32 @@ func ShardItems(items []warm.Item, shards int) []Shard {
 	return out
 }
 
+// SubShard carves an arbitrary index subset out of an already-sharded
+// shard's Items (calque#145 slice 3, item-level re-drive "D4a"): a
+// worker-pool claim that completed but reported some permanently-failed
+// item indices (calpool.Summary.Failed, keyed by warm.Item.Index — see
+// DrainBatch) can be resubmitted for JUST those items instead of the
+// dedicated-instance D4 fallback treating the whole shard as failed.
+// Global indices are preserved on every returned Item (unchanged from the
+// original shard), so a caller that reuses the original shard's
+// ResultPrefix gets its results merged for free by CollectShards'
+// existing index-keyed union — no changes needed there. id is the CALLER's
+// choice of a fresh shard identity (e.g. for a distinguishing S3 key); it
+// is NOT derived from the original shard's own ID here.
+func SubShard(id int, items []warm.Item, indices []int) Shard {
+	want := make(map[int]bool, len(indices))
+	for _, idx := range indices {
+		want[idx] = true
+	}
+	sub := make([]warm.Item, 0, len(indices))
+	for _, it := range items {
+		if want[it.Index] {
+			sub = append(sub, it)
+		}
+	}
+	return Shard{ID: id, Items: sub}
+}
+
 // ShardLayout derives a shard's S3 keys under a run base, so every shard writes to
 // a distinct manifest/result/summary/log namespace but shares the artifact prefix.
 // shardKey is a string identifier (calque#110: a string-keyed sibling to the

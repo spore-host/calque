@@ -94,6 +94,84 @@ func TestMergeShardResultsUnionAndMissing(t *testing.T) {
 	}
 }
 
+// TestSubShardKeepsOnlyRequestedIndices (calque#145 slice 3, D4a): a shard
+// with 5 items, asked for a 2-index subset, must return exactly those 2
+// items with their GLOBAL indices preserved — not renumbered to 0..1.
+func TestSubShardKeepsOnlyRequestedIndices(t *testing.T) {
+	sh := SubShard(99, items(5), []int{1, 3})
+	if sh.ID != 99 {
+		t.Errorf("ID = %d, want 99 (caller's fresh identity, not derived)", sh.ID)
+	}
+	if len(sh.Items) != 2 {
+		t.Fatalf("Items = %d, want 2", len(sh.Items))
+	}
+	got := map[int]bool{}
+	for _, it := range sh.Items {
+		got[it.Index] = true
+	}
+	if !got[1] || !got[3] {
+		t.Errorf("Items indices = %v, want {1, 3}", sh.Items)
+	}
+}
+
+// TestSubShardEmptyIndicesYieldsEmptyItems: asking for zero indices is not
+// an error, just an empty sub-shard (a caller should skip submitting it,
+// but SubShard itself doesn't need to know that).
+func TestSubShardEmptyIndicesYieldsEmptyItems(t *testing.T) {
+	sh := SubShard(0, items(5), nil)
+	if len(sh.Items) != 0 {
+		t.Errorf("Items = %v, want empty for zero requested indices", sh.Items)
+	}
+}
+
+// TestSubShardIgnoresIndicesNotInItems: an index not present in the source
+// items (e.g. a stale/mismatched failed-index list) is silently dropped
+// rather than fabricating a phantom item.
+func TestSubShardIgnoresIndicesNotInItems(t *testing.T) {
+	sh := SubShard(0, items(3), []int{1, 42})
+	if len(sh.Items) != 1 || sh.Items[0].Index != 1 {
+		t.Errorf("Items = %v, want only index 1 (42 is not in the source items)", sh.Items)
+	}
+}
+
+// TestMergeShardResults_SecondPassFillsGaps is the concrete proof behind
+// calque#145 slice 3's D4a design: CollectShards/mergeShardResults need
+// ZERO changes to support item-level re-drive, because a redrive writes
+// its result to the SAME ResultPrefix as the original shard — meaning by
+// the time CollectShards' per-shard Collect call lists that prefix, it
+// simply sees the UNION of both landings already. This test proves that
+// union, once complete, reports no missing — feeding mergeShardResults the
+// shard's full expected Items alongside a result set that now includes
+// the previously-dropped index (simulating what Collect would see after
+// a redrive independently PUTs its item to the same prefix).
+func TestMergeShardResults_SecondPassFillsGaps(t *testing.T) {
+	all := items(5)
+	shards := ShardItems(all, 1) // one shard, all 5 items
+	// First pass: index 3 dropped (the D2 claim's partial failure).
+	var firstPass []warm.Result
+	for _, it := range shards[0].Items {
+		if it.Index == 3 {
+			continue
+		}
+		firstPass = append(firstPass, warm.Result{Index: it.Index, Result: it.Index})
+	}
+	_, missingBefore := mergeShardResults(shards, [][]warm.Result{firstPass})
+	if !reflect.DeepEqual(missingBefore, []int{3}) {
+		t.Fatalf("missingBefore = %v, want [3]", missingBefore)
+	}
+
+	// Second pass: the redrive's item lands at the SAME prefix, so a fresh
+	// Collect over that prefix now returns the union of both landings.
+	secondPass := append(append([]warm.Result{}, firstPass...), warm.Result{Index: 3, Result: 3})
+	results, missingAfter := mergeShardResults(shards, [][]warm.Result{secondPass})
+	if len(missingAfter) != 0 {
+		t.Errorf("missingAfter = %v, want none (redrive filled the gap)", missingAfter)
+	}
+	if len(results) != 5 {
+		t.Errorf("results = %d, want 5 (all items accounted for)", len(results))
+	}
+}
+
 // TestShardLayoutDistinctNamespaces: each shard writes to a distinct manifest /
 // result / summary / log key so instances never collide in S3.
 func TestShardLayoutDistinctNamespaces(t *testing.T) {

@@ -152,3 +152,50 @@ func TestDiscoverFleetWorkerIDs_EmptyIsNotNilError(t *testing.T) {
 		t.Errorf("ids = %v, want empty for a run with no tagged workers", ids)
 	}
 }
+
+// TestDiscoverFleetWorkerInstances_ReturnsRealInstanceIDs (calque#145
+// slice 3): the actual gap DiscoverFleetWorkerIDs left open — a fleet-wide
+// liveness check needs real EC2 InstanceIDs (spawn:last-heartbeat is
+// stamped on the instance, not the cohort entity name), which
+// DiscoverFleetWorkerIDs discards. seedFleet already stores instanceID
+// keyed by name; this proves DiscoverFleetWorkerInstances surfaces it.
+func TestDiscoverFleetWorkerInstances_ReturnsRealInstanceIDs(t *testing.T) {
+	launch := newFakeLaunchAPI()
+	launch.seedFleet("calque-fleet-run-abc-worker-0", "i-1", "run-abc")
+	launch.seedFleet("calque-fleet-run-abc-worker-1", "i-2", "run-abc")
+	launch.seedFleet("calque-fleet-run-xyz-worker-0", "i-3", "run-xyz") // different run
+
+	workers, err := DiscoverFleetWorkerInstances(context.Background(), launch, "run-abc", "us-east-1")
+	if err != nil {
+		t.Fatalf("DiscoverFleetWorkerInstances: %v", err)
+	}
+	if len(workers) != 2 {
+		t.Fatalf("workers = %+v, want 2 (only run-abc's)", workers)
+	}
+	gotIDs := map[string]bool{}
+	for _, w := range workers {
+		gotIDs[w.InstanceID] = true
+		if w.EntityID == "" {
+			t.Errorf("worker %+v has empty EntityID", w)
+		}
+	}
+	if !gotIDs["i-1"] || !gotIDs["i-2"] {
+		t.Errorf("gotIDs = %v, want {i-1, i-2}", gotIDs)
+	}
+	if gotIDs["i-3"] {
+		t.Error("DiscoverFleetWorkerInstances leaked a different run's instance ID")
+	}
+}
+
+// TestDiscoverFleetWorkerInstances_EmptyIsNotAnError mirrors
+// TestDiscoverFleetWorkerIDs_EmptyIsNotNilError for the instance-ID variant.
+func TestDiscoverFleetWorkerInstances_EmptyIsNotAnError(t *testing.T) {
+	launch := newFakeLaunchAPI()
+	workers, err := DiscoverFleetWorkerInstances(context.Background(), launch, "run-empty", "us-east-1")
+	if err != nil {
+		t.Fatalf("DiscoverFleetWorkerInstances: %v", err)
+	}
+	if len(workers) != 0 {
+		t.Errorf("workers = %v, want empty for a run with no tagged workers", workers)
+	}
+}
