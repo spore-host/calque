@@ -513,33 +513,111 @@ def _free_refs(node: ast.FunctionDef, module_names: frozenset[str]) -> list[str]
     return sorted(n for n in finder.free if n in module_names)
 
 
-def _module_bindings(tree: ast.Module) -> tuple[dict[str, ast.AST], dict[str, ast.Assign]]:
-    """Top-level-only scan (tree.body, NOT ast.walk) for calque#139's two
-    shippable free-reference targets: every module-level `def`/`async def`
-    (decorated or not — a bare helper like `_format` is never decorated) and
-    every module-level SIMPLE assignment (`NAME = <expr>`, single ast.Name
-    target only — `A = B = 5` and tuple-unpacking assigns are deliberately
-    excluded, matching the issue's "simple Assign target" scope). Scanning
-    only tree.body (not the whole tree) is what makes this "module-level":
-    the same node types nested inside a function/class body are a different
+def _free_refs_in_class(node: ast.ClassDef, module_names: frozenset[str]) -> list[str]:
+    """_free_refs' sibling for a PLAIN (non-`@app.cls`) module-level class
+    body (calque#147) — mirrors _free_refs' shape exactly, but seeded with
+    the class's OWN body as top_body (no params: a class has no argument
+    list of its own the way a function does) instead of a function's args.
+    Each method inside still gets its OWN pushed scope via
+    _FreeRefFinder.visit_FunctionDef (params + hoisted locals), so a bare
+    module-level reference inside `__init__`/any method is still found
+    correctly — this only differs from _free_refs in what seeds the
+    OUTERMOST scope."""
+    finder = _FreeRefFinder(set(), node.body)
+    for stmt in node.body:
+        finder.visit(stmt)
+    return sorted(n for n in finder.free if n in module_names)
+
+
+def _free_refs_in_expr(node: ast.expr, module_names: frozenset[str]) -> list[str]:
+    """_free_refs' sibling for a bare EXPRESSION rather than a function body
+    (calque#146.2) — a module-level constant's own RHS (e.g. `forecast_volume
+    = modal.Volume.from_name(...)`) can itself reference an import or another
+    constant, but has no function scope of its own to seed _FreeRefFinder
+    with (no params, no hoisted locals). Empty top scope: every Name Load in
+    the expression is automatically "free" unless it's a comprehension's own
+    loop var (_FreeRefFinder already handles that shadowing regardless of
+    what seeded the top scope)."""
+    finder = _FreeRefFinder(set(), [])
+    finder.visit(node)
+    return sorted(n for n in finder.free if n in module_names)
+
+
+_CLASS_DECO_SUFFIXES = ("cls",)  # matches Collector.visit_ClassDef's own "endswith('cls')" test
+
+
+def _is_app_cls(node: ast.ClassDef) -> bool:
+    """Mirrors Collector.visit_ClassDef's own decorator test exactly (module-
+    scope helper so _module_bindings doesn't need a Collector instance) — a
+    class decorated `@app.cls`/`@modal.cls` is Modal's own execution unit,
+    already modeled structurally elsewhere; only a PLAIN, undecorated helper
+    class (never `@app.cls`) is a calque#147 shipping candidate."""
+    return any(_decorator_name(d).endswith(_CLASS_DECO_SUFFIXES) for d in node.decorator_list)
+
+
+def _module_bindings(
+    tree: ast.Module,
+) -> tuple[dict[str, ast.AST], dict[str, ast.Assign], dict[str, ast.stmt], dict[str, ast.ClassDef]]:
+    """Top-level-only scan (tree.body, NOT ast.walk) for calque#139/#146/
+    #147's FOUR shippable free-reference targets: every module-level `def`/
+    `async def` (decorated or not — a bare helper like `_format` is never
+    decorated), every module-level SIMPLE assignment (`NAME = <expr>`,
+    single ast.Name target only — `A = B = 5` and tuple-unpacking assigns
+    are deliberately excluded, matching the issue's "simple Assign target"
+    scope), every module-level `import X` / `from X import Y` statement
+    (calque#146 — a bare, non-`.local()` reference to an imported name, e.g.
+    `Path(...)` after `from pathlib import Path`, was previously a hard
+    NameError: unlike a re-exported name from ANOTHER module (deliberately
+    still unresolved — genuinely ambiguous without executing that module),
+    a name this script imports itself is unambiguous and shippable the same
+    way a module-level constant already is), and every PLAIN (non-`@app.cls`)
+    module-level class (calque#147 — an ordinary helper class like a log-tee
+    context manager, never Modal's own `@app.cls` execution unit, which is
+    already modeled structurally by Collector and must NOT be double-
+    collected here). `imports` maps EACH bound name from a statement to that
+    SAME statement node — `from datetime import UTC, datetime` binds two
+    names, both pointing at the one import statement, so shipping resolves
+    per-name but the source text is identical either way. Scanning only
+    tree.body (not the whole tree) is what makes this "module-level": the
+    same node types nested inside a function/class body are a different
     binding entirely and must not be captured here."""
     funcs: dict[str, ast.AST] = {}
     consts: dict[str, ast.Assign] = {}
+    imports: dict[str, ast.stmt] = {}
+    classes: dict[str, ast.ClassDef] = {}
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs[stmt.name] = stmt
         elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
             consts[stmt.targets[0].id] = stmt
-    return funcs, consts
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                imports[(alias.asname or alias.name).split(".")[0]] = stmt
+        elif isinstance(stmt, ast.ImportFrom):
+            # `from __future__ import annotations` etc. bind names too, but
+            # re-execing a __future__ import at runtime (outside module
+            # scope) raises SyntaxError — excluded, matching CPython's own
+            # restriction that __future__ imports must be the first
+            # statement in a module.
+            if stmt.module == "__future__":
+                continue
+            for alias in stmt.names:
+                imports[alias.asname or alias.name] = stmt
+        elif isinstance(stmt, ast.ClassDef) and not _is_app_cls(stmt):
+            classes[stmt.name] = stmt
+    return funcs, consts, imports, classes
 
 
-def _assign_source(src: str, node: ast.Assign) -> str:
-    """Verbatim source text of a top-level `NAME = <expr>` assignment
-    statement (calque#139) — analogous to _body_source but for a whole
-    statement rather than a function body. Ships a module-level CONSTANT's
-    exact source line(s) so the runner can exec it into globals unchanged;
-    same "ship the payload verbatim, never interpret it" trust model this
-    file already applies to every @enter/@method body."""
+def _stmt_source(src: str, node: ast.stmt) -> str:
+    """Verbatim source text of a whole top-level statement (calque#139's
+    `NAME = <expr>` assignments, calque#146's `import X`/`from X import Y`
+    statements) — analogous to _body_source but for a statement rather than
+    a function body. Ships the exact source line(s) so the runner can exec
+    it into globals unchanged; same "ship the payload verbatim, never
+    interpret it" trust model this file already applies to every
+    @enter/@method body. Named generically (not `_assign_source`) since
+    calque#146 reuses this for import statements too — the slicing logic is
+    identical regardless of statement kind."""
     lines = src.splitlines()[node.lineno - 1 : node.end_lineno]
     return "\n".join(lines)
 
@@ -985,12 +1063,42 @@ def analyze(path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         src = f.read()
     tree = ast.parse(src, filename=path)
-    # calque#139: module-level def/simple-assign names, computed ONCE up front
-    # so every function/method's _free_refs walk (inside Collector, via
-    # _describe_fn) resolves against the same universe.
-    module_func_nodes, module_const_nodes = _module_bindings(tree)
-    module_names = frozenset(module_func_nodes) | frozenset(module_const_nodes)
-    module_consts = {name: _assign_source(src, node) for name, node in module_const_nodes.items()}
+    # calque#139/#146: module-level def/simple-assign/import names, computed
+    # ONCE up front so every function/method's _free_refs walk (inside
+    # Collector, via _describe_fn) resolves against the same universe.
+    module_func_nodes, module_const_nodes, module_import_nodes, module_class_nodes = _module_bindings(tree)
+    module_names = (
+        frozenset(module_func_nodes)
+        | frozenset(module_const_nodes)
+        | frozenset(module_import_nodes)
+        | frozenset(module_class_nodes)
+    )
+    # calque#146.2: a module-level constant's OWN RHS can itself reference an
+    # import or another constant (e.g. `forecast_volume =
+    # modal.Volume.from_name(...)` needs `import modal` too) — module_consts
+    # now carries free_refs alongside source, mirroring module_funcs' own
+    # shape, so collectLocalExtras' transitive walk (cmd/calque/run.go) can
+    # enqueue THROUGH a shipped constant, not just stop at it. Before this,
+    # a constant that itself needed an import was shipped with no way to
+    # discover that dependency, so the import never got enqueued and the
+    # runner NameError'd on the constant's own exec.
+    module_consts = {
+        name: {
+            "source": _stmt_source(src, node),
+            "free_refs": _free_refs_in_expr(node.value, module_names),
+        }
+        for name, node in module_const_nodes.items()
+    }
+    # calque#146: verbatim source of every module-level import statement
+    # (import X / from X import Y), keyed by EACH bound name — a bare,
+    # non-.local() reference to an imported name (e.g. `Path(...)` after
+    # `from pathlib import Path`) was previously an unconditional NameError
+    # on execution, even though the script parsed fine; unlike a genuinely
+    # re-exported name from ANOTHER module (still deliberately unresolved —
+    # ambiguous without executing that module), a name THIS script imports
+    # itself is unambiguous and shippable the same way a module-level
+    # constant already is.
+    module_imports = {name: _stmt_source(src, node) for name, node in module_import_nodes.items()}
     # module_funcs: EVERY module-level function, decorated or not — crucially
     # INCLUDING a plain, undecorated helper like `_format` that never becomes
     # an @app.function and so never lands in c.functions below. This is the
@@ -1007,6 +1115,21 @@ def analyze(path: str) -> dict[str, Any]:
         }
         for name, node in module_func_nodes.items()
     }
+    # calque#147: verbatim source of every PLAIN (non-@app.cls) module-level
+    # class, keyed by name — the FOURTH shippable free-reference target. A
+    # bare reference like `_LogTee(sys.stdout, log_buffer)` inside a picked
+    # unit's body was previously an unconditional NameError, the same shape
+    # calque#139/#146 already fixed for functions/constants/imports. Ships
+    # the class's WHOLE verbatim body (methods included) via _stmt_source,
+    # which already handles a multi-line statement's source-line slicing
+    # correctly regardless of statement kind.
+    module_classes = {
+        name: {
+            "source": _stmt_source(src, node),
+            "free_refs": _free_refs_in_class(node, module_names),
+        }
+        for name, node in module_class_nodes.items()
+    }
 
     c = Collector(src, module_names)
     c.visit(tree)
@@ -1022,9 +1145,10 @@ def analyze(path: str) -> dict[str, Any]:
         "invoke_calls": c.invoke_calls,
         "volume_writes": c.volume_writes,
         "helper_leaks": c.leaks,
-        # calque#139: verbatim source of every module-level `NAME = <literal-
-        # or-expression>` assignment, keyed by name — one of the two shippable
-        # free-reference targets (see module_funcs for the other).
+        # calque#139/#146.2: verbatim source (+ the constant's OWN free_refs,
+        # calque#146.2) of every module-level `NAME = <literal-or-expression>`
+        # assignment, keyed by name — one of the three shippable free-
+        # reference targets (see module_funcs/module_imports for the others).
         "module_consts": module_consts,
         # calque#139: every module-level function (decorated or not), keyed by
         # name — the OTHER shippable free-reference target. A plain,
@@ -1032,6 +1156,14 @@ def analyze(path: str) -> dict[str, Any]:
         # `functions` above) is exactly the shape the issue's `_format`
         # repro needs resolved.
         "module_funcs": module_funcs,
+        # calque#146: verbatim source of every module-level import statement,
+        # keyed by each name it binds — the THIRD shippable free-reference
+        # target (see module_consts/module_funcs for the others).
+        "module_imports": module_imports,
+        # calque#147: verbatim source (+ free_refs) of every PLAIN (non-
+        # @app.cls) module-level class — the FOURTH shippable free-reference
+        # target.
+        "module_classes": module_classes,
     }
 
 

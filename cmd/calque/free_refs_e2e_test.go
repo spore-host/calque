@@ -53,7 +53,7 @@ func TestFreeRefsEndToEndDryRun(t *testing.T) {
 		t.Fatalf("selected unit = %+v, want the .map()'d greet", unit.method)
 	}
 
-	extras, consts := collectLocalExtras(app, unit, rep)
+	extras, consts, _, _ := collectLocalExtras(app, unit, rep)
 	if len(extras) != 1 || extras[0].Name != "_format" {
 		t.Fatalf("extras = %+v, want exactly [_format] (the plain, undecorated helper greet() bare-calls)", extras)
 	}

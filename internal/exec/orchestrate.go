@@ -30,10 +30,17 @@ type Manifest struct {
 	// does locally. Omitted (zero value) reproduces every pre-#79 manifest
 	// byte-for-byte, since none of calque real/ramp/fleetrun ever set them
 	// before this change.
-	MethodArgs   []string          `json:"method_args,omitempty"`
-	Starmap      bool              `json:"starmap,omitempty"`
-	Extras       []warm.ExtraFunc  `json:"extras,omitempty"`
-	ExtraConsts  []warm.ExtraConst `json:"extra_consts,omitempty"`
+	MethodArgs  []string          `json:"method_args,omitempty"`
+	Starmap     bool              `json:"starmap,omitempty"`
+	Extras      []warm.ExtraFunc  `json:"extras,omitempty"`
+	ExtraConsts []warm.ExtraConst `json:"extra_consts,omitempty"`
+	// ExtraImports mirrors warm.Config's field of the same name (calque#146)
+	// — module-level import statements a picked unit's body bare-references.
+	ExtraImports []warm.ExtraImport `json:"extra_imports,omitempty"`
+	// ExtraClasses mirrors warm.Config's field of the same name (calque#147)
+	// — plain (non-@app.cls) module-level classes a picked unit's body
+	// bare-instantiates.
+	ExtraClasses []warm.ExtraClass `json:"extra_classes,omitempty"`
 	Items        []warm.Item       `json:"items"`
 	Bucket       string            `json:"bucket"`
 	ResultPrefix string            `json:"result_prefix"`
@@ -126,13 +133,15 @@ func WriteManifestFull(ctx context.Context, c *s3.Client, l RunLayout, enterBody
 // WriteManifest's EnterBody/MethodBody/MethodArg-only signature, which
 // predates calque#93/#139 and has no way to carry them.
 type ManifestBody struct {
-	EnterBody   string
-	MethodBody  string
-	MethodArg   string
-	MethodArgs  []string         // calque#93: full .starmap() positional arg list
-	Starmap     bool             // calque#93: splat MethodArgs instead of binding MethodArg alone
-	Extras      []warm.ExtraFunc // calque#92/#139: sibling functions the body references
-	ExtraConsts []warm.ExtraConst
+	EnterBody    string
+	MethodBody   string
+	MethodArg    string
+	MethodArgs   []string         // calque#93: full .starmap() positional arg list
+	Starmap      bool             // calque#93: splat MethodArgs instead of binding MethodArg alone
+	Extras       []warm.ExtraFunc // calque#92/#139: sibling functions the body references
+	ExtraConsts  []warm.ExtraConst
+	ExtraImports []warm.ExtraImport // calque#146: module-level imports the body bare-references
+	ExtraClasses []warm.ExtraClass  // calque#147: plain module-level classes the body bare-instantiates
 }
 
 // WriteManifestBody is WriteManifestFull with a full ManifestBody instead of
@@ -146,6 +155,7 @@ func writeManifest(ctx context.Context, c *s3.Client, l RunLayout, body Manifest
 	man := Manifest{
 		EnterBody: body.EnterBody, MethodBody: body.MethodBody, MethodArg: body.MethodArg,
 		MethodArgs: body.MethodArgs, Starmap: body.Starmap, Extras: body.Extras, ExtraConsts: body.ExtraConsts,
+		ExtraImports: body.ExtraImports, ExtraClasses: body.ExtraClasses,
 		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: "python3", RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
 		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency, BatchSize: l.BatchSize,

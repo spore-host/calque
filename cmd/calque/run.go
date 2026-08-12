@@ -363,24 +363,28 @@ func syntheticClass(f ir.Function) ir.Class {
 // previously shipped only the picked unit's own body, guaranteeing a
 // NameError either way.
 //
-// Three resolution targets are tried per queued name, in order: a plain
+// Five resolution targets are tried per queued name, in order: a plain
 // @app.function (app.FindFunction — the pre-existing calque#92 path, still
 // how a .local()-suffixed call resolves, since .local() only exists on a
 // Modal-SDK-wrapped, i.e. decorated, callable), a plain module-level
 // function that was NEVER decorated at all (app.ModuleFuncs — calque#139's
-// new target, e.g. a bare `_format` helper), and a module-level constant
+// new target, e.g. a bare `_format` helper), a module-level constant
 // (app.ModuleConsts — calque#139's other new target, e.g. `GREETING =
-// "hello"`). A name that resolves to a @cls METHOD is deliberately left
-// unsupported (leaked, not shipped): that method would need its own warm
-// @enter state, a materially bigger feature this pass doesn't attempt (see
-// calque#92's own "approach 1 is more robust... revisit if a real adopter
-// needs it" framing).
+// "hello"`), a module-level import (app.ModuleImports — calque#146's new
+// target, e.g. `Path` after `from pathlib import Path`, or `modal` after
+// `import modal`), and a PLAIN (non-@app.cls) module-level class
+// (app.ModuleClasses — calque#147's new target, e.g. `_LogTee` after
+// `class _LogTee: ...`). A name that resolves to a @cls METHOD is
+// deliberately left unsupported (leaked, not shipped): that method would
+// need its own warm @enter state, a materially bigger feature this pass
+// doesn't attempt (see calque#92's own "approach 1 is more robust...
+// revisit if a real adopter needs it" framing).
 //
 // visited is checked (and set) BEFORE enqueueing a name, not just before
 // shipping — this is what bounds a self-referential (f calling f.local(...)
 // or f referencing itself) or cyclic (a->b->a) chain to one visit per name
 // rather than looping forever.
-func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) ([]warm.ExtraFunc, []warm.ExtraConst) {
+func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) ([]warm.ExtraFunc, []warm.ExtraConst, []warm.ExtraImport, []warm.ExtraClass) {
 	visited := map[string]bool{}
 	var queue []string
 	enqueue := func(names []string) {
@@ -398,6 +402,8 @@ func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) ([]warm.Ext
 
 	var extras []warm.ExtraFunc
 	var consts []warm.ExtraConst
+	var imports []warm.ExtraImport
+	var classes []warm.ExtraClass
 	for len(queue) > 0 {
 		name := queue[0]
 		queue = queue[1:]
@@ -413,8 +419,25 @@ func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) ([]warm.Ext
 			enqueue(mf.FreeRefs)
 			continue
 		}
-		if src, ok := app.ModuleConsts[name]; ok {
-			consts = append(consts, warm.ExtraConst{Name: name, Source: src})
+		if mc, ok := app.ModuleConsts[name]; ok {
+			consts = append(consts, warm.ExtraConst{Name: name, Source: mc.Source})
+			// calque#146.2: a constant's OWN RHS can itself reference an
+			// import or another constant (e.g. `forecast_volume =
+			// modal.Volume.from_name(...)` needs `import modal` too) —
+			// enqueue through it, not just stop at it.
+			enqueue(mc.FreeRefs)
+			continue
+		}
+		if src, ok := app.ModuleImports[name]; ok {
+			imports = append(imports, warm.ExtraImport{Name: name, Source: src})
+			continue
+		}
+		if mcls, ok := app.ModuleClasses[name]; ok {
+			classes = append(classes, warm.ExtraClass{Name: name, Source: mcls.Source})
+			// calque#147: a class's own body (methods, class-level attrs)
+			// can itself reference an import or another module-level name —
+			// enqueue through it, mirroring ModuleConsts' own transitivity.
+			enqueue(mcls.FreeRefs)
 			continue
 		}
 		if resolvesToClassMethod(app, name) {
@@ -422,7 +445,7 @@ func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) ([]warm.Ext
 				"%s: resolves to a @cls method — not shipped (no warm @enter state outside the picked unit); will NameError", name)
 		}
 	}
-	return extras, consts
+	return extras, consts, imports, classes
 }
 
 // resolvesToClassMethod reports whether name matches any @cls method across
@@ -553,7 +576,7 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 	// helper/constant read (confirmed blocking on AI-Almanac's
 	// blending_app.py, calque#79, and on 3 of 7 real-world corpus scripts,
 	// calque#139).
-	extras, extraConsts := collectLocalExtras(app, unit, rep)
+	extras, extraConsts, extraImports, extraClasses := collectLocalExtras(app, unit, rep)
 	if len(extras) > 0 {
 		names := make([]string, len(extras))
 		for i, e := range extras {
@@ -570,6 +593,22 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
 			"shipped %d module-level constant(s) referenced via a bare name (calque#139): %s", len(extraConsts), strings.Join(names, ", "))
 	}
+	if len(extraImports) > 0 {
+		names := make([]string, len(extraImports))
+		for i, e := range extraImports {
+			names[i] = e.Name
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"shipped %d module-level import(s) referenced via a bare name (calque#146): %s", len(extraImports), strings.Join(names, ", "))
+	}
+	if len(extraClasses) > 0 {
+		names := make([]string, len(extraClasses))
+		for i, e := range extraClasses {
+			names[i] = e.Name
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"shipped %d module-level class(es) referenced via a bare name (calque#147): %s", len(extraClasses), strings.Join(names, ", "))
+	}
 
 	sink := warm.NewMemSink()
 	sup := &warm.Supervisor{
@@ -579,8 +618,10 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 		Leak:   leakAdapter{rep},
 		Config: warm.Config{
 			EnterBody: enterBody, MethodBody: methodBody, MethodArg: arg, Extras: extras,
-			ExtraConsts: extraConsts,
-			MethodArgs:  methodArgs, Starmap: isStarmap,
+			ExtraConsts:  extraConsts,
+			ExtraImports: extraImports,
+			ExtraClasses: extraClasses,
+			MethodArgs:   methodArgs, Starmap: isStarmap,
 		},
 		// B3: retries= (portable config) caps the warm supervisor's crash re-drive.
 		// 0 leaves warmd's sane default.

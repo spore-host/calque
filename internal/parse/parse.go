@@ -34,19 +34,35 @@ type pyOut struct {
 	InvokeCalls  []pyInvokeCall      `json:"invoke_calls"`
 	VolumeWrites []pyVolumeWrite     `json:"volume_writes"`
 	HelperLeaks  []map[string]any    `json:"helper_leaks"`
-	// ModuleConsts is the verbatim source of every module-level `NAME = <literal-
-	// or-expression>` assignment, keyed by name (calque#139) — the shippable
-	// half of free-variable resolution besides Functions itself (a FreeRefs
-	// name may resolve to either this map or a plain @app.function in
-	// Functions; collectLocalExtras tries both, same as it already does for
-	// LocalCalls' @cls-method-vs-plain-function distinction).
-	ModuleConsts map[string]string `json:"module_consts"`
+	// ModuleConsts is every module-level `NAME = <literal-or-expression>`
+	// assignment, keyed by name (calque#139) — the shippable half of
+	// free-variable resolution besides Functions itself (a FreeRefs name may
+	// resolve to either this map or a plain @app.function in Functions;
+	// collectLocalExtras tries both, same as it already does for LocalCalls'
+	// @cls-method-vs-plain-function distinction). Each entry also carries its
+	// OWN free_refs (calque#146.2): a constant's RHS can itself reference an
+	// import or another constant (e.g. `forecast_volume =
+	// modal.Volume.from_name(...)` needs `import modal` shipped too) —
+	// without this, collectLocalExtras' transitive walk stops AT a shipped
+	// constant instead of continuing THROUGH it.
+	ModuleConsts map[string]pyModuleConst `json:"module_consts"`
 	// ModuleFuncs is EVERY module-level function (calque#139), decorated or
 	// not — crucially including a plain, undecorated helper that never
 	// becomes an @app.function and so never appears in Functions above. The
 	// OTHER shippable free-reference target besides ModuleConsts.
 	ModuleFuncs map[string]pyModuleFunc `json:"module_funcs"`
-	Error       string                  `json:"error"`
+	// ModuleImports is the verbatim source of every module-level `import X`
+	// / `from X import Y` statement, keyed by each name it binds (calque#146)
+	// — the THIRD shippable free-reference target, alongside ModuleConsts/
+	// ModuleFuncs. A re-exported name from ANOTHER module stays unresolved
+	// (a leak, not shipped) — this only covers an import THIS script does
+	// itself, which is unambiguous.
+	ModuleImports map[string]string `json:"module_imports"`
+	// ModuleClasses is every PLAIN (non-`@app.cls`) module-level class,
+	// keyed by name (calque#147) — the FOURTH shippable free-reference
+	// target, alongside ModuleConsts/ModuleFuncs/ModuleImports.
+	ModuleClasses map[string]pyModuleConst `json:"module_classes"`
+	Error         string                   `json:"error"`
 }
 
 // pyModuleFunc is one module-level function's shippable shape (calque#139):
@@ -57,6 +73,14 @@ type pyModuleFunc struct {
 	Body       string   `json:"body"`
 	LocalCalls []string `json:"local_calls"`
 	FreeRefs   []string `json:"free_refs"`
+}
+
+// pyModuleConst is one module-level constant's shippable shape (calque#146.2):
+// its verbatim source plus its OWN free_refs — a constant's RHS can itself
+// reference an import or another constant.
+type pyModuleConst struct {
+	Source   string   `json:"source"`
+	FreeRefs []string `json:"free_refs"`
 }
 
 // pyVolumeWrite is a volume.commit()/reload() call site (§E). Target is the var the
@@ -269,7 +293,10 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	// resolution targets collectLocalExtras (cmd/calque/run.go) consults for
 	// each callable's FreeRefs/EnterFreeRefs alongside FindFunction.
 	if len(out.ModuleConsts) > 0 {
-		app.ModuleConsts = out.ModuleConsts
+		app.ModuleConsts = make(map[string]ir.ModuleConst, len(out.ModuleConsts))
+		for name, mc := range out.ModuleConsts {
+			app.ModuleConsts[name] = ir.ModuleConst{Source: mc.Source, FreeRefs: mc.FreeRefs}
+		}
 	}
 	if len(out.ModuleFuncs) > 0 {
 		app.ModuleFuncs = make(map[string]ir.ModuleFunc, len(out.ModuleFuncs))
@@ -284,6 +311,19 @@ func build(out pyOut, rep *leak.Report) ir.App {
 				LocalCalls: localCalls,
 				FreeRefs:   mf.FreeRefs,
 			}
+		}
+	}
+	// calque#146: module-level imports — the THIRD resolution target
+	// collectLocalExtras consults, alongside ModuleConsts/ModuleFuncs.
+	if len(out.ModuleImports) > 0 {
+		app.ModuleImports = out.ModuleImports
+	}
+	// calque#147: plain (non-@app.cls) module-level classes — the FOURTH
+	// resolution target.
+	if len(out.ModuleClasses) > 0 {
+		app.ModuleClasses = make(map[string]ir.ModuleClass, len(out.ModuleClasses))
+		for name, mc := range out.ModuleClasses {
+			app.ModuleClasses[name] = ir.ModuleClass{Source: mc.Source, FreeRefs: mc.FreeRefs}
 		}
 	}
 

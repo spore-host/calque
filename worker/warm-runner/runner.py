@@ -67,6 +67,8 @@ class Runner:
         method_args: list[str] | None = None,
         starmap: bool = False,
         extra_consts: list[dict] | None = None,
+        extra_imports: list[dict] | None = None,
+        extra_classes: list[dict] | None = None,
     ) -> None:
         self.enter_body = enter_body
         self.method_body = method_body
@@ -87,6 +89,19 @@ class Runner:
         # Distinct from extras (functions): each entry is exec'd verbatim as
         # its own assignment statement, not compiled as a callable.
         self.extra_consts = extra_consts or []
+        # extra_imports (calque#146): module-level `import X`/`from X import
+        # Y` statements a bare (non-.local()) free-name reference resolved
+        # to, e.g. `Path(...)` inside @enter with `from pathlib import Path`
+        # a plain module-level import. Same verbatim-exec shape as
+        # extra_consts, compiled FIRST (see enter()) since a constant's own
+        # RHS or a sibling function's body could reference an imported name.
+        self.extra_imports = extra_imports or []
+        # extra_classes (calque#147): PLAIN (non-@app.cls) module-level
+        # classes a bare instantiation resolved to, e.g. `_LogTee(sys.stdout,
+        # log_buffer)`. Same verbatim-exec shape as extra_consts — a `class
+        # X: ...` statement execs into self.globals exactly like an
+        # assignment does.
+        self.extra_classes = extra_classes or []
         self.entered = False
         # The warm namespace: a stand-in for the @cls instance `self`. Bodies see
         # it as `self`; whatever @enter assigns (self.llm = ...) lives here and is
@@ -103,12 +118,17 @@ class Runner:
             # refuse rather than silently reload (which would destroy the economics).
             raise RuntimeError("enter called twice; model would reload (see spec §6)")
         t0 = time.perf_counter()
-        # Extras/extra_consts go into self.globals FIRST — before @enter itself
-        # runs — so an @enter body that .local()-calls a sibling (calque#92) or
-        # bare-references a sibling helper/constant (calque#139) can resolve it
-        # too, not just @method.
+        # Extras/extra_consts/extra_imports/extra_classes go into
+        # self.globals FIRST — before @enter itself runs — so an @enter body
+        # that .local()-calls a sibling (calque#92) or bare-references a
+        # sibling helper/constant/import/class (calque#139/#146/#147) can
+        # resolve it too, not just @method. Imports compile BEFORE extras/
+        # consts/classes: a constant's or class's own body could reference
+        # an imported name, but not vice versa in any real script.
+        self._compile_extra_imports()
         self._compile_extras()
         self._compile_extra_consts()
+        self._compile_extra_classes()
         self._exec_body(self.enter_body, extra_locals={})
         # Compile the @method body once, AFTER @enter (so any imports @enter added to
         # self.globals are in scope for the method). Reused for every item, incl.
@@ -241,6 +261,44 @@ class Runner:
             code = compile(source, f"<calque-const:{extra.get('name', '?')}>", "exec")
             exec(code, self.globals)
 
+    def _compile_extra_imports(self) -> None:
+        """Exec every bare-referenced module-level IMPORT statement
+        (calque#146) into self.globals, so a verbatim `Path(...)` (or
+        `modal.Volume.from_name(...)`, or any other bare use of an imported
+        name) resolves unmodified instead of NameError-ing. Same shape as
+        _compile_extra_consts — `source` is the ENTIRE original `import X` /
+        `from X import Y` statement, exec'd exactly as it appears at module
+        scope in the original script. Deduplicated by source text (a single
+        `from datetime import UTC, datetime` statement may be shipped twice
+        — once per bound name that was actually referenced — and must only
+        be exec'd once; re-exec'ing an already-imported module is harmless
+        but wasteful, so dedup here rather than relying on that harmlessness).
+        """
+        seen: set[str] = set()
+        for extra in self.extra_imports:
+            source = extra.get("source") or ""
+            if not source or source in seen:
+                continue
+            seen.add(source)
+            code = compile(source, f"<calque-import:{extra.get('name', '?')}>", "exec")
+            exec(code, self.globals)
+
+    def _compile_extra_classes(self) -> None:
+        """Exec every bare-referenced PLAIN (non-@app.cls) module-level
+        CLASS (calque#147) into self.globals, so a verbatim
+        `_LogTee(sys.stdout, log_buffer)` (or any other bare instantiation)
+        resolves unmodified instead of NameError-ing. Same shape as
+        _compile_extra_consts — `source` is the ENTIRE original `class X:
+        ...` statement (methods included), exec'd exactly as it appears at
+        module scope in the original script.
+        """
+        for extra in self.extra_classes:
+            source = extra.get("source") or ""
+            if not source:
+                continue
+            code = compile(source, f"<calque-class:{extra.get('name', '?')}>", "exec")
+            exec(code, self.globals)
+
 
 class _Namespace:
     """A permissive attribute bag standing in for the @cls `self`."""
@@ -361,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
                     method_args=msg.get("method_args") or None,
                     starmap=bool(msg.get("starmap", False)),
                     extra_consts=msg.get("extra_consts") or [],
+                    extra_imports=msg.get("extra_imports") or [],
+                    extra_classes=msg.get("extra_classes") or [],
                 )
                 # concurrency=C>1 => items run in a C-wide thread pool so inference
                 # overlaps (vLLM batches in-flight requests). Absent/1 => the serial

@@ -43,10 +43,17 @@ type Manifest struct {
 	// (calque#79 Part 1) can drive an arbitrary parsed script's picked warm
 	// unit — not just the hardcoded vLLM reference body — the same way
 	// dryRunWarm already does locally.
-	MethodArgs   []string                 `json:"method_args,omitempty"`
-	Starmap      bool                     `json:"starmap,omitempty"`
-	Extras       []warm.ExtraFunc         `json:"extras,omitempty"`
-	ExtraConsts  []warm.ExtraConst        `json:"extra_consts,omitempty"`
+	MethodArgs  []string          `json:"method_args,omitempty"`
+	Starmap     bool              `json:"starmap,omitempty"`
+	Extras      []warm.ExtraFunc  `json:"extras,omitempty"`
+	ExtraConsts []warm.ExtraConst `json:"extra_consts,omitempty"`
+	// ExtraImports mirrors warm.Config's field of the same name (calque#146)
+	// — module-level import statements a picked unit's body bare-references.
+	ExtraImports []warm.ExtraImport `json:"extra_imports,omitempty"`
+	// ExtraClasses mirrors warm.Config's field of the same name (calque#147)
+	// — plain (non-@app.cls) module-level classes a picked unit's body
+	// bare-instantiates.
+	ExtraClasses []warm.ExtraClass        `json:"extra_classes,omitempty"`
 	Items        []warm.Item              `json:"items"`
 	Bucket       string                   `json:"bucket"`
 	ResultPrefix string                   `json:"result_prefix"`
@@ -325,6 +332,7 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 		Config: warm.Config{
 			EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg,
 			MethodArgs: man.MethodArgs, Starmap: man.Starmap, Extras: man.Extras, ExtraConsts: man.ExtraConsts,
+			ExtraImports: man.ExtraImports, ExtraClasses: man.ExtraClasses,
 		},
 		Concurrency: man.Concurrency,
 		BatchSize:   man.BatchSize,

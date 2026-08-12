@@ -22,9 +22,12 @@ func TestCollectLocalExtrasTransitiveClosure(t *testing.T) {
 	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
 	rep := &leak.Report{}
 
-	extras, consts := collectLocalExtras(app, unit, rep)
+	extras, consts, imports, _ := collectLocalExtras(app, unit, rep)
 	if len(consts) != 0 {
 		t.Errorf("consts = %+v, want none", consts)
+	}
+	if len(imports) != 0 {
+		t.Errorf("imports = %+v, want none", imports)
 	}
 	if len(extras) != 2 {
 		t.Fatalf("collectLocalExtras returned %d extras, want 2; got %+v", len(extras), extras)
@@ -54,9 +57,9 @@ func TestCollectLocalExtrasSkipsClassMethodAndLeaksHonestly(t *testing.T) {
 	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
 	rep := &leak.Report{}
 
-	extras, consts := collectLocalExtras(app, unit, rep)
-	if len(extras) != 0 || len(consts) != 0 {
-		t.Errorf("collectLocalExtras shipped extras=%+v consts=%+v, want none (score is a @cls method)", extras, consts)
+	extras, consts, imports, _ := collectLocalExtras(app, unit, rep)
+	if len(extras) != 0 || len(consts) != 0 || len(imports) != 0 {
+		t.Errorf("collectLocalExtras shipped extras=%+v consts=%+v imports=%+v, want none (score is a @cls method)", extras, consts, imports)
 	}
 	found := false
 	for _, l := range rep.Leaks {
@@ -82,7 +85,7 @@ func TestCollectLocalExtrasSelfReferenceTerminates(t *testing.T) {
 
 	done := make(chan []warm.ExtraFunc, 1)
 	go func() {
-		extras, _ := collectLocalExtras(app, unit, rep)
+		extras, _, _, _ := collectLocalExtras(app, unit, rep)
 		done <- extras
 	}()
 	select {
@@ -108,7 +111,7 @@ func TestCollectLocalExtrasCycleTerminates(t *testing.T) {
 
 	done := make(chan []warm.ExtraFunc, 1)
 	go func() {
-		extras, _ := collectLocalExtras(app, unit, rep)
+		extras, _, _, _ := collectLocalExtras(app, unit, rep)
 		done <- extras
 	}()
 	select {
@@ -122,5 +125,102 @@ func TestCollectLocalExtrasCycleTerminates(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("collectLocalExtras did not terminate on an a->b->a cycle")
+	}
+}
+
+// TestCollectLocalExtrasResolvesBareImport (calque#146) is the import
+// counterpart to the existing bare-constant/bare-function tests: a body
+// that bare-references an imported name (e.g. `Path(...)` after `from
+// pathlib import Path`) must resolve to app.ModuleImports and ship as an
+// ExtraImport — previously this whole resolution target didn't exist at
+// all, so it fell through to an unconditional NameError on execution.
+func TestCollectLocalExtrasResolvesBareImport(t *testing.T) {
+	app := ir.App{
+		Functions:     []ir.Function{{Name: "run_blend", Body: "return Path('/tmp')", FreeRefs: []string{"Path"}}},
+		ModuleImports: map[string]string{"Path": "from pathlib import Path"},
+	}
+	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
+	rep := &leak.Report{}
+
+	extras, consts, imports, _ := collectLocalExtras(app, unit, rep)
+	if len(extras) != 0 || len(consts) != 0 {
+		t.Errorf("extras=%+v consts=%+v, want none (Path resolves as an import, not a function/const)", extras, consts)
+	}
+	if len(imports) != 1 || imports[0].Name != "Path" || imports[0].Source != "from pathlib import Path" {
+		t.Fatalf("imports = %+v, want exactly [{Path, \"from pathlib import Path\"}]", imports)
+	}
+}
+
+// TestCollectLocalExtrasImportTransitiveThroughSiblingFunc proves an
+// import reachable only through a SIBLING function's own FreeRefs (not the
+// picked unit's own body) is still resolved — mirroring how
+// TestCollectLocalExtrasTransitiveClosure already proves this for
+// function-to-function chains.
+func TestCollectLocalExtrasImportTransitiveThroughSiblingFunc(t *testing.T) {
+	app := ir.App{
+		Functions: []ir.Function{
+			{Name: "run_blend", Body: "return _load()", LocalCalls: []string{"_load"}},
+			{Name: "_load", Body: "return os.getcwd()", FreeRefs: []string{"os"}},
+		},
+		ModuleImports: map[string]string{"os": "import os"},
+	}
+	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
+	rep := &leak.Report{}
+
+	extras, _, imports, _ := collectLocalExtras(app, unit, rep)
+	if len(extras) != 1 || extras[0].Name != "_load" {
+		t.Fatalf("extras = %+v, want exactly [_load]", extras)
+	}
+	if len(imports) != 1 || imports[0].Name != "os" {
+		t.Fatalf("imports = %+v, want exactly [os] (reached transitively through _load's own FreeRefs)", imports)
+	}
+}
+
+// TestCollectLocalExtrasResolvesBareClass (calque#147) is the class
+// counterpart to TestCollectLocalExtrasResolvesBareImport: a body that
+// bare-instantiates a PLAIN module-level class (e.g. `_LogTee(...)`) must
+// resolve to app.ModuleClasses and ship as an ExtraClass — previously this
+// whole resolution target didn't exist at all, so it fell through to an
+// unconditional NameError on execution.
+func TestCollectLocalExtrasResolvesBareClass(t *testing.T) {
+	app := ir.App{
+		Functions:     []ir.Function{{Name: "run_blend", Body: "return _Adder(1).add(2)", FreeRefs: []string{"_Adder"}}},
+		ModuleClasses: map[string]ir.ModuleClass{"_Adder": {Source: "class _Adder:\n    pass"}},
+	}
+	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
+	rep := &leak.Report{}
+
+	extras, consts, imports, classes := collectLocalExtras(app, unit, rep)
+	if len(extras) != 0 || len(consts) != 0 || len(imports) != 0 {
+		t.Errorf("extras=%+v consts=%+v imports=%+v, want none (_Adder resolves as a class)", extras, consts, imports)
+	}
+	if len(classes) != 1 || classes[0].Name != "_Adder" || classes[0].Source != "class _Adder:\n    pass" {
+		t.Fatalf("classes = %+v, want exactly [{_Adder, \"class _Adder:\\n    pass\"}]", classes)
+	}
+}
+
+// TestCollectLocalExtrasClassTransitiveThroughFreeRefs proves a class's OWN
+// FreeRefs (e.g. a class-level attribute or a method referencing another
+// module-level name) is enqueued through, mirroring ModuleConsts' own
+// transitivity fix (calque#146.2).
+func TestCollectLocalExtrasClassTransitiveThroughFreeRefs(t *testing.T) {
+	app := ir.App{
+		Functions: []ir.Function{
+			{Name: "run_blend", Body: "return _Adder(1).add(2)", FreeRefs: []string{"_Adder"}},
+		},
+		ModuleClasses: map[string]ir.ModuleClass{
+			"_Adder": {Source: "class _Adder:\n    pass", FreeRefs: []string{"os"}},
+		},
+		ModuleImports: map[string]string{"os": "import os"},
+	}
+	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
+	rep := &leak.Report{}
+
+	_, _, imports, classes := collectLocalExtras(app, unit, rep)
+	if len(classes) != 1 || classes[0].Name != "_Adder" {
+		t.Fatalf("classes = %+v, want exactly [_Adder]", classes)
+	}
+	if len(imports) != 1 || imports[0].Name != "os" {
+		t.Fatalf("imports = %+v, want exactly [os] (reached transitively through _Adder's own FreeRefs)", imports)
 	}
 }

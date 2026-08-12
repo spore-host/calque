@@ -283,7 +283,22 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 	wasWarm := w.Supervisor.IsWarm()
 	enterCountBefore := w.Supervisor.EnterCount
 	if !wasWarm {
-		w.Supervisor.Config = warm.Config{EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg}
+		// calque#146: MethodArgs/Starmap/Extras/ExtraConsts/ExtraImports were
+		// silently dropped here — only EnterBody/MethodBody/MethodArg made it
+		// into Config, so any `warmd fleet` claim whose script used
+		// .starmap(), sibling functions/constants, or a bare module-level
+		// import would either mis-bind (starmap unpacked into the wrong
+		// single arg) or NameError, even though the SAME manifest ran fine
+		// through the single-instance runOnInstance path (cmd/warmd/main.go),
+		// which already copies every one of these fields. Fleet mode's whole
+		// point (calque#145) is running a real script's OWN parsed unit
+		// through a worker pool — this gap meant that only worked for the
+		// narrowest (@enter/@method-only, no siblings/imports) shape.
+		w.Supervisor.Config = warm.Config{
+			EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg,
+			MethodArgs: man.MethodArgs, Starmap: man.Starmap, Extras: man.Extras,
+			ExtraConsts: man.ExtraConsts, ExtraImports: man.ExtraImports, ExtraClasses: man.ExtraClasses,
+		}
 	}
 	w.Supervisor.Sink = w.Results.Sink(man)
 

@@ -69,7 +69,7 @@ func manifestBodyForUnit(app ir.App, unit warmUnit, rep *leak.Report) (calexec.M
 	}
 	isStarmap := unit.method.Invoke == ir.InvokeStarmap
 	methodArgs := nonSelfArgs(unit.method.Args)
-	extras, extraConsts := collectLocalExtras(app, unit, rep)
+	extras, extraConsts, extraImports, extraClasses := collectLocalExtras(app, unit, rep)
 	if len(extras) > 0 {
 		names := make([]string, len(extras))
 		for i, e := range extras {
@@ -86,9 +86,26 @@ func manifestBodyForUnit(app ir.App, unit warmUnit, rep *leak.Report) (calexec.M
 		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
 			"shipped %d module-level constant(s) referenced via a bare name (calque#139): %s", len(extraConsts), strings.Join(names, ", "))
 	}
+	if len(extraImports) > 0 {
+		names := make([]string, len(extraImports))
+		for i, e := range extraImports {
+			names[i] = e.Name
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"shipped %d module-level import(s) referenced via a bare name (calque#146): %s", len(extraImports), strings.Join(names, ", "))
+	}
+	if len(extraClasses) > 0 {
+		names := make([]string, len(extraClasses))
+		for i, e := range extraClasses {
+			names[i] = e.Name
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"shipped %d module-level class(es) referenced via a bare name (calque#147): %s", len(extraClasses), strings.Join(names, ", "))
+	}
 	return calexec.ManifestBody{
 		EnterBody: unit.class.EnterBody, MethodBody: unit.method.Body, MethodArg: arg,
 		MethodArgs: methodArgs, Starmap: isStarmap, Extras: extras, ExtraConsts: extraConsts,
+		ExtraImports: extraImports, ExtraClasses: extraClasses,
 	}, true
 }
 

@@ -374,6 +374,70 @@ func TestWorker_StaysWarmAcrossClaims(t *testing.T) {
 	}
 }
 
+// TestWorker_ManifestExtrasStarmapImportsSurviveIntoConfig (calque#146/#147)
+// is the regression test for a real bug found while implementing calque#146:
+// runOne's `w.Supervisor.Config = warm.Config{EnterBody, MethodBody,
+// MethodArg}` silently dropped MethodArgs/Starmap/Extras/ExtraConsts/
+// ExtraImports/ExtraClasses — meaning `warmd fleet` (calque#145's whole
+// worker-pool mechanism) would either mis-bind a .starmap()'d unit's args
+// or NameError on any sibling function/constant/import/class a real
+// script's picked unit bare-references, even though the SAME manifest ran
+// fine through the single-instance runOnInstance path (cmd/warmd/main.go).
+// This claim's EnterBody bare-references an imported name (`Path`) via
+// ExtraImports AND a plain module-level class via ExtraClasses — proving
+// both fixes, not just that the struct fields compile.
+func TestWorker_ManifestExtrasStarmapImportsSurviveIntoConfig(t *testing.T) {
+	q := newFakeQueue()
+	fetcher := &fakeFetcher{}
+	results := &fakeResults{}
+	sup := &warm.Supervisor{Python: python(t), Script: runnerScript(t)}
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+
+	man := calexec.Manifest{
+		EnterBody:    `self.base = _Wrap(Path("/tmp"))`,
+		MethodBody:   "return str(self.base.value / payload)",
+		MethodArg:    "payload",
+		ExtraImports: []warm.ExtraImport{{Name: "Path", Source: "from pathlib import Path"}},
+		ExtraClasses: []warm.ExtraClass{{Name: "_Wrap", Source: "class _Wrap:\n    def __init__(self, value):\n        self.value = value"}},
+	}
+	man.Items = items("world")
+	stageManifest(t, fetcher, "s3://b/claim1.json", man)
+	q.submit(ClaimRef{RunID: "run-1", Model: "resnet", ManifestURI: "s3://b/claim1.json"})
+
+	w := &Worker{
+		Queue: q, Fetcher: fetcher, Results: results, Supervisor: sup,
+		Config: WorkerConfig{Model: "resnet", IdleTimeout: time.Second},
+		now:    clk.now,
+	}
+
+	done := make(chan struct{})
+	var served int
+	var runErr error
+	go func() { served, runErr = w.Run(context.Background()); close(done) }()
+
+	if !drainClock(t, clk, done) {
+		t.Fatal("worker did not drain within 5s")
+	}
+	if runErr != nil {
+		t.Fatalf("Run error: %v", runErr)
+	}
+	if served != 1 {
+		t.Fatalf("claims served = %d, want 1", served)
+	}
+	if results.summaryCount() != 1 {
+		t.Fatalf("summaries written = %d, want 1", results.summaryCount())
+	}
+	got := results.sinks[0].Results()
+	r, ok := got[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	want := "/tmp/world" // str(_Wrap(Path("/tmp")).value / "world") — only resolves if BOTH ExtraImports and ExtraClasses reached Config
+	if s, ok := r.Result.(string); !ok || s != want {
+		t.Errorf("result = %v, want %q — proves ExtraImports (Path) AND ExtraClasses (_Wrap) actually reached warm.Config through runOne, not silently dropped", r.Result, want)
+	}
+}
+
 // TestWorker_MismatchedModelClaimIsAckedNotRun: a claim whose Model doesn't
 // match this pool's configured model must be dropped (acked, not executed) —
 // per docs/pool-queue-contract.md decision 2, this should never happen under

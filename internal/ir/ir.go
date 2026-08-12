@@ -30,15 +30,15 @@ type App struct {
 	// script with no entrypoints, or an entrypoint with no recognized call
 	// sites of its own.
 	EntrypointInvokes map[string]map[string]InvokeKind
-	// ModuleConsts is the verbatim source of every module-level `NAME =
-	// <literal-or-expression>` assignment, keyed by name (calque#139) — real
-	// Modal code commonly reads a bare module-level constant from inside an
-	// @enter/@method body (e.g. `self.prefix = GREETING`) with no .local()
-	// in sight, since it's never registered as an @app.function to begin
-	// with. collectLocalExtras (cmd/calque/run.go) resolves a Function's/
-	// Class's FreeRefs/EnterFreeRefs against this map (and ModuleFuncs below)
-	// the same way it already resolves LocalCalls against FindFunction.
-	ModuleConsts map[string]string
+	// ModuleConsts is every module-level `NAME = <literal-or-expression>`
+	// assignment, keyed by name (calque#139) — real Modal code commonly
+	// reads a bare module-level constant from inside an @enter/@method body
+	// (e.g. `self.prefix = GREETING`) with no .local() in sight, since it's
+	// never registered as an @app.function to begin with. collectLocalExtras
+	// (cmd/calque/run.go) resolves a Function's/Class's FreeRefs/
+	// EnterFreeRefs against this map (and ModuleFuncs below) the same way it
+	// already resolves LocalCalls against FindFunction.
+	ModuleConsts map[string]ModuleConst
 	// ModuleFuncs carries every module-level function/method, keyed by name
 	// (calque#139) — INCLUDING a plain, undecorated helper like `_format`
 	// that is never an @app.function and so never appears in Functions.
@@ -46,6 +46,28 @@ type App struct {
 	// call, not `.local()`; FreeRefs/EnterFreeRefs may name one of these
 	// instead of (or in addition to) an entry in Functions.
 	ModuleFuncs map[string]ModuleFunc
+	// ModuleImports is the verbatim source of every module-level `import X`
+	// / `from X import Y` statement, keyed by EACH name it binds (calque#146)
+	// — a bare reference to an imported name (e.g. `Path(...)` after `from
+	// pathlib import Path`, or `modal.Volume.from_name(...)` after `import
+	// modal`) inside an @enter/@method body was previously an unconditional
+	// NameError on execution: calque#139 shipped bare-referenced functions/
+	// constants but explicitly did NOT resolve imports. A plain top-level
+	// import THIS script does itself is unambiguous (unlike a re-exported
+	// name from another module, which stays a leak, not a false positive)
+	// and is shippable the same way a module-level constant already is.
+	// collectLocalExtras (cmd/calque/run.go) resolves a Function's/Class's
+	// FreeRefs/EnterFreeRefs against this map too, alongside ModuleFuncs/
+	// ModuleConsts.
+	ModuleImports map[string]string
+	// ModuleClasses is every PLAIN (non-`@app.cls`) module-level class,
+	// keyed by name (calque#147) — an ordinary helper class (e.g. a
+	// log-tee context manager) a picked unit's body bare-instantiates,
+	// e.g. `_LogTee(sys.stdout, log_buffer)`. Distinct from Classes above
+	// (those are Modal's own `@app.cls` execution units, already modeled
+	// structurally) — this is the FOURTH shippable free-reference target,
+	// alongside ModuleFuncs/ModuleConsts/ModuleImports.
+	ModuleClasses map[string]ModuleClass
 }
 
 // ModuleFunc is one module-level function's shippable shape (calque#139):
@@ -58,6 +80,27 @@ type ModuleFunc struct {
 	Body       string
 	LocalCalls []string
 	FreeRefs   []string
+}
+
+// ModuleConst is one module-level constant's shippable shape (calque#146.2):
+// its verbatim source plus its OWN FreeRefs — a constant's RHS can itself
+// reference an import or another constant (e.g. `forecast_volume =
+// modal.Volume.from_name(...)` needs `import modal` shipped too), so
+// collectLocalExtras' transitive-closure walk must be able to enqueue
+// THROUGH a shipped constant, not just stop at it.
+type ModuleConst struct {
+	Source   string
+	FreeRefs []string
+}
+
+// ModuleClass is one PLAIN (non-`@app.cls`) module-level class's shippable
+// shape (calque#147): its verbatim source (whole class body, methods
+// included) plus its OWN FreeRefs — mirrors ModuleConst's exact shape,
+// since the exec mechanics (verbatim source, exec'd into shared globals)
+// are identical for a class statement and a constant assignment.
+type ModuleClass struct {
+	Source   string
+	FreeRefs []string
 }
 
 // FindFunction looks up a plain @app.function by name (calque#88: correlating

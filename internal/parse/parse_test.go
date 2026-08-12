@@ -725,8 +725,8 @@ func TestFreeRefsPopulatedFromFixture(t *testing.T) {
 		t.Errorf("stray.FreeRefs = %v, want empty (GREETING is shadowed by its own comprehension loop var)", stray.FreeRefs)
 	}
 
-	if src, ok := app.ModuleConsts["GREETING"]; !ok || !strings.Contains(src, `"hello"`) {
-		t.Errorf(`app.ModuleConsts["GREETING"] = %q, ok=%v, want a source line containing "hello"`, src, ok)
+	if mc, ok := app.ModuleConsts["GREETING"]; !ok || !strings.Contains(mc.Source, `"hello"`) {
+		t.Errorf(`app.ModuleConsts["GREETING"] = %+v, ok=%v, want a source line containing "hello"`, mc, ok)
 	}
 	mf, ok := app.ModuleFuncs["_format"]
 	if !ok {
@@ -737,6 +737,89 @@ func TestFreeRefsPopulatedFromFixture(t *testing.T) {
 	}
 	if len(mf.FreeRefs) != 1 || mf.FreeRefs[0] != "GREETING" {
 		t.Errorf("ModuleFuncs[_format].FreeRefs = %v, want [GREETING] (the helper itself reads the module constant)", mf.FreeRefs)
+	}
+}
+
+// TestFreeRefsResolveModuleImports (calque#146) is TestFreeRefsPopulatedFromFixture's
+// import counterpart: a bare reference to a module-level `from X import Y`
+// name must resolve via App.ModuleImports — the THIRD free-reference target,
+// closing the gap calque#139's own fix explicitly left open ("deliberately
+// does NOT attempt to resolve imports").
+func TestFreeRefsResolveModuleImports(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/free_refs_import.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if len(app.Classes) != 1 {
+		t.Fatalf("app.Classes = %d, want 1", len(app.Classes))
+	}
+	cls := app.Classes[0]
+	if len(cls.EnterFreeRefs) != 1 || cls.EnterFreeRefs[0] != "Path" {
+		t.Errorf("cls.EnterFreeRefs = %v, want [Path]", cls.EnterFreeRefs)
+	}
+	src, ok := app.ModuleImports["Path"]
+	if !ok {
+		t.Fatal(`app.ModuleImports["Path"] missing — want the "from pathlib import Path" statement captured`)
+	}
+	if !strings.Contains(src, "pathlib") || !strings.Contains(src, "Path") {
+		t.Errorf(`app.ModuleImports["Path"] = %q, want it to contain "from pathlib import Path"`, src)
+	}
+	// app.ModuleImports is the lookup TABLE of every module-level import
+	// (mirroring ModuleConsts/ModuleFuncs) — it's collectLocalExtras
+	// (cmd/calque) that decides what's actually SHIPPED, based on FreeRefs.
+	// "modal" is imported too (never bare-referenced from inside a body in
+	// this fixture — only used via the @app.cls/@modal.enter decorators,
+	// which resolve structurally, not via FreeRefs) and IS present here,
+	// proving this table isn't filtered to "already known to be referenced"
+	// — the filtering happens downstream, exactly like ModuleConsts/
+	// ModuleFuncs.
+	if _, ok := app.ModuleImports["modal"]; !ok {
+		t.Error(`app.ModuleImports["modal"] missing, want present — ModuleImports captures every module-level import, unfiltered`)
+	}
+}
+
+// TestFreeRefsResolveModuleClasses (calque#147) is TestFreeRefsResolveModuleImports'
+// class counterpart: a bare instantiation of a PLAIN (non-@app.cls)
+// module-level class must resolve via App.ModuleClasses — the FOURTH
+// free-reference target, closing the gap left open after calque#139/#146
+// (functions/constants/imports).
+func TestFreeRefsResolveModuleClasses(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/free_refs_class.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if len(app.Classes) != 1 {
+		t.Fatalf("app.Classes = %d, want 1 (only Worker, the @app.cls — _Adder must NOT be double-collected there)", len(app.Classes))
+	}
+	cls := app.Classes[0]
+	if cls.Name != "Worker" {
+		t.Errorf("app.Classes[0].Name = %q, want Worker", cls.Name)
+	}
+	if len(cls.EnterFreeRefs) != 1 || cls.EnterFreeRefs[0] != "_Adder" {
+		t.Errorf("cls.EnterFreeRefs = %v, want [_Adder]", cls.EnterFreeRefs)
+	}
+	mc, ok := app.ModuleClasses["_Adder"]
+	if !ok {
+		t.Fatal(`app.ModuleClasses["_Adder"] missing — want the plain helper class captured`)
+	}
+	if !strings.Contains(mc.Source, "def add(self, x)") {
+		t.Errorf(`app.ModuleClasses["_Adder"].Source = %q, want it to contain the add method`, mc.Source)
+	}
+	// Worker (the @app.cls) must NOT also appear in ModuleClasses — only
+	// PLAIN classes are collected there, proving _is_app_cls's exclusion
+	// works, not just that _Adder happens to be found.
+	if _, ok := app.ModuleClasses["Worker"]; ok {
+		t.Error(`app.ModuleClasses["Worker"] present, want absent — Worker is @app.cls, already modeled structurally in app.Classes`)
 	}
 }
 

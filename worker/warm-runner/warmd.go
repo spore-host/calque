@@ -68,6 +68,29 @@ type Config struct {
 	// statement, same "ship the payload verbatim, never interpret it" trust
 	// model as everything else in this file.
 	ExtraConsts []ExtraConst `json:"extra_consts,omitempty"`
+	// ExtraImports are module-level `import X` / `from X import Y` statements
+	// (calque#146) — a bare reference to an imported name (e.g. `Path(...)`
+	// after `from pathlib import Path`, or `modal.Volume.from_name(...)`
+	// after `import modal`) inside EnterBody/MethodBody was previously an
+	// unconditional NameError, even though calque#139 already shipped
+	// bare-referenced functions/constants: an import THIS script does itself
+	// is unambiguous (unlike a re-exported name from ANOTHER module, which
+	// stays an honest leak, not shipped) and is shippable the same "verbatim
+	// exec into shared globals" way as ExtraConsts. Compiled BEFORE
+	// ExtraConsts/Extras (see runner.py's enter()) — a constant's own RHS or
+	// a sibling function's body could reference an imported name, but not
+	// vice versa in any real script.
+	ExtraImports []ExtraImport `json:"extra_imports,omitempty"`
+	// ExtraClasses are PLAIN (non-`@app.cls`) module-level classes
+	// (calque#147) — a bare instantiation like `_LogTee(sys.stdout,
+	// log_buffer)` inside EnterBody/MethodBody was previously an
+	// unconditional NameError, the same shape calque#139/#146 already fixed
+	// for functions/constants/imports. Compiled alongside ExtraConsts
+	// (same verbatim-exec mechanics — a `class X: ...` statement execs into
+	// shared globals exactly like an assignment or import does), AFTER
+	// ExtraImports (a class body could reference an imported name in a
+	// method or class-level attribute).
+	ExtraClasses []ExtraClass `json:"extra_classes,omitempty"`
 }
 
 // ExtraFunc is one .local()-referenced (calque#92) or bare-referenced
@@ -87,6 +110,30 @@ type ExtraFunc struct {
 // into its shared globals, unchanged, exactly as it exists at module scope in
 // the original script.
 type ExtraConst struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
+}
+
+// ExtraImport is one bare-referenced (calque#146) module-level import
+// statement's verbatim source: the whole `import X` / `from X import Y`
+// statement, shipped alongside the picked warm unit's Config so the runner
+// can exec it into its shared globals, unchanged, exactly as it exists at
+// module scope in the original script. Name is the SPECIFIC bound name that
+// triggered shipping this statement (e.g. "Path" for `from pathlib import
+// Path`) — used only for dedup/logging; Source is exec'd verbatim regardless
+// of which of its possibly-multiple bound names (`from datetime import UTC,
+// datetime`) were actually referenced.
+type ExtraImport struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
+}
+
+// ExtraClass is one bare-referenced (calque#147) PLAIN (non-`@app.cls`)
+// module-level class's verbatim source: the WHOLE class statement (methods
+// included), shipped alongside the picked warm unit's Config so the runner
+// can exec it into its shared globals, unchanged, exactly as it exists at
+// module scope in the original script.
+type ExtraClass struct {
 	Name   string `json:"name"`
 	Source string `json:"source"`
 }
@@ -605,11 +652,26 @@ func (s *Supervisor) warmUp(rn *runner) error {
 	for i, e := range s.Config.ExtraConsts {
 		extraConsts[i] = map[string]any{"name": e.Name, "source": e.Source}
 	}
+	// calque#146: module-level imports a bare free-name reference resolved
+	// to (e.g. `Path(...)` after `from pathlib import Path`) — same
+	// verbatim-exec shape as ExtraConsts, sent alongside it.
+	extraImports := make([]map[string]any, len(s.Config.ExtraImports))
+	for i, e := range s.Config.ExtraImports {
+		extraImports[i] = map[string]any{"name": e.Name, "source": e.Source}
+	}
+	// calque#147: plain module-level classes a bare instantiation resolved
+	// to (e.g. `_LogTee(sys.stdout, log_buffer)`) — same verbatim-exec
+	// shape as ExtraConsts/ExtraImports.
+	extraClasses := make([]map[string]any, len(s.Config.ExtraClasses))
+	for i, e := range s.Config.ExtraClasses {
+		extraClasses[i] = map[string]any{"name": e.Name, "source": e.Source}
+	}
 	if err := rn.send(map[string]any{
 		"kind": "config", "enter_body": s.Config.EnterBody,
 		"method_body": s.Config.MethodBody, "method_arg": s.Config.MethodArg,
 		"method_args": s.Config.MethodArgs, "starmap": s.Config.Starmap,
 		"concurrency": conc, "extras": extras, "extra_consts": extraConsts,
+		"extra_imports": extraImports, "extra_classes": extraClasses,
 	}); err != nil {
 		return err
 	}
