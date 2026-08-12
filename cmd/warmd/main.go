@@ -87,8 +87,7 @@ type Summary struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: warmd run --manifest s3://bucket/key")
-		fmt.Fprintln(os.Stderr, "       warmd pool --model <name> --region <region> [--idle-timeout 30m]")
+		usage()
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -126,11 +125,38 @@ func main() {
 			fmt.Fprintln(os.Stderr, "warmd pool error:", err)
 			os.Exit(1)
 		}
+	case "fleet":
+		fs := flag.NewFlagSet("fleet", flag.ExitOnError)
+		runID := fs.String("run-id", "", "this fleet run's id (calque#145: the shard queue is scoped to the RUN, not a model, unlike `warmd pool`)")
+		region := fs.String("region", "", "AWS region the run's SQS shard queue lives in")
+		pythonBin := fs.String("python-bin", "python3", "interpreter for the warm runner")
+		runnerPath := fs.String("runner-path", "", "path to runner.py in the image")
+		idleTimeout := fs.Duration("idle-timeout", fleetWorkerDefaultIdleTimeout, "how long to keep the resident runner warm with an empty queue before closing it — short by default: a fleet submits every shard's claim upfront, so there is no future submission worth waiting on the way a pool's IdleTimeout does")
+		pollWait := fs.Int("poll-wait-seconds", 20, "SQS long-poll wait per claim (0..20)")
+		visibilityTimeout := fs.Int("visibility-timeout", 900, "MUST match the run queue's own SQS VisibilityTimeout (set by fleetRun's CreateRunQueue call) — used to size this worker's heartbeat interval, not to configure the queue itself")
+		_ = fs.Parse(os.Args[2:])
+		if *runID == "" || *runnerPath == "" {
+			fmt.Fprintln(os.Stderr, "error: --run-id and --runner-path required")
+			os.Exit(2)
+		}
+		if err := runFleetWorker(context.Background(), fleetWorkerArgs{
+			runID: *runID, region: *region, pythonBin: *pythonBin, runnerPath: *runnerPath,
+			idleTimeout: *idleTimeout, pollWaitSeconds: int32(*pollWait),
+			visibilityTimeout: *visibilityTimeout,
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "warmd fleet error:", err)
+			os.Exit(1)
+		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: warmd run --manifest s3://bucket/key")
-		fmt.Fprintln(os.Stderr, "       warmd pool --model <name> --region <region> [--idle-timeout 30m]")
+		usage()
 		os.Exit(2)
 	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: warmd run --manifest s3://bucket/key")
+	fmt.Fprintln(os.Stderr, "       warmd pool --model <name> --region <region> [--idle-timeout 30m]")
+	fmt.Fprintln(os.Stderr, "       warmd fleet --run-id <id> --region <region> --runner-path <path> [--idle-timeout 1m]")
 }
 
 // poolWorkerArgs bundles `warmd pool`'s flags.
@@ -173,6 +199,65 @@ func runPoolWorker(ctx context.Context, a poolWorkerArgs) error {
 	}
 	served, err := w.Run(ctx)
 	fmt.Fprintf(os.Stderr, "pool worker for model %q served %d claim(s)\n", a.model, served)
+	return err
+}
+
+// fleetWorkerDefaultIdleTimeout is far shorter than warmd pool's 30m default
+// (calque#145): a fleet run submits every shard's claim upfront (fleetRun's
+// D2), so once a worker's queue goes empty there is no FUTURE submission
+// worth waiting on the way a long-lived pool's IdleTimeout is sized for —
+// the worker should self-exit promptly so fleetRun's own explicit teardown
+// (DrainFleetWorkers) isn't racing a worker that's still needlessly polling.
+const fleetWorkerDefaultIdleTimeout = 1 * time.Minute
+
+// fleetWorkerArgs bundles `warmd fleet`'s flags.
+type fleetWorkerArgs struct {
+	runID, region, pythonBin, runnerPath string
+	idleTimeout                          time.Duration
+	pollWaitSeconds                      int32
+	visibilityTimeout                    int
+}
+
+// runFleetWorker starts a calque#145 fleet worker: claims shard manifests
+// from the RUN's SQS queue (calpool.OpenRunQueue — run-scoped, unlike
+// warmd pool's model-scoped queue), drains each against a resident
+// warm.Supervisor (warm ONCE across every shard this worker serves, not
+// once per shard, the entire point of #145), writes results+summary to S3,
+// and acks — until idle past idleTimeout, then closes the resident runner
+// and exits. Otherwise identical to runPoolWorker; the only real
+// difference is which queue it opens and what Config.Model is checked
+// against: a fleet worker only ever knows its run id (not a model — it's
+// booted with --run-id, no --model flag exists here), so Config.Model is
+// set to a.runID, and fleetRun's submitter must set every ClaimRef.Model
+// to that SAME run id — Worker.runOne's affinity check (ref.Model !=
+// w.Config.Model) then still catches a misrouted claim exactly the way it
+// does for pool mode, just keyed by run id instead of model name.
+func runFleetWorker(ctx context.Context, a fleetWorkerArgs) error {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(a.region))
+	if err != nil {
+		return fmt.Errorf("load aws config: %w", err)
+	}
+	sqsClient := sqs.NewFromConfig(cfg)
+	s3Client := s3.NewFromConfig(cfg)
+
+	q, err := calpool.OpenRunQueue(ctx, sqsClient, a.runID)
+	if err != nil {
+		return fmt.Errorf("open run queue for run %q: %w", a.runID, err)
+	}
+
+	sup := &warm.Supervisor{Python: a.pythonBin, Script: a.runnerPath, Leak: stderrLeaker{}}
+	w := &calpool.Worker{
+		Queue:      q,
+		Fetcher:    &calpool.S3Manifests{Client: s3Client},
+		Results:    &calpool.S3Results{Client: s3Client},
+		Supervisor: sup,
+		Config: calpool.WorkerConfig{
+			Model: a.runID, PollWaitSeconds: a.pollWaitSeconds, IdleTimeout: a.idleTimeout,
+			VisibilityTimeout: a.visibilityTimeout, Log: os.Stderr,
+		},
+	}
+	served, err := w.Run(ctx)
+	fmt.Fprintf(os.Stderr, "fleet worker for run %q served %d claim(s)\n", a.runID, served)
 	return err
 }
 

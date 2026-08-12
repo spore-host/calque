@@ -1,0 +1,125 @@
+package pool
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// TestFleetWorkerPolicyScopesToThisRunOnly is TestWorkerPolicyScopesToThisPoolOnly's
+// calque#145 sibling — proves the IAM policy is scoped to the SPECIFIC run's
+// queue and buckets, and grants no submitter-only actions.
+func TestFleetWorkerPolicyScopesToThisRunOnly(t *testing.T) {
+	policy := FleetWorkerPolicy("111122223333", "us-east-1", "run-abc", "calque-manifests", "calque-results")
+
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(policy), &doc); err != nil {
+		t.Fatalf("FleetWorkerPolicy did not produce valid JSON: %v\n%s", err, policy)
+	}
+
+	wantQueueARN := "arn:aws:sqs:us-east-1:111122223333:calque-fleet-run-abc"
+	if !strings.Contains(policy, wantQueueARN) {
+		t.Errorf("policy missing scoped queue ARN %q; got %s", wantQueueARN, policy)
+	}
+	for _, forbidden := range []string{"sqs:SendMessage", "sqs:CreateQueue", "sqs:DeleteQueue"} {
+		if strings.Contains(policy, forbidden) {
+			t.Errorf("policy grants %q, which is a submitter-only action a worker must not have", forbidden)
+		}
+	}
+	if !strings.Contains(policy, "calque-manifests") {
+		t.Errorf("policy missing manifest bucket scoping; got %s", policy)
+	}
+	if !strings.Contains(policy, "calque-results") {
+		t.Errorf("policy missing results bucket scoping; got %s", policy)
+	}
+	if strings.Contains(policy, "calque-fleet-run-xyz") {
+		t.Errorf("policy for run %q leaked a reference to a different run's queue", "run-abc")
+	}
+}
+
+// TestFleetWorkerPolicy_DoesNotCollideWithPoolPolicy: the same identifier
+// used as both a model and a run id must produce policies scoped to
+// DIFFERENT queue ARNs — the run/pool queue isolation proven at the naming
+// layer (TestOpenRunQueue_DoesNotResolveAPoolQueue) must hold at the IAM
+// layer too.
+func TestFleetWorkerPolicy_DoesNotCollideWithPoolPolicy(t *testing.T) {
+	shared := "shared-name"
+	fleetPolicy := FleetWorkerPolicy("111122223333", "us-east-1", shared, "b1", "b2")
+	poolPolicy := WorkerPolicy("111122223333", "us-east-1", shared, "b1", "b2")
+	if strings.Contains(fleetPolicy, PoolQueueName(shared)) {
+		t.Error("FleetWorkerPolicy referenced the POOL queue name for a shared identifier")
+	}
+	if strings.Contains(poolPolicy, RunQueueName(shared)) {
+		t.Error("WorkerPolicy referenced the RUN queue name for a shared identifier")
+	}
+}
+
+// TestBuildFleetWorkerBootstrapCommandIsShellSafe mirrors
+// TestBuildWorkerBootstrapCommandIsShellSafe — every argument must be
+// quoted so a runner path containing a space doesn't silently truncate.
+func TestBuildFleetWorkerBootstrapCommandIsShellSafe(t *testing.T) {
+	cmd := buildFleetWorkerBootstrapCommand("run-abc", "us-east-1", "/opt/calque runner/runner.py", "1m", 900)
+	for _, want := range []string{
+		`--run-id "run-abc"`,
+		`--region "us-east-1"`,
+		`--runner-path "/opt/calque runner/runner.py"`,
+		`--idle-timeout "1m"`,
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("bootstrap command missing %q; got: %s", want, cmd)
+		}
+	}
+}
+
+// TestDrainFleetWorkers_TerminatesOnlyThisRunsWorkers is
+// TestDeletePool_TerminatesOnlyThisModelsWorkers' calque#145 sibling: proves
+// DrainFleetWorkers discovers workers by the calque:fleet-run tag
+// ProvisionFleetWorkers stamps, terminates every one of THIS run's workers,
+// and leaves a different run's workers (same account, different run-id tag)
+// untouched.
+func TestDrainFleetWorkers_TerminatesOnlyThisRunsWorkers(t *testing.T) {
+	launch := newFakeLaunchAPI()
+	launch.seedFleet("calque-fleet-run-abc-worker-0", "i-1", "run-abc")
+	launch.seedFleet("calque-fleet-run-abc-worker-1", "i-2", "run-abc")
+	launch.seedFleet("calque-fleet-run-xyz-worker-0", "i-3", "run-xyz") // different run
+
+	if err := drainFleetWorkers(context.Background(), launch, "run-abc", "us-east-1"); err != nil {
+		t.Fatalf("drainFleetWorkers: %v", err)
+	}
+	if launch.terminatedCount() != 2 {
+		t.Errorf("terminated count = %d, want 2 (only run-abc's workers)", launch.terminatedCount())
+	}
+	remaining, err := launch.ListInstances(context.Background(), "us-east-1", "")
+	if err != nil {
+		t.Fatalf("ListInstances: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].InstanceID != "i-3" {
+		t.Errorf("remaining instances = %+v, want only run-xyz's worker (i-3) left", remaining)
+	}
+}
+
+// TestDrainFleetWorkers_NoWorkersIsNotAnError mirrors
+// TestDeletePool_NoQueueIsNotAnError's spirit: draining a run with zero
+// discovered workers (never provisioned, or already drained) must succeed,
+// not fail.
+func TestDrainFleetWorkers_NoWorkersIsNotAnError(t *testing.T) {
+	launch := newFakeLaunchAPI()
+	if err := drainFleetWorkers(context.Background(), launch, "run-empty", "us-east-1"); err != nil {
+		t.Fatalf("drainFleetWorkers with no workers should succeed, got: %v", err)
+	}
+}
+
+// TestDiscoverFleetWorkerIDs_EmptyIsNotNilError proves a fleet run with no
+// live workers reports an empty (not error) result — "zero live workers" is
+// a normal state, mirroring discoverPoolWorkerIDs' own contract.
+func TestDiscoverFleetWorkerIDs_EmptyIsNotNilError(t *testing.T) {
+	launch := newFakeLaunchAPI()
+	ids, err := DiscoverFleetWorkerIDs(context.Background(), launch, "run-empty", "us-east-1")
+	if err != nil {
+		t.Fatalf("DiscoverFleetWorkerIDs: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("ids = %v, want empty for a run with no tagged workers", ids)
+	}
+}

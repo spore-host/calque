@@ -256,6 +256,42 @@ func TestPoolQueueName_AlreadyCleanModelIsUnchanged(t *testing.T) {
 	}
 }
 
+// TestRunQueueName_SlugsUnsafeRunIDChars (calque#145): a run id containing
+// characters SQS rejects must still slug to a valid QueueName — the
+// run-scoped mirror of TestPoolQueueName_SlugsUnsafeModelChars, since
+// RunQueueName defensively slugs the same way even though calque's own
+// runIDs are typically already SQS-safe.
+func TestRunQueueName_SlugsUnsafeRunIDChars(t *testing.T) {
+	got := RunQueueName("fleet/run 2026-08-11")
+	if !validRunSQSQueueName.MatchString(got) {
+		t.Errorf("RunQueueName(%q) = %q, does not match valid SQS QueueName pattern %s",
+			"fleet/run 2026-08-11", got, validRunSQSQueueName)
+	}
+	if len(got) > 80 {
+		t.Errorf("RunQueueName(%q) = %q, length %d exceeds SQS's 80-char QueueName limit",
+			"fleet/run 2026-08-11", got, len(got))
+	}
+}
+
+// validRunSQSQueueName is validSQSQueueName's run-scoped counterpart
+// (calque#145) — RunQueueName's prefix differs from PoolQueueName's.
+var validRunSQSQueueName = regexp.MustCompile(`^calque-fleet-[a-z0-9_-]+$`)
+
+// TestRunQueueName_AlreadyCleanRunIDIsUnchanged mirrors
+// TestPoolQueueName_AlreadyCleanModelIsUnchanged, and also asserts the
+// run-scoped prefix is DISTINCT from the pool-scoped one — the two queue
+// kinds must never collide under the same identifier.
+func TestRunQueueName_AlreadyCleanRunIDIsUnchanged(t *testing.T) {
+	got := RunQueueName("fleet-quota-verify2-20260811-0459")
+	want := "calque-fleet-fleet-quota-verify2-20260811-0459"
+	if got != want {
+		t.Errorf("RunQueueName(%q) = %q, want %q", "fleet-quota-verify2-20260811-0459", got, want)
+	}
+	if got == PoolQueueName("fleet-quota-verify2-20260811-0459") {
+		t.Error("RunQueueName and PoolQueueName must not collide for the same identifier")
+	}
+}
+
 // TestWorker_StaysWarmAcrossClaims is the core sticky-pool proof (calque#100):
 // two claims for the SAME model, served by ONE worker, must warm the runner
 // only ONCE — @enter's cost is paid on the first claim and NOT the second.

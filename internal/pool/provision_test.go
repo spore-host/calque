@@ -100,6 +100,20 @@ func (f *fakeLaunchAPI) seed(name, instanceID, model string) {
 	}
 }
 
+// seedFleet is seed's calque#145 sibling: tags the instance with
+// fleetWorkerTag (calque:fleet-run) instead of poolModelTag, as
+// ProvisionFleetWorkers' own base.Tags would have stamped it.
+func (f *fakeLaunchAPI) seedFleet(name, instanceID, runID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.instances[name] = spawnaws.InstanceInfo{
+		InstanceID: instanceID,
+		Name:       name,
+		State:      "running",
+		Tags:       map[string]string{fleetWorkerTag: runID},
+	}
+}
+
 func (f *fakeLaunchAPI) Launch(_ context.Context, _ spawnaws.LaunchConfig) (*spawnaws.LaunchResult, error) {
 	return nil, fmt.Errorf("fakeLaunchAPI: Launch not needed by DeletePool/PoolStatus tests")
 }

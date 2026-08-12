@@ -251,6 +251,101 @@ func DeletePoolQueueIfExists(ctx context.Context, client SQSAPI, model string) e
 	return q.DeleteQueue(ctx)
 }
 
+// RunQueueName derives the SQS queue name for a fleet run's shard queue,
+// keyed by RUN ID (not model) — the opposite scoping decision from
+// PoolQueueName, and deliberately so (calque#145): a fleet run's queue does
+// NOT outlive the run the way a pool's queue outlives any one run, so it's
+// scoped to (and expires with, via CreateRunQueue's MessageRetentionPeriod)
+// the run that created it, mirroring spawn's own taskpool.QueueName(runID)
+// shape exactly rather than PoolQueueName's model-scoped one. Slugged the
+// same way PoolQueueName slugs a model — a runID is expected to already be
+// SQS-safe (calque's own runIDs are typically date-stamped identifiers), but
+// nothing upstream enforces that, so this stays defensive rather than
+// trusting the caller.
+func RunQueueName(runID string) string {
+	return fleetQueuePrefix + slugModel(runID)
+}
+
+// fleetQueuePrefix mirrors poolQueuePrefix's role for RunQueueName — a named
+// const so slugModel's length budget stays in lockstep with the prefix here
+// too.
+const fleetQueuePrefix = "calque-fleet-"
+
+// runQueueRetentionSeconds mirrors spawn's taskpool.CreateQueue's own 12h
+// choice ("a queue outlives a slow run but a leaked queue still expires") —
+// the exact reasoning applies unchanged to a fleet run's queue, unlike a
+// pool queue's deliberately-unbounded lifetime (see CreatePoolQueue's own
+// comment on why IT has no retention override).
+const runQueueRetentionSeconds = "43200"
+
+// CreateRunQueue creates (idempotently) the shard queue for one fleet run,
+// keyed by runID (calque#145) — the run-scoped sibling to CreatePoolQueue's
+// model-scoped queue. Unlike a pool queue, this DOES set
+// MessageRetentionPeriod: a fleet run's queue is meant to expire on its own
+// if the run's own explicit teardown (DeleteRunQueueIfExists) is somehow
+// skipped, rather than living forever the way a pool's queue deliberately
+// does.
+func CreateRunQueue(ctx context.Context, client SQSAPI, runID string, visibilityTimeout int) (*SQSQueue, error) {
+	name := RunQueueName(runID)
+	out, err := client.CreateQueue(ctx, &sqs.CreateQueueInput{
+		QueueName: aws.String(name),
+		Attributes: map[string]string{
+			"VisibilityTimeout":      fmt.Sprintf("%d", visibilityTimeout),
+			"MessageRetentionPeriod": runQueueRetentionSeconds,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create run queue %s: %w", name, err)
+	}
+	return &SQSQueue{client: client, url: aws.ToString(out.QueueUrl)}, nil
+}
+
+// OpenRunQueue resolves an EXISTING fleet run's shard queue by run id (the
+// worker path: a fleet worker boots knowing only its run id, mirroring
+// OpenPoolQueue's worker-boots-knowing-only-its-model shape). Retries
+// GetQueueUrl's eventual-consistency window after a fresh CreateRunQueue,
+// reusing the exact same retry loop/constants OpenPoolQueue does.
+func OpenRunQueue(ctx context.Context, client SQSAPI, runID string) (*SQSQueue, error) {
+	name := RunQueueName(runID)
+	var lastErr error
+	for attempt := 0; attempt < poolOpenMaxAttempts; attempt++ {
+		if attempt > 0 {
+			t := time.NewTimer(poolOpenRetryDelay)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil, ctx.Err()
+			case <-t.C:
+			}
+		}
+		out, err := client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(name)})
+		if err == nil {
+			return &SQSQueue{client: client, url: aws.ToString(out.QueueUrl)}, nil
+		}
+		lastErr = err
+		if !isNonExistentQueue(err) {
+			return nil, fmt.Errorf("resolve run queue %s: %w", name, err)
+		}
+	}
+	return nil, fmt.Errorf("resolve run queue %s: not visible after %d attempts: %w", name, poolOpenMaxAttempts, lastErr)
+}
+
+// DeleteRunQueueIfExists deletes a fleet run's shard queue by run id,
+// tolerating the queue already being gone — mirrors
+// DeletePoolQueueIfExists's exact idempotent-delete shape and rationale.
+func DeleteRunQueueIfExists(ctx context.Context, client SQSAPI, runID string) error {
+	name := RunQueueName(runID)
+	out, err := client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(name)})
+	if err != nil {
+		if isNonExistentQueue(err) {
+			return nil // already gone — deletion is idempotent
+		}
+		return fmt.Errorf("resolve run queue %s for deletion: %w", name, err)
+	}
+	q := &SQSQueue{client: client, url: aws.ToString(out.QueueUrl)}
+	return q.DeleteQueue(ctx)
+}
+
 // atoiDefault parses a decimal string, returning 0 on any non-digit —
 // mirrors taskpool's own helper of the same name and purpose (SQS attribute
 // values are always decimal strings; a malformed one is worth reporting as 0,
