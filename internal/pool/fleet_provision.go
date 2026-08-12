@@ -38,11 +38,36 @@ func FleetWorkerPolicy(account, region, runID, manifestBucket, resultsBucket str
 // `warmd fleet --run-id R` — buildWorkerBootstrapCommand's sibling for the
 // fleet case (--run-id instead of --model, no separate model flag since a
 // fleet worker only ever knows its run id).
-func buildFleetWorkerBootstrapCommand(runID, region, runnerPath, idleTimeout string, visibilityTimeout int) string {
-	return fmt.Sprintf(
+//
+// Unlike pool mode (whose --runner-path help text says "path to runner.py
+// IN THE WORKER IMAGE" — pool workers assume a pre-baked AMI, matching
+// spawn's own pool create precedent), fleetRun's existing single-shard
+// path (runShard/BootstrapConfig.Command, internal/exec/bootstrap.go)
+// builds+uploads warmd/runner.py/occupancy.py fresh every run and never
+// requires a pre-baked AMI. artifactS3URI (calque#145 slice 2) is that
+// SAME already-uploaded S3 prefix (fleetRun's existing UploadArtifacts
+// call, unchanged) — syncing it here before invoking `warmd fleet`
+// preserves that "no pre-baked AMI needed" property for fleet workers
+// too, mirroring BootstrapConfig.Command's own sync-then-invoke shape
+// (mkdir, aws s3 cp --recursive, chmod +x) rather than assuming the
+// binary is already present.
+func buildFleetWorkerBootstrapCommand(runID, region, artifactS3URI, workerDir, runnerPath, idleTimeout string, visibilityTimeout int) string {
+	warmdCmd := fmt.Sprintf(
 		"warmd fleet --run-id %q --region %q --runner-path %q --idle-timeout %q --visibility-timeout %d",
 		runID, region, runnerPath, idleTimeout, visibilityTimeout,
 	)
+	lines := []string{
+		"#!/bin/bash",
+		"exec > /tmp/calque-fleet-worker-bootstrap.log 2>&1",
+		"set -euxo pipefail",
+		"command -v aws >/dev/null || (sudo apt-get update && sudo apt-get install -y awscli)",
+		"command -v python3 >/dev/null || (sudo apt-get update && sudo apt-get install -y python3)",
+		fmt.Sprintf("mkdir -p %s", workerDir),
+		fmt.Sprintf("aws s3 cp --recursive %s/ %s/", strings.TrimSuffix(artifactS3URI, "/"), workerDir),
+		fmt.Sprintf("chmod +x %s/warmd", workerDir),
+		fmt.Sprintf("cd %s && ./%s", workerDir, warmdCmd),
+	}
+	return strings.Join(lines, "\n")
 }
 
 // FleetCreateConfig is ProvisionFleetWorkers' input — CreateConfig's
@@ -66,8 +91,18 @@ type FleetCreateConfig struct {
 	VisibilityTimeout int
 	ManifestBucket    string
 	ResultsBucket     string
-	RunnerPath        string
-	AMI               string
+	// ArtifactS3URI is the S3 prefix fleetRun's OWN calexec.UploadArtifacts
+	// call already uploaded warmd/runner.py/occupancy.py to (calque#145
+	// slice 2) — synced onto each worker at boot so fleet mode, like
+	// fleetRun's existing single-shard path, needs no pre-baked AMI.
+	ArtifactS3URI string
+	// WorkerDir is where artifacts land on the worker (e.g. "/tmp/calque"),
+	// mirroring internal/exec.BootstrapConfig.WorkerDir. RunnerPath below is
+	// resolved relative to this at boot ("<WorkerDir>/runner.py"), NOT a
+	// pre-existing image path the way pool mode's RunnerPath is.
+	WorkerDir  string
+	RunnerPath string
+	AMI        string
 }
 
 // fleetWorkerTag is the instance tag ProvisionFleetWorkers stamps on every
@@ -119,7 +154,15 @@ func ProvisionFleetWorkers(ctx context.Context, client *spawnaws.Client, cfg Fle
 	if visibilityTimeout <= 0 {
 		visibilityTimeout = defaultVisibilityTimeout
 	}
-	workerCmd := buildFleetWorkerBootstrapCommand(cfg.RunID, cfg.Region, cfg.RunnerPath, cfg.IdleTimeout, visibilityTimeout)
+	workerDir := cfg.WorkerDir
+	if workerDir == "" {
+		workerDir = "/tmp/calque-fleet"
+	}
+	runnerPath := cfg.RunnerPath
+	if runnerPath == "" {
+		runnerPath = workerDir + "/runner.py"
+	}
+	workerCmd := buildFleetWorkerBootstrapCommand(cfg.RunID, cfg.Region, cfg.ArtifactS3URI, workerDir, runnerPath, cfg.IdleTimeout, visibilityTimeout)
 	userData, err := launcher.BuildLinuxBootstrap(launcher.BootstrapConfig{
 		Username:       "ec2-user",
 		CustomUserData: workerCmd,

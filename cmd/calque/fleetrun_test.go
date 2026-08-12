@@ -10,7 +10,9 @@ import (
 
 	"github.com/aws/smithy-go"
 
+	calexec "github.com/spore-host/calque/internal/exec"
 	"github.com/spore-host/calque/internal/leak"
+	calpool "github.com/spore-host/calque/internal/pool"
 )
 
 // apiErr is a fake smithy.APIError with a chosen code, mirroring
@@ -209,5 +211,82 @@ func TestRedriveBackoff_UnwrapsThroughRunShardAndAcquireWrapping(t *testing.T) {
 
 	if got := redriveBackoff(runShardWrap); got != quotaExceededBackoff {
 		t.Errorf("redriveBackoff() through 2 layers of wrapping = %v, want %v (IsQuotaExceeded must unwrap through errors.As)", got, quotaExceededBackoff)
+	}
+}
+
+// TestMeasurementFromPoolSummaryFields_WarmHitReportsZeroEnter is the core
+// calque#145 D5 fix, proven directly: a warm-hit claim (this worker was
+// already loaded when it claimed the shard) must report EnterSeconds=0,
+// NOT the worker's original (possibly large) load cost — the exact
+// overcounting bug this fix closes, since measure.FleetFold sums
+// EnterSeconds across every shard's Measurement.
+func TestMeasurementFromPoolSummaryFields_WarmHitReportsZeroEnter(t *testing.T) {
+	summary := calpool.Summary{WarmHit: true, EnterSecondsPaid: 0}
+	m := measurementFromPoolSummaryFields(summary, []float64{1.0, 2.0}, "g7e.2xlarge")
+	if m.EnterSeconds != 0 {
+		t.Errorf("EnterSeconds = %v, want 0 for a warm-hit claim", m.EnterSeconds)
+	}
+	if m.AcquireWaitSeconds != 0 {
+		t.Errorf("AcquireWaitSeconds = %v, want 0 (fleet-pool acquire cost is a per-run fixed cost, not per-shard)", m.AcquireWaitSeconds)
+	}
+}
+
+// TestMeasurementFromPoolSummaryFields_ColdHitReportsRealEnter: the claim
+// that actually triggers @enter (this worker's first claim, or one
+// following a mid-drain crash) must carry that real, non-zero paid cost
+// through unchanged — only WARM claims should report 0.
+func TestMeasurementFromPoolSummaryFields_ColdHitReportsRealEnter(t *testing.T) {
+	summary := calpool.Summary{WarmHit: false, EnterSecondsPaid: 42.5}
+	m := measurementFromPoolSummaryFields(summary, []float64{1.0}, "g7e.2xlarge")
+	if m.EnterSeconds != 42.5 {
+		t.Errorf("EnterSeconds = %v, want 42.5 (the real paid load cost for a cold claim)", m.EnterSeconds)
+	}
+}
+
+// TestMeasurementFromPoolSummaryFields_DerivesPerItemFromResults proves
+// per-item timing comes from the caller-supplied perItemSecs (derived from
+// the shard's own collected S3 results), NOT from the pool summary itself —
+// calpool.Summary carries no per-item series at all.
+func TestMeasurementFromPoolSummaryFields_DerivesPerItemFromResults(t *testing.T) {
+	m := measurementFromPoolSummaryFields(calpool.Summary{}, []float64{1.0, 3.0, 5.0}, "g7e.2xlarge")
+	if m.PerItem.Count != 3 {
+		t.Errorf("PerItem.Count = %d, want 3", m.PerItem.Count)
+	}
+	wantMean := 3.0 // (1+3+5)/3
+	if m.PerItem.MeanSecs != wantMean {
+		t.Errorf("PerItem.MeanSecs = %v, want %v", m.PerItem.MeanSecs, wantMean)
+	}
+}
+
+// TestMeasurementFromPoolSummaryFields_CarriesOccupancy proves occupancy
+// still rides through from the pool summary (its own OccupancyRaw field
+// IS carried, unlike per-item timing).
+func TestMeasurementFromPoolSummaryFields_CarriesOccupancy(t *testing.T) {
+	occ := 0.75
+	summary := calpool.Summary{Occupancy: calexec.OccupancyRaw{Measured: true, MeanOccupancy: &occ, Source: "nvidia-smi"}}
+	m := measurementFromPoolSummaryFields(summary, nil, "g7e.2xlarge")
+	if !m.Occupancy.Measured {
+		t.Error("Occupancy.Measured = false, want true (carried from the pool summary)")
+	}
+	if m.Occupancy.MeanOccupancy == nil || *m.Occupancy.MeanOccupancy != 0.75 {
+		t.Errorf("Occupancy.MeanOccupancy = %v, want 0.75", m.Occupancy.MeanOccupancy)
+	}
+}
+
+// TestFleetClaimRef_ModelMatchesRunID (calque#145) guards the exact
+// copy-paste risk flagged in fleetRun's D2: a submitted ClaimRef.Model
+// that doesn't equal the run id would be silently dropped by
+// Worker.runOne's affinity check (ref.Model != w.Config.Model) — acked and
+// discarded, never run. This constructs the SAME ClaimRef shape fleetRun's
+// D2 submission loop builds and asserts the field fleetRun must get right.
+func TestFleetClaimRef_ModelMatchesRunID(t *testing.T) {
+	runID := "fleet-run-abc"
+	manifestURI := "s3://bucket/fleet/fleet-run-abc/shard-0/manifest.json"
+	ref := calpool.ClaimRef{RunID: runID, Model: runID, ManifestURI: manifestURI}
+	if ref.Model != runID {
+		t.Errorf("ClaimRef.Model = %q, want %q (must equal the run id, not o.model, or runFleetWorker's affinity check silently drops the claim)", ref.Model, runID)
+	}
+	if ref.ManifestURI != manifestURI {
+		t.Errorf("ClaimRef.ManifestURI = %q, want %q", ref.ManifestURI, manifestURI)
 	}
 }

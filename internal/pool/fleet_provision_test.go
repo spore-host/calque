@@ -56,10 +56,11 @@ func TestFleetWorkerPolicy_DoesNotCollideWithPoolPolicy(t *testing.T) {
 }
 
 // TestBuildFleetWorkerBootstrapCommandIsShellSafe mirrors
-// TestBuildWorkerBootstrapCommandIsShellSafe — every argument must be
-// quoted so a runner path containing a space doesn't silently truncate.
+// TestBuildWorkerBootstrapCommandIsShellSafe — every warmd-fleet argument
+// must be quoted so a runner path containing a space doesn't silently
+// truncate.
 func TestBuildFleetWorkerBootstrapCommandIsShellSafe(t *testing.T) {
-	cmd := buildFleetWorkerBootstrapCommand("run-abc", "us-east-1", "/opt/calque runner/runner.py", "1m", 900)
+	cmd := buildFleetWorkerBootstrapCommand("run-abc", "us-east-1", "s3://bucket/artifacts", "/tmp/calque-fleet", "/opt/calque runner/runner.py", "1m", 900)
 	for _, want := range []string{
 		`--run-id "run-abc"`,
 		`--region "us-east-1"`,
@@ -69,6 +70,34 @@ func TestBuildFleetWorkerBootstrapCommandIsShellSafe(t *testing.T) {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("bootstrap command missing %q; got: %s", want, cmd)
 		}
+	}
+}
+
+// TestBuildFleetWorkerBootstrapCommand_SyncsArtifactsBeforeInvokingWarmd
+// (calque#145 slice 2): the real gotcha this fix addresses — pool mode's
+// bootstrap command (buildWorkerBootstrapCommand) assumes warmd/runner.py
+// are ALREADY on a pre-baked AMI and never syncs anything from S3. Fleet
+// mode inherited that same bootstrap shape in slice 1, but fleetRun's
+// existing single-shard path (BootstrapConfig.Command) builds+uploads
+// warmd fresh every run and needs no pre-baked AMI — so the fleet worker
+// bootstrap must sync artifactS3URI onto the worker BEFORE invoking
+// `warmd fleet`, or every worker fails to boot (no warmd binary present).
+func TestBuildFleetWorkerBootstrapCommand_SyncsArtifactsBeforeInvokingWarmd(t *testing.T) {
+	cmd := buildFleetWorkerBootstrapCommand("run-abc", "us-east-1", "s3://calque-bucket/fleet/run-abc/artifacts", "/tmp/calque-fleet", "/tmp/calque-fleet/runner.py", "1m", 900)
+
+	syncIdx := strings.Index(cmd, "aws s3 cp --recursive s3://calque-bucket/fleet/run-abc/artifacts")
+	if syncIdx < 0 {
+		t.Fatalf("bootstrap command does not sync the artifact S3 URI at all; got: %s", cmd)
+	}
+	warmdIdx := strings.Index(cmd, "warmd fleet")
+	if warmdIdx < 0 {
+		t.Fatalf("bootstrap command never invokes warmd fleet; got: %s", cmd)
+	}
+	if syncIdx > warmdIdx {
+		t.Errorf("artifact sync must happen BEFORE warmd fleet is invoked (a fresh worker has no warmd binary until synced); got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "chmod +x /tmp/calque-fleet/warmd") {
+		t.Errorf("bootstrap command must chmod +x the synced warmd binary; got: %s", cmd)
 	}
 }
 

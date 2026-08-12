@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/spore-host/lagotto/pkg/failure"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
+	calpool "github.com/spore-host/calque/internal/pool"
 	"github.com/spore-host/calque/internal/target"
 )
 
@@ -161,18 +163,100 @@ func fleetRun(o realOpts, shards int) (err error) {
 	rawCeiling, qerr := plan.QuotaCeiling(ctx, cfg, o.instance, o.region, o.spot)
 	ceiling := resolveFleetCeiling(safeRep, o.model, o.instance, o.region, o.spot, shards, rawCeiling, qerr)
 
-	// D2: launch every shard's acquire+bootstrap concurrently, bounded by the
-	// quota ceiling (calque#141) — a buffered-channel semaphore instead of
-	// unbounded fan-out. When ceiling >= shards this is unchanged behavior
-	// (every shard launches at once); when it's less, shards launch in WAVES
-	// (ceiling-many at a time, topping up as earlier shards' instances
-	// terminate) instead of firing all N acquisitions in parallel and letting
-	// the excess fail.
+	// D2 (calque#145 slice 2): provision `ceiling` WORKERS once, keep them
+	// warm across every shard they serve, instead of a fresh acquire+
+	// bootstrap PER SHARD (today's runWaves-based fan-out, still used below
+	// for D4's re-drive fallback only). Bootstrap cost (docker pull, model
+	// load) now amortizes across every shard a given worker drains, closing
+	// the actual gap calque#145 tracks.
 	measurements := make([]measure.Measurement, len(shs))
 	shardErrs := make([]error, len(shs))
-	runWaves(ceiling, len(shs), func(i int) {
-		measurements[i], shardErrs[i] = runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep)
-	})
+	sqsClient := sqs.NewFromConfig(cfg)
+	// The queue must exist before any worker boots and tries to OpenRunQueue
+	// it — mirrors calque pool create's own create-queue-before-provision
+	// ordering (cmd/calque/pool.go's poolCreateCmd).
+	if _, err := calpool.CreateRunQueue(ctx, sqsClient, o.runID, defaultVisibilityTimeout); err != nil {
+		return fmt.Errorf("create run queue: %w", err)
+	}
+	fleetCfg := calpool.FleetCreateConfig{
+		RunID: o.runID, Region: o.region, InstanceType: o.instance,
+		Workers: ceiling, MinViable: ceiling, // slice 2: require ALL requested workers, not best-effort
+		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
+		TTL: o.ttl, IdleTimeout: fleetWorkerIdleTimeout.String(),
+		VisibilityTimeout: defaultVisibilityTimeout,
+		ManifestBucket:    o.bucket, ResultsBucket: o.bucket,
+		ArtifactS3URI: fmt.Sprintf("s3://%s/%s", o.bucket, sharedLayout.ArtifactPfx),
+		WorkerDir:     hostWorkerDir, RunnerPath: hostWorkerDir + "/runner.py",
+		AMI: o.ami,
+	}
+	if err := calpool.ProvisionFleetWorkers(ctx, spawnClient, fleetCfg); err != nil {
+		_ = calpool.DeleteRunQueueIfExists(ctx, sqsClient, o.runID) // nothing to drain — provisioning itself failed
+		return fmt.Errorf("provision fleet workers: %w", err)
+	}
+	fmt.Printf("[fleet] %d worker(s) ready for run %s\n", ceiling, o.runID)
+	defer func() {
+		fmt.Printf("[fleet] tearing down %d worker(s) for run %s...\n", ceiling, o.runID)
+		if derr := calpool.DrainFleetWorkers(context.Background(), spawnClient, o.runID, o.region); derr != nil {
+			fmt.Fprintf(os.Stderr, "[fleet] WARNING: drain fleet workers failed for run %s: %v (workers' own TTL will reap)\n", o.runID, derr)
+		}
+		if derr := calpool.DeleteRunQueueIfExists(context.Background(), sqsClient, o.runID); derr != nil {
+			fmt.Fprintf(os.Stderr, "[fleet] WARNING: delete run queue failed for run %s: %v (12h retention will reap)\n", o.runID, derr)
+		}
+	}()
+
+	q, err := calpool.OpenRunQueue(ctx, sqsClient, o.runID)
+	if err != nil {
+		return fmt.Errorf("open just-created run queue: %w", err)
+	}
+	// Fleet-pool acquire cost is a per-RUN fixed cost (ceiling workers'
+	// worth of provisioning), not attributable to any one shard — mirrors
+	// poolsubmit.go's emitKForPoolClaim precedent (AcquireSeconds: 0 for a
+	// pool submission). Leaked once, loudly, since — unlike a persistent
+	// pool amortizing this over its whole lifetime — a fleet run's pool is
+	// short-lived (one run), so the omission is proportionally bigger.
+	safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
+		"fleet-pool K under-reports acquire-wait cost: %d worker(s)' real acquisition time is not folded into any shard's AcquireWaitSeconds (reported as 0, calque#145) — a known simplification, revisit if K needs to be exact for a specific run", ceiling)
+	var wg sync.WaitGroup
+	for i := range shs {
+		if err := calexec.WriteManifestBody(ctx, s3c, calexec.RunLayout{
+			Bucket: o.bucket, ArtifactPfx: sharedLayout.ArtifactPfx,
+			ManifestKey: shs[i].ManifestKey, ResultPrefix: shs[i].ResultPrefix, SummaryKey: shs[i].SummaryKey, LogKey: shs[i].LogKey,
+		}, shardBody, hostWorkerDir, shs[i].Items, nil, nil); err != nil {
+			shardErrs[i] = fmt.Errorf("shard %d write manifest: %w", shs[i].ID, err)
+			continue
+		}
+		manifestURI := fmt.Sprintf("s3://%s/%s", o.bucket, shs[i].ManifestKey)
+		// Model MUST equal o.runID, matching runFleetWorker's Config.Model
+		// (cmd/warmd/main.go) — a fleet worker only ever knows its run id,
+		// not a separate "model." Setting this to o.model here (the
+		// poolsubmit.go-style field name) would silently drop every claim:
+		// Worker.runOne's affinity check (ref.Model != w.Config.Model) acks
+		// and discards a mismatched claim rather than running it.
+		if err := q.Submit(ctx, calpool.ClaimRef{RunID: o.runID, Model: o.runID, ManifestURI: manifestURI}); err != nil {
+			shardErrs[i] = fmt.Errorf("shard %d submit claim: %w", shs[i].ID, err)
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// No LogKey here (unlike runShard's dedicated-instance case): a
+			// worker's bootstrap failure is a WORKER-level concern, already
+			// caught by ProvisionFleetWorkers' MinViable check before any
+			// shard is even submitted — there is no per-shard bootstrap log
+			// to fast-fail against once a claim is in flight.
+			shardLayout := calexec.RunLayout{
+				Bucket: o.bucket, ResultPrefix: shs[i].ResultPrefix, SummaryKey: shs[i].SummaryKey,
+			}
+			summaryBytes, werr := calexec.WaitForSummary(ctx, s3c, shardLayout, o.deadline, 15*time.Second, nil)
+			if werr != nil {
+				shardErrs[i] = fmt.Errorf("shard %d wait summary: %w", shs[i].ID, werr)
+				return
+			}
+			m, merr := measurementFromPoolSummary(ctx, s3c, o, shs[i], summaryBytes)
+			measurements[i], shardErrs[i] = m, merr
+		}(i)
+	}
+	wg.Wait()
 
 	// D4: fleet-level partial-failure re-drive, through the SAME quota
 	// ceiling (calque#141) rather than firing every failed shard's re-drive
@@ -234,11 +318,14 @@ func fleetRun(o realOpts, shards int) (err error) {
 }
 
 // resolveFleetCeiling turns a QuotaCeiling query result into the concurrency
-// ceiling fleetRun should actually use (calque#141). A query failure doesn't
-// block the run — it leaks the failure and falls back to `shards` unclamped
-// (today's pre-#141 behavior); a ceiling that already covers every requested
-// shard is also left unclamped (no waves needed); only a genuine shortfall
-// triggers wave-based launching, logged both as a leak and to stdout.
+// ceiling fleetRun should actually use (calque#141) — now the WORKER-POOL
+// size D2 provisions (calque#145 slice 2; D4's re-drive fallback still
+// treats it as a runWaves concurrency bound, unchanged). A query failure
+// doesn't block the run — it leaks the failure and falls back to `shards`
+// unclamped (today's pre-#141 behavior); a ceiling that already covers
+// every requested shard is also left unclamped (no pool-size clamping
+// needed); only a genuine shortfall triggers clamping, logged both as a
+// leak and to stdout.
 func resolveFleetCeiling(rep *syncReport, model, instance, region string, spot bool, shards, rawCeiling int, qerr error) int {
 	switch {
 	case qerr != nil:
@@ -251,9 +338,9 @@ func resolveFleetCeiling(rep *syncReport, model, instance, region string, spot b
 			market = "spot"
 		}
 		rep.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, model, 0,
-			"requested %d shards but %s quota headroom in %s supports %d concurrent %s instance(s); launching in waves of %d (calque#141)",
+			"requested %d shards but %s quota headroom in %s supports %d concurrent %s instance(s); provisioning %d worker(s) to serve them (calque#141/#145)",
 			shards, market, region, rawCeiling, instance, rawCeiling)
-		fmt.Printf("[fleet] quota ceiling: %d concurrent (requested %d) — launching in waves\n", rawCeiling, shards)
+		fmt.Printf("[fleet] quota ceiling: %d concurrent (requested %d shards) — provisioning %d worker(s)\n", rawCeiling, shards, rawCeiling)
 		return rawCeiling
 	default:
 		return shards // fits entirely, no clamping needed, unchanged behavior
@@ -321,6 +408,13 @@ func redriveBackoff(err error) time.Duration {
 // and internal/pool/pool.go's heartbeatInterval package-var-for-testability
 // pattern already used elsewhere in this codebase.
 var fleetSleep = time.Sleep
+
+// fleetWorkerIdleTimeout (calque#145 slice 2) is short, like warmd fleet's
+// own default (cmd/warmd/main.go's fleetWorkerDefaultIdleTimeout) — a fleet
+// run submits every shard's claim upfront (D2 above), so once a worker's
+// queue goes empty there is no future submission worth waiting on the way
+// a long-lived pool's IdleTimeout is sized for.
+const fleetWorkerIdleTimeout = 1 * time.Minute
 
 // runShard acquires ONE instance for a shard, writes its manifest, drives warmd,
 // waits for the summary, and returns the shard's Measurement. Deferred terminate so
@@ -399,6 +493,62 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 	}, nil
 }
 
+// measurementFromPoolSummary builds a shard's D5 measure.Measurement from a
+// WORKER-POOL claim's completion summary (calque#145 slice 2) — the D2
+// counterpart to runShard's own tail (used only by D4's dedicated-instance
+// re-drive fallback, unchanged). warmd fleet workers write calpool.Summary
+// (WarmHit/EnterSecondsPaid, internal/pool/s3.go), NOT warmd's plain
+// per-run Summary (EnterSeconds/PerItemSecs) runShard parses — a real gap:
+// unmarshaling a pool claim's summary into runShard's shape would silently
+// zero-value every field. Per-item timing has no home in calpool.Summary at
+// all (it carries no per-item series), so it's derived from the shard's own
+// collected S3 results instead — mirroring poolsubmit.go's emitKForPoolClaim
+// precedent exactly (calque#102).
+func measurementFromPoolSummary(ctx context.Context, s3c *s3.Client, o realOpts, sh calexec.Shard, summaryBytes []byte) (measure.Measurement, error) {
+	var summary calpool.Summary
+	if err := json.Unmarshal(summaryBytes, &summary); err != nil {
+		return measure.Measurement{}, fmt.Errorf("shard %d decode pool summary: %w", sh.ID, err)
+	}
+	results, _, err := calexec.Collect(ctx, s3c, o.bucket, sh.ResultPrefix, 0)
+	if err != nil {
+		return measure.Measurement{}, fmt.Errorf("shard %d collect for measurement: %w", sh.ID, err)
+	}
+	perItemSecs := make([]float64, len(results))
+	for i, r := range results {
+		perItemSecs[i] = r.Seconds
+	}
+	return measurementFromPoolSummaryFields(summary, perItemSecs, o.instance), nil
+}
+
+// measurementFromPoolSummaryFields is measurementFromPoolSummary's pure
+// core (no ctx/S3), factored out for unit-testability — the actual D5 fix
+// logic (calque#145) lives entirely here.
+func measurementFromPoolSummaryFields(summary calpool.Summary, perItemSecs []float64, instance string) measure.Measurement {
+	return measure.Measurement{
+		CardAskedFor: "H100", InstanceUsed: instance,
+		PerItem: measure.Aggregate(perItemSecs),
+		Occupancy: measure.OccupancySummary{
+			MeanOccupancy: summary.Occupancy.MeanOccupancy, Samples: summary.Occupancy.Samples,
+			Source: summary.Occupancy.Source, Measured: summary.Occupancy.Measured,
+			Scope: summary.Occupancy.ScopeOrWholeRun(),
+		},
+		// EnterSeconds is THE fix (calque#145): EnterSecondsPaid is 0 on a
+		// warm hit (this worker was already loaded when it claimed this
+		// shard) and only non-zero for whichever claim actually triggered
+		// @enter. Summing this across shards (measure.FleetFold, unchanged)
+		// now correctly totals to `ceiling` workers' worth of load cost,
+		// not `len(shs)` shards' worth — today's bug, inherited if this
+		// read summary.EnterSeconds (a dedicated single-shard process's OWN
+		// full, always-nonzero paid cost) the way runShard's tail does.
+		EnterSeconds: summary.EnterSecondsPaid,
+		// AcquireWaitSeconds is 0 here by design — see the leak emitted
+		// once in fleetRun's D2 (calque#145): the real acquire cost is a
+		// per-RUN fixed cost (ceiling workers' provisioning), not
+		// attributable to any single shard.
+		AcquireWaitSeconds: 0,
+	}
+}
+
 // emitFleetK folds the per-instance measurements (D5) and emits one fleet K.
 func emitFleetK(o realOpts, perInstance []measure.Measurement, priceHr float64) error {
 	rates, err := cost.LoadRates(o.ratesFP)
@@ -418,7 +568,7 @@ func emitFleetK(o realOpts, perInstance []measure.Measurement, priceHr float64) 
 		AcquireSeconds: agg.AcquireWaitSeconds, EnterSeconds: agg.EnterSeconds,
 		OccupancyScope: agg.Occupancy.ScopeOrWholeRun(),
 	}}
-	fmt.Printf("\n--- cost model (§9) — FLEET of %d instances, MEASURED ---\n", len(perInstance))
+	fmt.Printf("\n--- cost model (§9) — FLEET of %d shard(s), MEASURED ---\n", len(perInstance))
 	verdict, verr := model.Verdict(o.n)
 	switch {
 	case verr == cost.ErrNoComputeMeasured:
@@ -428,7 +578,9 @@ func emitFleetK(o realOpts, perInstance []measure.Measurement, priceHr float64) 
 	default:
 		fmt.Print(verdict)
 	}
-	fmt.Printf("Fleet K folds %d instances: Σacquire=%.0fs Σenter=%.0fs across %d items @ %.0f%% occ%s.\n",
+	// calque#145: len(perInstance) is now a SHARD count, not an instance/worker
+	// count (D2 shards can share a worker) — "shard(s)" avoids implying 1:1.
+	fmt.Printf("Fleet K folds %d shard(s): Σacquire=%.0fs Σenter=%.0fs across %d items @ %.0f%% occ%s.\n",
 		len(perInstance), agg.AcquireWaitSeconds, agg.EnterSeconds, agg.PerItem.Count, occFrac*100, proxyNote(occMeasured))
 	return nil
 }
