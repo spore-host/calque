@@ -35,9 +35,18 @@ import (
 
 // Manifest is the work order the control plane writes to S3; warmd reads it.
 type Manifest struct {
-	EnterBody    string                   `json:"enter_body"`
-	MethodBody   string                   `json:"method_body"`
-	MethodArg    string                   `json:"method_arg"`
+	EnterBody  string `json:"enter_body"`
+	MethodBody string `json:"method_body"`
+	MethodArg  string `json:"method_arg"`
+	// MethodArgs/Starmap/Extras/ExtraConsts mirror warm.Config's fields of
+	// the same name (calque#93/#139), threaded through so a real-AWS run
+	// (calque#79 Part 1) can drive an arbitrary parsed script's picked warm
+	// unit — not just the hardcoded vLLM reference body — the same way
+	// dryRunWarm already does locally.
+	MethodArgs   []string                 `json:"method_args,omitempty"`
+	Starmap      bool                     `json:"starmap,omitempty"`
+	Extras       []warm.ExtraFunc         `json:"extras,omitempty"`
+	ExtraConsts  []warm.ExtraConst        `json:"extra_consts,omitempty"`
 	Items        []warm.Item              `json:"items"`
 	Bucket       string                   `json:"bucket"`
 	ResultPrefix string                   `json:"result_prefix"`
@@ -224,11 +233,14 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 	started := time.Now()
 	sink := &calexec.S3Sink{Client: s3c, Bucket: man.Bucket, Prefix: man.ResultPrefix}
 	sup := &warm.Supervisor{
-		Python:      pyOr(man.PythonBin),
-		Script:      man.RunnerPath,
-		Sink:        sink,
-		Leak:        stderrLeaker{},
-		Config:      warm.Config{EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg},
+		Python: pyOr(man.PythonBin),
+		Script: man.RunnerPath,
+		Sink:   sink,
+		Leak:   stderrLeaker{},
+		Config: warm.Config{
+			EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg,
+			MethodArgs: man.MethodArgs, Starmap: man.Starmap, Extras: man.Extras, ExtraConsts: man.ExtraConsts,
+		},
 		Concurrency: man.Concurrency,
 		BatchSize:   man.BatchSize,
 	}

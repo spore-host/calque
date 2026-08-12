@@ -16,6 +16,7 @@ import (
 
 	"github.com/spore-host/calque/internal/cost"
 	calexec "github.com/spore-host/calque/internal/exec"
+	"github.com/spore-host/calque/internal/gpu"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
@@ -106,21 +107,51 @@ func realRun(o realOpts) (err error) {
 	// .map()/.starmap() iterable when it's long enough; else (the default,
 	// --script unset) this is byte-identical to the pre-existing synthesized
 	// canned-sentence placeholder.
-	unit, _ := warmUnitForScript(ctx, o.script, rep)
+	app, unit, _ := warmUnitForScript(ctx, o.script, rep)
 	items := realOrSyntheticItems(unit, o.n, func(i int) any {
 		return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
 	}, rep)
-	if err := calexec.WriteManifest(ctx, s3c, layout, realEnterBody, realMethodBody, "prompt", hostWorkerDir, items); err != nil {
+	// calque#79 Part 1: when --script picked a REAL warm unit, ship ITS OWN
+	// body (plus any .starmap()/.local() shape) instead of always driving the
+	// hardcoded vLLM reference constants regardless of what the script does.
+	// unset --script (the default) reproduces prior behavior byte-for-byte.
+	hostMode := false
+	body := calexec.ManifestBody{EnterBody: realEnterBody, MethodBody: realMethodBody, MethodArg: "prompt"}
+	if scriptBody, ok := manifestBodyForUnit(app, unit, rep); ok {
+		if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
+			return err
+		}
+		// GPU guard parity with dry-run (run.go's swapLegal check, calque#7/§7):
+		// a real launch must refuse the same flagged multi-GPU/coupled swaps
+		// --dry-run does, rather than silently launching on a wrong-shaped
+		// instance — this path had no GPU guard at all before calque#79.
+		glog := gpu.RewriteApp(app, rep)
+		if !swapLegal(glog, unit.class.Name) {
+			return fmt.Errorf("gpu= swap for %q is FLAGGED (multi-GPU or coupled); out of single-node scope — see leak report", unit.class.Name)
+		}
+		body = scriptBody
+		hostMode = true // a parsed script's own body is typically not a vLLM/docker workload
+		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"real run driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
+	}
+	if err := calexec.WriteManifestBody(ctx, s3c, layout, body, hostWorkerDir, items, nil, nil); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
-	fmt.Printf("[3/8] wrote manifest (%d real prompts, vLLM @enter+@method)\n", o.n)
+	if hostMode {
+		fmt.Printf("[3/8] wrote manifest (%d items, %s's own @enter+@method)\n", o.n, unit.method.Name)
+	} else {
+		fmt.Printf("[3/8] wrote manifest (%d real prompts, vLLM @enter+@method)\n", o.n)
+	}
 
-	// Docker-mode bootstrap: pull vLLM, run --gpus all, pass the model via env, warmd
-	// drives the warm runner inside the container. CALQUE_MODEL is read by @enter.
+	// Docker-mode bootstrap (the default, unchanged): pull vLLM, run --gpus all,
+	// pass the model via env, warmd drives the warm runner inside the container.
+	// calque#79 Part 1: a --script-picked real unit runs HOST-MODE instead — its
+	// own body is typically a plain CPU/GPU function, not necessarily a vLLM
+	// inference call, mirroring spawnrun.go's runSpawnShard precedent.
 	boot := calexec.BootstrapConfig{
 		BaseImage: "vllm/vllm-openai:latest", Bucket: o.bucket, ArtifactPrefix: layout.ArtifactPfx,
 		ManifestKey: layout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
-		LogKey: layout.LogKey, HostMode: false, ModelEnv: o.model,
+		LogKey: layout.LogKey, HostMode: hostMode, ModelEnv: o.model,
 	}
 
 	// Price once via truffle (also R_a).

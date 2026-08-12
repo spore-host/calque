@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"strings"
 
+	calexec "github.com/spore-host/calque/internal/exec"
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/parse"
@@ -42,6 +44,54 @@ func realOrSyntheticItems(unit warmUnit, n int, synth func(i int) any, rep *leak
 	return items
 }
 
+// manifestBodyForUnit builds the calexec.ManifestBody a real-AWS run
+// (calque real/ramp/fleetrun, calque#79 Part 1) should ship for unit,
+// instead of always driving the hardcoded vLLM realEnterBody/realMethodBody
+// regardless of what --script actually parsed. ok is false when unit is the
+// zero warmUnit{} (--script unset, or its parse failed) — callers fall back
+// to their existing hardcoded body unchanged, exactly today's pre-#79
+// behavior.
+//
+// Mirrors dryRunWarm's (run.go) extras/starmap logic, MINUS its GPU-body
+// substitution: dry-run has no GPU, so it swaps in a CPU stand-in and leaks
+// the substitution; a real-AWS run legitimately runs unit's OWN body on
+// real hardware — there is nothing to substitute. checkInvokeSupport
+// should already have been called by the time this runs (mirroring run.go's
+// own pipeline order); this function does not re-check .starmap()
+// refusal — see run.go's checkInvokeSupport for that.
+func manifestBodyForUnit(app ir.App, unit warmUnit, rep *leak.Report) (calexec.ManifestBody, bool) {
+	if unit.method.Name == "" {
+		return calexec.ManifestBody{}, false // zero warmUnit{} — no script parsed, or its parse failed
+	}
+	arg := unit.method.ItemArg
+	if arg == "" {
+		arg = "item"
+	}
+	isStarmap := unit.method.Invoke == ir.InvokeStarmap
+	methodArgs := nonSelfArgs(unit.method.Args)
+	extras, extraConsts := collectLocalExtras(app, unit, rep)
+	if len(extras) > 0 {
+		names := make([]string, len(extras))
+		for i, e := range extras {
+			names[i] = e.Name
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"shipped %d sibling function(s): %s", len(extras), strings.Join(names, ", "))
+	}
+	if len(extraConsts) > 0 {
+		names := make([]string, len(extraConsts))
+		for i, e := range extraConsts {
+			names[i] = e.Name
+		}
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"shipped %d module-level constant(s) referenced via a bare name (calque#139): %s", len(extraConsts), strings.Join(names, ", "))
+	}
+	return calexec.ManifestBody{
+		EnterBody: unit.class.EnterBody, MethodBody: unit.method.Body, MethodArg: arg,
+		MethodArgs: methodArgs, Starmap: isStarmap, Extras: extras, ExtraConsts: extraConsts,
+	}, true
+}
+
 // warmUnitForScript parses scriptPath (when non-empty) and returns its
 // pickWarmUnit result, for the real-AWS execution paths (calque real/ramp/
 // fleetrun) that don't otherwise parse ANY Modal script — they drive a fixed,
@@ -56,18 +106,25 @@ func realOrSyntheticItems(unit warmUnit, n int, synth func(i int) any, rep *leak
 // closure. A parse error is reported via rep rather than failing the run —
 // this is a best-effort enrichment of the item batch, not a new hard
 // dependency for these commands.
-func warmUnitForScript(ctx context.Context, scriptPath string, rep *leak.Report) (warmUnit, bool) {
+// The returned ir.App is the zero value when ok is false (--script unset,
+// or its parse failed) — manifestBodyForUnit (calque#79 Part 1) needs the
+// parsed app alongside the picked unit to resolve collectLocalExtras'
+// .local()/free-ref closure, which warmUnitForScript's callers previously
+// had no reason to keep around since only items.go's realOrSyntheticItems
+// consumed the unit itself.
+func warmUnitForScript(ctx context.Context, scriptPath string, rep *leak.Report) (ir.App, warmUnit, bool) {
 	if scriptPath == "" {
-		return warmUnit{}, false
+		return ir.App{}, warmUnit{}, false
 	}
 	runner, runnerArgs := parse.DefaultRunner(pyastDir())
 	app, err := parse.Parse(ctx, scriptPath, rep, runner, runnerArgs...)
 	if err != nil {
 		rep.Addf(leak.PrimMap, leak.KindSemanticGap, scriptPath, 0,
 			"--script %q could not be parsed (%v); using synthesized placeholder items (calque#136)", scriptPath, err)
-		return warmUnit{}, false
+		return ir.App{}, warmUnit{}, false
 	}
-	return pickWarmUnit(app, "")
+	unit, ok := pickWarmUnit(app, "")
+	return app, unit, ok
 }
 
 // recommendedTarget builds the Target these real-AWS commands (real/ramp/

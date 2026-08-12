@@ -18,6 +18,7 @@ import (
 
 	"github.com/spore-host/calque/internal/cost"
 	calexec "github.com/spore-host/calque/internal/exec"
+	"github.com/spore-host/calque/internal/gpu"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
@@ -77,11 +78,34 @@ func fleetRun(o realOpts, shards int) (err error) {
 	// draw from --script's REAL .map()/.starmap() iterable when it's long enough,
 	// else the pre-existing synthesized placeholder (unchanged when --script is
 	// unset, the default).
-	unit, _ := warmUnitForScript(ctx, o.script, rep)
+	app, unit, _ := warmUnitForScript(ctx, o.script, rep)
 	allItems := realOrSyntheticItems(unit, o.n, func(i int) any {
 		return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
 	}, rep)
 	shs := calexec.ShardItems(allItems, shards)
+	// calque#79 Part 1: when --script picked a REAL warm unit, every shard
+	// ships ITS OWN body instead of always driving the hardcoded vLLM
+	// reference constants — computed ONCE here (parsing is shared across
+	// shards) and passed into each runShard call. Unset --script (the
+	// default) reproduces prior behavior byte-for-byte.
+	shardBody := calexec.ManifestBody{EnterBody: realEnterBody, MethodBody: realMethodBody, MethodArg: "prompt"}
+	shardHostMode := false
+	if scriptBody, ok := manifestBodyForUnit(app, unit, rep); ok {
+		if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
+			return err
+		}
+		// GPU guard parity with dry-run (run.go's swapLegal check, §7): refuse
+		// a flagged multi-GPU/coupled swap for the whole fleet rather than
+		// silently launching every shard on a wrong-shaped instance.
+		glog := gpu.RewriteApp(app, rep)
+		if !swapLegal(glog, unit.class.Name) {
+			return fmt.Errorf("gpu= swap for %q is FLAGGED (multi-GPU or coupled); out of single-node scope — see leak report", unit.class.Name)
+		}
+		shardBody = scriptBody
+		shardHostMode = true
+		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+			"fleet driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
+	}
 	for i := range shs {
 		mk, rp, sk, lk := calexec.ShardLayout(base, sharedLayout.ArtifactPfx, strconv.Itoa(shs[i].ID))
 		shs[i].ManifestKey, shs[i].ResultPrefix, shs[i].SummaryKey, shs[i].LogKey = mk, rp, sk, lk
@@ -147,7 +171,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	measurements := make([]measure.Measurement, len(shs))
 	shardErrs := make([]error, len(shs))
 	runWaves(ceiling, len(shs), func(i int) {
-		measurements[i], shardErrs[i] = runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
+		measurements[i], shardErrs[i] = runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep)
 	})
 
 	// D4: fleet-level partial-failure re-drive, through the SAME quota
@@ -172,7 +196,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 				fleetSleep(wait)
 			}
 			fmt.Fprintf(os.Stderr, "[fleet] shard %d failed (%v); re-driving once on a fresh instance\n", shs[i].ID, shardErrs[i])
-			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, safeRep)
+			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep)
 			measurements[i], shardErrs[i] = m, serr
 			if serr != nil {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
@@ -307,18 +331,18 @@ var fleetSleep = time.Sleep
 // called from concurrent goroutines (calque#134: a shared *target.Target
 // pointer across shards would race on that mutation).
 func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o realOpts,
-	sh calexec.Shard, places []plan.Placement, pricePerHr float64, baseTgt *target.Target, rep *syncReport) (measure.Measurement, error) {
+	sh calexec.Shard, places []plan.Placement, pricePerHr float64, baseTgt *target.Target, body calexec.ManifestBody, hostMode bool, rep *syncReport) (measure.Measurement, error) {
 	shardLayout := calexec.RunLayout{
 		Bucket: o.bucket, ArtifactPfx: "fleet/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
 	}
-	if err := calexec.WriteManifest(ctx, s3c, shardLayout, realEnterBody, realMethodBody, "prompt", hostWorkerDir, sh.Items); err != nil {
+	if err := calexec.WriteManifestBody(ctx, s3c, shardLayout, body, hostWorkerDir, sh.Items, nil, nil); err != nil {
 		return measure.Measurement{}, fmt.Errorf("shard %d write manifest: %w", sh.ID, err)
 	}
 	boot := calexec.BootstrapConfig{
 		BaseImage: "vllm/vllm-openai:latest", Bucket: o.bucket, ArtifactPrefix: shardLayout.ArtifactPfx,
 		ManifestKey: shardLayout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
-		LogKey: shardLayout.LogKey, HostMode: false, ModelEnv: o.model,
+		LogKey: shardLayout.LogKey, HostMode: hostMode, ModelEnv: o.model,
 	}
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",

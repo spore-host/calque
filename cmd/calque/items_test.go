@@ -117,3 +117,112 @@ func TestRecommendedTarget_FallsBackToDefaultCardForZeroUnit(t *testing.T) {
 		t.Errorf("Instance = %q, want %q", tgt.Instance, "g7e.2xlarge")
 	}
 }
+
+// TestManifestBodyForUnit_ZeroUnitReturnsNotOK (calque#79 Part 1): the zero
+// warmUnit{} (--script unset, or its parse failed) must report ok=false so
+// callers (realrun.go/fleetrun.go) fall back to their existing hardcoded
+// vLLM body — the regression guard for every pre-#79 caller.
+func TestManifestBodyForUnit_ZeroUnitReturnsNotOK(t *testing.T) {
+	rep := &leak.Report{}
+	_, ok := manifestBodyForUnit(ir.App{}, warmUnit{}, rep)
+	if ok {
+		t.Error("manifestBodyForUnit() ok = true, want false for the zero warmUnit{}")
+	}
+	if rep.Len() != 0 {
+		t.Errorf("expected no leak for the zero-unit case, got %d: %+v", rep.Len(), rep.Leaks)
+	}
+}
+
+// TestManifestBodyForUnit_CarriesRealBodyAndArg (calque#79 Part 1): a real
+// parsed unit's own EnterBody/MethodBody/ItemArg must ride through verbatim
+// — the actual fix for the gap where calque real/ramp/fleetrun always drove
+// a hardcoded vLLM body regardless of what --script parsed.
+func TestManifestBodyForUnit_CarriesRealBodyAndArg(t *testing.T) {
+	unit := warmUnit{
+		class:  ir.Class{EnterBody: "self.x = 1"},
+		method: ir.Function{Name: "transform", Body: "return item * 2", ItemArg: "item", Args: []string{"self", "item"}},
+	}
+	rep := &leak.Report{}
+	body, ok := manifestBodyForUnit(ir.App{}, unit, rep)
+	if !ok {
+		t.Fatal("manifestBodyForUnit() ok = false, want true for a real unit")
+	}
+	if body.EnterBody != "self.x = 1" {
+		t.Errorf("EnterBody = %q, want the unit's real @enter body", body.EnterBody)
+	}
+	if body.MethodBody != "return item * 2" {
+		t.Errorf("MethodBody = %q, want the unit's real @method body", body.MethodBody)
+	}
+	if body.MethodArg != "item" {
+		t.Errorf("MethodArg = %q, want %q", body.MethodArg, "item")
+	}
+	if body.Starmap {
+		t.Error("Starmap = true, want false for a plain .map()'d unit")
+	}
+}
+
+// TestManifestBodyForUnit_DefaultsItemArgWhenEmpty: a unit with no
+// ItemArg set (unusual, but not statically impossible) must default to
+// "item" — mirroring dryRunWarm's own identical fallback in run.go.
+func TestManifestBodyForUnit_DefaultsItemArgWhenEmpty(t *testing.T) {
+	unit := warmUnit{method: ir.Function{Name: "f", Body: "pass"}}
+	rep := &leak.Report{}
+	body, ok := manifestBodyForUnit(ir.App{}, unit, rep)
+	if !ok {
+		t.Fatal("manifestBodyForUnit() ok = false, want true")
+	}
+	if body.MethodArg != "item" {
+		t.Errorf("MethodArg = %q, want the default %q", body.MethodArg, "item")
+	}
+}
+
+// TestManifestBodyForUnit_StarmapCarriesFullArgList (calque#93): a
+// .starmap()'d unit must carry Starmap=true and its FULL non-self/cls arg
+// list, not just the first — the shape the runner's tuple-splat needs.
+func TestManifestBodyForUnit_StarmapCarriesFullArgList(t *testing.T) {
+	unit := warmUnit{
+		method: ir.Function{
+			Name: "combine", Body: "return a + b", ItemArg: "a",
+			Args: []string{"self", "a", "b"}, Invoke: ir.InvokeStarmap,
+		},
+	}
+	rep := &leak.Report{}
+	body, ok := manifestBodyForUnit(ir.App{}, unit, rep)
+	if !ok {
+		t.Fatal("manifestBodyForUnit() ok = false, want true")
+	}
+	if !body.Starmap {
+		t.Error("Starmap = false, want true for an ir.InvokeStarmap unit")
+	}
+	if len(body.MethodArgs) != 2 || body.MethodArgs[0] != "a" || body.MethodArgs[1] != "b" {
+		t.Errorf("MethodArgs = %v, want [a b] (self/cls filtered, full remaining list)", body.MethodArgs)
+	}
+}
+
+// TestManifestBodyForUnit_ShipsLocalExtrasAndLeaks (calque#92/#139): a unit
+// whose body references a sibling function via .local() must have that
+// sibling shipped as an Extra AND leak the shipment — the real-AWS
+// counterpart to dryRunWarm's identical local-extras handling.
+func TestManifestBodyForUnit_ShipsLocalExtrasAndLeaks(t *testing.T) {
+	app := ir.App{
+		Script:    "script.py",
+		Functions: []ir.Function{{Name: "helper", Args: []string{"x"}, Body: "return x + 1"}},
+	}
+	unit := warmUnit{
+		method: ir.Function{Name: "main", Body: "return helper.local(item)", ItemArg: "item", LocalCalls: []string{"helper"}},
+	}
+	rep := &leak.Report{}
+	body, ok := manifestBodyForUnit(app, unit, rep)
+	if !ok {
+		t.Fatal("manifestBodyForUnit() ok = false, want true")
+	}
+	if len(body.Extras) != 1 || body.Extras[0].Name != "helper" {
+		t.Fatalf("Extras = %+v, want one ExtraFunc named %q", body.Extras, "helper")
+	}
+	if rep.Len() != 1 {
+		t.Fatalf("expected exactly one leak reporting the shipped extra, got %d: %+v", rep.Len(), rep.Leaks)
+	}
+	if !strings.Contains(rep.Leaks[0].Detail, "helper") {
+		t.Errorf("leak detail %q should name the shipped sibling function", rep.Leaks[0].Detail)
+	}
+}

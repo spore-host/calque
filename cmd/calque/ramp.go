@@ -141,7 +141,14 @@ func runRamp(o rampOpts) (err error) {
 	// .map()/.starmap() iterable doesn't change between rungs (only how many
 	// of its items each rung's own --n draws from), and its GPU card (if any)
 	// is what the Target below should carry instead of always DefaultCard.
-	unit, _ := warmUnitForScript(ctx, o.script, rep)
+	// calque#79 Part 1 scope note: unlike real/fleetrun, ramp does NOT yet
+	// ship a --script-picked unit's OWN body — ramp's SessionPrep pulls the
+	// vLLM docker image unconditionally, before any script-driven host-vs-
+	// docker-mode decision could apply, and --batch-size's micro-batch body
+	// selection (below) would need to compose with a script-picked body too.
+	// Left as a follow-up; ramp's items/card DO already reflect --script
+	// (calque#134/#136), only the executed body doesn't yet.
+	_, unit, _ := warmUnitForScript(ctx, o.script, rep)
 
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: prep.PrepCommand(artifactPfx), TTL: o.ttl,

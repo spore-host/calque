@@ -19,20 +19,32 @@ import (
 // Manifest mirrors cmd/warmd.Manifest (the work order warmd reads from S3). Kept
 // here too so the control plane can WRITE it without importing package main.
 type Manifest struct {
-	EnterBody    string           `json:"enter_body"`
-	MethodBody   string           `json:"method_body"`
-	MethodArg    string           `json:"method_arg"`
-	Items        []warm.Item      `json:"items"`
-	Bucket       string           `json:"bucket"`
-	ResultPrefix string           `json:"result_prefix"`
-	SummaryKey   string           `json:"summary_key"`
-	PythonBin    string           `json:"python_bin"`
-	RunnerPath   string           `json:"runner_path"`
-	Occupancy    string           `json:"occupancy_path"`
-	VolumeSync   []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
-	VolumeCommit []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
-	Concurrency  int              `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
-	BatchSize    int              `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
+	EnterBody  string `json:"enter_body"`
+	MethodBody string `json:"method_body"`
+	MethodArg  string `json:"method_arg"`
+	// MethodArgs/Starmap/Extras/ExtraConsts mirror warm.Config's fields of the
+	// same name (calque#93/#139) — carried here so a real-AWS run (calque#79
+	// Part 1) can ship an arbitrary parsed script's picked warm unit (with
+	// its .starmap() tuple-splat args and sibling function/constant
+	// closure) through the S3 manifest, the same way dryRunWarm already
+	// does locally. Omitted (zero value) reproduces every pre-#79 manifest
+	// byte-for-byte, since none of calque real/ramp/fleetrun ever set them
+	// before this change.
+	MethodArgs   []string          `json:"method_args,omitempty"`
+	Starmap      bool              `json:"starmap,omitempty"`
+	Extras       []warm.ExtraFunc  `json:"extras,omitempty"`
+	ExtraConsts  []warm.ExtraConst `json:"extra_consts,omitempty"`
+	Items        []warm.Item       `json:"items"`
+	Bucket       string            `json:"bucket"`
+	ResultPrefix string            `json:"result_prefix"`
+	SummaryKey   string            `json:"summary_key"`
+	PythonBin    string            `json:"python_bin"`
+	RunnerPath   string            `json:"runner_path"`
+	Occupancy    string            `json:"occupancy_path"`
+	VolumeSync   []VolumeSyncSpec  `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
+	VolumeCommit []VolumeSyncSpec  `json:"volume_commit,omitempty"` // written back after @method drains (§E)
+	Concurrency  int               `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
+	BatchSize    int               `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
 }
 
 // VolumeSyncSpec tells warmd to `aws s3 sync <URI> <MountPath>` before @enter, so
@@ -102,18 +114,48 @@ func WriteManifest(ctx context.Context, c *s3.Client, l RunLayout, enterBody, me
 // syncs BACK to S3 after @method drains (Modal's volume.commit()). Kept as a
 // separate entry point so the common no-commit callers stay terse.
 func WriteManifestFull(ctx context.Context, c *s3.Client, l RunLayout, enterBody, methodBody, methodArg, workerDir string, items []warm.Item, volumeSync, volumeCommit []VolumeSyncSpec) error {
+	return writeManifest(ctx, c, l, ManifestBody{EnterBody: enterBody, MethodBody: methodBody, MethodArg: methodArg}, workerDir, items, volumeSync, volumeCommit)
+}
+
+// ManifestBody carries a warm unit's actual executable content — everything
+// warm.Config needs beyond items/volumes/concurrency knobs. Exists so a
+// caller with a real parsed script's picked unit (calque#79 Part 1: plain-
+// @app.function/`.starmap()`/`.local()`-chained real-AWS execution, not
+// just --dry-run) can ship its FULL shape — tuple-splat args, sibling
+// function/constant closure — through WriteManifestBody, instead of
+// WriteManifest's EnterBody/MethodBody/MethodArg-only signature, which
+// predates calque#93/#139 and has no way to carry them.
+type ManifestBody struct {
+	EnterBody   string
+	MethodBody  string
+	MethodArg   string
+	MethodArgs  []string         // calque#93: full .starmap() positional arg list
+	Starmap     bool             // calque#93: splat MethodArgs instead of binding MethodArg alone
+	Extras      []warm.ExtraFunc // calque#92/#139: sibling functions the body references
+	ExtraConsts []warm.ExtraConst
+}
+
+// WriteManifestBody is WriteManifestFull with a full ManifestBody instead of
+// just EnterBody/MethodBody/MethodArg — the real-AWS-execution counterpart
+// to dryRunWarm's local warm.Config construction (cmd/calque/run.go).
+func WriteManifestBody(ctx context.Context, c *s3.Client, l RunLayout, body ManifestBody, workerDir string, items []warm.Item, volumeSync, volumeCommit []VolumeSyncSpec) error {
+	return writeManifest(ctx, c, l, body, workerDir, items, volumeSync, volumeCommit)
+}
+
+func writeManifest(ctx context.Context, c *s3.Client, l RunLayout, body ManifestBody, workerDir string, items []warm.Item, volumeSync, volumeCommit []VolumeSyncSpec) error {
 	man := Manifest{
-		EnterBody: enterBody, MethodBody: methodBody, MethodArg: methodArg,
+		EnterBody: body.EnterBody, MethodBody: body.MethodBody, MethodArg: body.MethodArg,
+		MethodArgs: body.MethodArgs, Starmap: body.Starmap, Extras: body.Extras, ExtraConsts: body.ExtraConsts,
 		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: "python3", RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
 		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency, BatchSize: l.BatchSize,
 	}
-	body, err := json.Marshal(man)
+	buf, err := json.Marshal(man)
 	if err != nil {
 		return err
 	}
 	_, err = c.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(l.Bucket), Key: aws.String(l.ManifestKey), Body: bytes.NewReader(body),
+		Bucket: aws.String(l.Bucket), Key: aws.String(l.ManifestKey), Body: bytes.NewReader(buf),
 	})
 	return err
 }
