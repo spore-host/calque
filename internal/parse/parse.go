@@ -23,17 +23,22 @@ import (
 // ---- JSON contract emitted by tools/pyast/pyast.py ----
 
 type pyOut struct {
-	Script       string              `json:"script"`
-	AppName      string              `json:"app_name"`
-	Images       map[string]pyImage  `json:"images"`
-	Volumes      map[string]pyVolume `json:"volumes"`
-	Functions    []pyFunc            `json:"functions"`
-	Classes      []pyClass           `json:"classes"`
-	Entrypoints  []pyFunc            `json:"entrypoints"`
-	MapCalls     []pyMapCall         `json:"map_calls"`
-	InvokeCalls  []pyInvokeCall      `json:"invoke_calls"`
-	VolumeWrites []pyVolumeWrite     `json:"volume_writes"`
-	HelperLeaks  []map[string]any    `json:"helper_leaks"`
+	Script  string `json:"script"`
+	AppName string `json:"app_name"`
+	// AppKwargs holds App(volumes=..., secrets=...)'s own kwargs (calque#168)
+	// — a function/class declaring neither inherits from here. image= is
+	// deliberately absent: real per-function image RESOLUTION (not just an
+	// app-level fallback) is a separately-tracked gap, see resolveImage.
+	AppKwargs    map[string]json.RawMessage `json:"app_kwargs"`
+	Images       map[string]pyImage         `json:"images"`
+	Volumes      map[string]pyVolume        `json:"volumes"`
+	Functions    []pyFunc                   `json:"functions"`
+	Classes      []pyClass                  `json:"classes"`
+	Entrypoints  []pyFunc                   `json:"entrypoints"`
+	MapCalls     []pyMapCall                `json:"map_calls"`
+	InvokeCalls  []pyInvokeCall             `json:"invoke_calls"`
+	VolumeWrites []pyVolumeWrite            `json:"volume_writes"`
+	HelperLeaks  []map[string]any           `json:"helper_leaks"`
 	// ModuleConsts is every module-level `NAME = <literal-or-expression>`
 	// assignment, keyed by name (calque#139) — the shippable half of
 	// free-variable resolution besides Functions itself (a FreeRefs name may
@@ -352,6 +357,11 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	// dangling reference so the pick isn't mistaken for the function's real image.
 	flagUnresolvedImageRefs(out, script, rep)
 
+	// calque#168: App(volumes=..., secrets=...)'s own kwargs — a Function/Class
+	// declaring neither inherits from here (applied per-callable in buildFn/
+	// buildClass below). Previously silently dropped with NO leak at all.
+	app.DefaultVolumes, app.DefaultSecrets = resolveAppDefaults(out, script, rep)
+
 	// How is each callable invoked? (spec §13: "where .map() is called", §C: the
 	// other sync idioms .starmap/.for_each/.remote). The target of a call like
 	// `Chat().generate.map(...)` is the trailing attribute ("generate"); we key by
@@ -365,12 +375,17 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	items := mapItems(out)
 
 	for _, f := range out.Functions {
-		app.Functions = append(app.Functions, buildFn(f, script, rep, invokes, items))
+		fn := buildFn(f, script, rep, invokes, items)
+		applyAppDefaults(&fn.Volumes, &fn.Config.Secrets, app.DefaultVolumes, app.DefaultSecrets)
+		app.Functions = append(app.Functions, fn)
 	}
 	for _, c := range out.Classes {
-		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items))
+		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items, app.DefaultVolumes, app.DefaultSecrets))
 	}
 	for _, ep := range out.Entrypoints {
+		// @app.local_entrypoint() runs LOCALLY, not in a container — App-level
+		// volumes=/secrets= inheritance doesn't apply here (nothing to mount
+		// or inject into).
 		app.Entrypoints = append(app.Entrypoints, buildFn(ep, script, rep, invokes, items))
 	}
 
@@ -617,6 +632,43 @@ func decodeImageRef(raw json.RawMessage) (string, bool) {
 	return ref.Ref, true
 }
 
+// resolveAppDefaults decodes App(volumes=..., secrets=...)'s own kwargs
+// (calque#168) — a Function/Class declaring neither inherits these via
+// applyAppDefaults below. Before this, App-level volumes=/secrets= were
+// silently dropped with NO leak at all (worse than App(image=), which at
+// least surfaced a generic leak) — confirmed via a live repro:
+// `modal.App("t", secrets=[...], volumes={...})` with a plain
+// `@app.function()` declaring neither produced ZERO leaks.
+func resolveAppDefaults(out pyOut, script string, rep *leak.Report) (volumes map[string]string, secrets []string) {
+	if raw, ok := out.AppKwargs["volumes"]; ok {
+		if m, ok := decodeStringMap(raw); ok {
+			volumes = m
+		} else {
+			rep.Addf(leak.PrimVolume, leak.KindUnsupportedArg, script, 0,
+				"App(volumes=...): not a {str:str} map (%s)", string(raw))
+		}
+	}
+	if raw, ok := out.AppKwargs["secrets"]; ok {
+		secrets = decodeStringListBestEffort(raw)
+		rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, script, 0,
+			"App(secrets=%s): app-level default secrets recorded but NOT injected in the spike, same as a function's own secrets= — a payload needing them will fail unless every function/class that inherits this default also gets a matching --secret NAME=VALUE", string(raw))
+	}
+	return volumes, secrets
+}
+
+// applyAppDefaults fills volumes/secrets from the App-level defaults ONLY
+// when the callable (Function or Class) declares none of its own — the
+// same fallback-if-own-is-empty shape buildClass already used for a
+// method inheriting its class's gpu=/volumes=, extended one level up.
+func applyAppDefaults(volumes *map[string]string, secrets *[]string, defaultVolumes map[string]string, defaultSecrets []string) {
+	if *volumes == nil {
+		*volumes = defaultVolumes
+	}
+	if len(*secrets) == 0 {
+		*secrets = defaultSecrets
+	}
+}
+
 // flagUnresolvedImageRefs walks every function/class-level decorator's image=
 // kwarg and leaks loudly when it names a variable that never resolved to an
 // Image chain in out.Images (calque#76). Without this, resolveImage()'s pick
@@ -735,10 +787,13 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 	return fn
 }
 
-func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any) ir.Class {
+func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any, defaultVolumes map[string]string, defaultSecrets []string) ir.Class {
 	cls := ir.Class{Name: c.Name, Line: c.Lineno}
 	gpu, vols, timeout, cfg := readConfigKwargs(c.ClsKwargs, leak.PrimGPU, c.Name, script, c.Lineno, rep)
 	cls.GPU, cls.Volumes, cls.Timeout, cls.Config = gpu, vols, timeout, cfg
+	// calque#168: App-level volumes=/secrets= inherited if the CLASS itself
+	// declares none — before a method's own class->method fallback below.
+	applyAppDefaults(&cls.Volumes, &cls.Config.Secrets, defaultVolumes, defaultSecrets)
 	if c.Enter != nil {
 		cls.EnterBody = c.Enter.Body
 		for _, lc := range c.Enter.LocalCalls {
@@ -772,12 +827,17 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 	}
 	for _, m := range c.Methods {
 		method := buildFn(m, script, rep, invokes, items)
-		// A class method inherits the class's gpu/volumes if it declares none.
+		// A class method inherits the class's gpu/volumes/secrets if it
+		// declares none (calque#168 extends this existing pattern one level
+		// up: the class itself may have already inherited from the App).
 		if method.GPU == "" {
 			method.GPU = cls.GPU
 		}
 		if method.Volumes == nil {
 			method.Volumes = cls.Volumes
+		}
+		if len(method.Config.Secrets) == 0 {
+			method.Config.Secrets = cls.Config.Secrets
 		}
 		cls.Methods = append(cls.Methods, method)
 	}

@@ -19,10 +19,18 @@ type App struct {
 	// before @enter, never written back — matches Modal, where an
 	// uncommitted local write is never visible to another container).
 	CommittedVolumes map[string]bool
-	Functions        []Function // @app.function
-	Classes          []Class    // @app.cls
-	Entrypoints      []Function // @app.local_entrypoint (may be more than one)
-	Script           string     // source path, for leak attribution (§10)
+	// DefaultVolumes/DefaultSecrets are App(volumes=..., secrets=...)'s own
+	// kwargs (calque#168) — a Function/Class declaring neither inherits
+	// from here, the same fallback-if-own-is-empty shape buildClass already
+	// uses for a method inheriting its class's gpu=/volumes=. Before this,
+	// App-level volumes=/secrets= were silently dropped with NO leak at
+	// all — worse than image=, which at least surfaced a generic leak.
+	DefaultVolumes map[string]string
+	DefaultSecrets []string
+	Functions      []Function // @app.function
+	Classes        []Class    // @app.cls
+	Entrypoints    []Function // @app.local_entrypoint (may be more than one)
+	Script         string     // source path, for leak attribution (§10)
 	// EntrypointInvokes attributes invoke-kind evidence to the SPECIFIC
 	// @app.local_entrypoint() whose body contains the call site (calque#98):
 	// entrypoint name -> invoked callable's leaf name -> best InvokeKind seen

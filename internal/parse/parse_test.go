@@ -100,6 +100,67 @@ func TestParseVolumeCacheHasFunctionAndClass(t *testing.T) {
 	}
 }
 
+// TestParseAppLevelDefaultsInherited (calque#168) proves App(volumes=...,
+// secrets=...) actually reaches a Function/Class declaring neither — before
+// this fix, both were silently dropped with NO leak at all. Also proves a
+// callable with its OWN volumes= is NOT overwritten by the App-level
+// default, and that class-level inheritance chains correctly down to the
+// class's own method (App -> class -> method, extending the pre-existing
+// class -> method fallback one level up).
+func TestParseAppLevelDefaultsInherited(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/app_level_defaults.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if len(app.DefaultVolumes) != 1 || app.DefaultVolumes["/weights"] != "weights" {
+		t.Errorf("app.DefaultVolumes = %+v, want {/weights: weights}", app.DefaultVolumes)
+	}
+	if len(app.DefaultSecrets) == 0 {
+		t.Errorf("app.DefaultSecrets = %+v, want non-empty", app.DefaultSecrets)
+	}
+
+	plainFn, ok := app.FindFunction("plain_fn")
+	if !ok {
+		t.Fatal("plain_fn not found")
+	}
+	if plainFn.Volumes["/weights"] != "weights" {
+		t.Errorf("plain_fn.Volumes = %+v, want to inherit {/weights: weights} from the App", plainFn.Volumes)
+	}
+	if len(plainFn.Config.Secrets) == 0 {
+		t.Errorf("plain_fn.Config.Secrets = %+v, want to inherit the App's secrets", plainFn.Config.Secrets)
+	}
+
+	overriddenFn, ok := app.FindFunction("overridden_fn")
+	if !ok {
+		t.Fatal("overridden_fn not found")
+	}
+	if _, has := overriddenFn.Volumes["/weights"]; has {
+		t.Errorf("overridden_fn.Volumes = %+v, must NOT pick up the App default when it declares its own", overriddenFn.Volumes)
+	}
+	if overriddenFn.Volumes["/own"] == "" {
+		t.Errorf("overridden_fn.Volumes = %+v, want its own {/own: own-cache} preserved", overriddenFn.Volumes)
+	}
+
+	if len(app.Classes) != 1 {
+		t.Fatalf("classes = %+v, want exactly one (Scorer)", app.Classes)
+	}
+	scorer := app.Classes[0]
+	if scorer.Volumes["/weights"] != "weights" {
+		t.Errorf("Scorer.Volumes = %+v, want to inherit {/weights: weights} from the App", scorer.Volumes)
+	}
+	if len(scorer.Methods) != 1 || scorer.Methods[0].Name != "score" {
+		t.Fatalf("Scorer.Methods = %+v, want exactly one (score)", scorer.Methods)
+	}
+	if scorer.Methods[0].Volumes["/weights"] != "weights" {
+		t.Errorf("score.Volumes = %+v, want to inherit {/weights: weights} via Scorer (App -> class -> method)", scorer.Methods[0].Volumes)
+	}
+}
+
 // TestParsePortableConfig exercises the M6 B/C pass-through: portable kwargs land
 // in ir.Config, autoscaling kwargs are recognized-and-leaked (not silently
 // dropped), and the sync invocation idioms are classified beyond plain .map.

@@ -755,6 +755,16 @@ class Collector(ast.NodeVisitor):
         # against when walking each function/method body (see _describe_fn).
         self._module_names = module_names
         self.app_name: str | None = None
+        # app_kwargs holds App(...)'s own volumes=/secrets= (calque#168) — a
+        # function/class that declares neither inherits from here (the same
+        # fallback-if-own-is-empty pattern buildClass already uses for a
+        # method's own gpu=/volumes= inheriting from its class). image= is
+        # deliberately NOT captured here: real per-function image RESOLUTION
+        # (not just app-level fallback) is a larger, separately-tracked gap
+        # (resolveImage picks one image var for the whole script) — see the
+        # existing App(image=) leak below, now made more specific instead of
+        # silently joining the same bucket as volumes=/secrets=.
+        self.app_kwargs: dict[str, Any] = {}
         self.functions: list[dict[str, Any]] = []
         self.classes: list[dict[str, Any]] = []
         self.entrypoints: list[dict[str, Any]] = []
@@ -787,10 +797,20 @@ class Collector(ast.NodeVisitor):
             if val.args:
                 self.app_name = _const_str(val.args[0]) or self.app_name
             kw = _decorator_kwargs(val, self.leaks)
-            if "image" in kw:  # App(image=...) — note it
+            if "image" in kw:  # App(image=...) — note it (real inheritance not built, see Collector.app_kwargs)
                 self.leaks.append(
-                    {"where": "App(image=)", "detail": "app-level default image", "lineno": node.lineno}
+                    {
+                        "where": "App(image=)",
+                        "detail": "app-level default image is NOT inherited by any function/class lacking its own image= "
+                        "(unlike volumes=/secrets=, calque#168) — a function relying on this default silently "
+                        "gets no image at all",
+                        "lineno": node.lineno,
+                    }
                 )
+            if "volumes" in kw:
+                self.app_kwargs["volumes"] = kw["volumes"]
+            if "secrets" in kw:
+                self.app_kwargs["secrets"] = kw["secrets"]
         # image = modal.Image.debian_slim().pip_install(...)
         chain = _walk_image_chain(val) if isinstance(val, ast.Call) else None
         if chain is not None:
@@ -1155,6 +1175,7 @@ def analyze(path: str) -> dict[str, Any]:
     return {
         "script": path,
         "app_name": c.app_name,
+        "app_kwargs": c.app_kwargs,
         "images": c.images,
         "volumes": c.volumes,
         "functions": c.functions,
