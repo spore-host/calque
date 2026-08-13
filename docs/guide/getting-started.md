@@ -1,6 +1,6 @@
 # Getting started
 
-**Status:** Authoritative current behavior. Verified through: v0.3.1.
+**Status:** Authoritative current behavior. Verified through: v0.4.0.
 
 This walks from a fresh clone to your first REAL, billable AWS run — the path
 [`examples/README.md`](../../examples/README.md) deliberately stops short of

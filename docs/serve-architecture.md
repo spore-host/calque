@@ -1,6 +1,6 @@
 # Design note: serve entrypoints on AWS (F3 — build deferred)
 
-**Status:** Authoritative current behavior. Verified through: v0.3.1 —
+**Status:** Authoritative current behavior. Verified through: v0.4.0 —
 serve is STILL not built; this decision record's own claim remains true.
 Serve is DETECTED + gated/leaked in the spike (M9/F1,
 F2), but the long-lived server is **not built** — the spike targets batch `.map()`

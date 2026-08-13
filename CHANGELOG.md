@@ -9,6 +9,103 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-13
+
+7 commits since v0.3.1: every calque-launched EC2 instance is now tagged
+with run-id/ownership metadata (closing a real "which instance was this"
+gap), a real IAM cross-run race is fixed, and a real silent-data-loss
+parser bug (App-level `volumes=`/`secrets=` defaults vanishing with zero
+leak at all) is fixed — plus a CI hardening pass (Action SHA pinning,
+Markdown link-validation) and a docs staleness sweep. Minor bump: one new
+capability (EC2 tagging) and a correctness fix that previously produced
+silently-wrong output are more than housekeeping.
+
+### Added
+
+- **Every calque-launched EC2 instance now tagged with run-id/ownership
+  metadata** (calque#166; 459a646): every launch path (`real`, `ramp`,
+  `smoke`, fleet's D4 dedicated-instance fallback, `spawn-run`, `pool`,
+  fleet workers) now stamps `calque:run-id`, `calque:managed=true`,
+  `calque:command`, and `calque:created-at` on the instance it acquires —
+  previously NO launch path tagged instances at all beyond spawn's own
+  internal `spawn:*` tags, so an interrupted run's orphaned instance was
+  only findable by launch time/instance type (`docs/guide/
+  troubleshooting.md`'s own documented workaround, now fixed).
+  `internal/plan/spawn.go`'s `SpawnLauncher` gains `RunID`/`Command`
+  fields; `internal/pool`'s worker/fleet provisioning paths (which build
+  `spawnaws.LaunchConfig` directly, not via `SpawnLauncher`) gain the same
+  tags alongside their existing `calque:pool-model`/`calque:fleet-run`/
+  `calque:role` tags. `docs/guide/troubleshooting.md`'s interrupted-run
+  section now filters by `Name=tag:calque:run-id` (or `calque:managed` for
+  "which run was this") instead of the old launch-time/instance-type
+  guess.
+
+### Fixed
+
+- **calque's real-run IAM role is now scoped per-bucket, not one shared
+  role** (calque#167; 982eabb): the single-instance real-run path shared
+  ONE role name (`calque-real-run`) across every bucket ever passed to
+  `--bucket` — since IAM's `PutRolePolicy` replaces a role's inline policy
+  document wholesale rather than merging it, two overlapping real runs
+  against DIFFERENT buckets could race: the later run's launch silently
+  revokes the earlier run's still-in-flight S3 access, non-deterministically
+  depending on exact timing. Not previously demonstrated as a live
+  incident, but a real gap implied directly by the documented
+  shared-mutable-role design. `roleNameForBucket` now derives a stable
+  per-bucket role name (`calque-real-run-<8-byte SHA-256 hex>`); two runs
+  against different buckets now use two different, never-colliding roles
+  by construction. Two runs against the SAME bucket still correctly share
+  one role, unchanged.
+
+- **App-level `volumes=`/`secrets=` defaults are now inherited by a
+  Function/Class declaring neither, instead of silently dropped**
+  (calque#168; 3c6bb8c): `modal.App("t", secrets=[api_key],
+  volumes={"/w": weights})` paired with a plain `@app.function()`
+  declaring neither previously produced ZERO leaks at all — not even the
+  generic leak `App(image=...)` at least got — exactly the silently-wrong
+  output calque's "recognize and leak, never silently drop" philosophy
+  exists to prevent. `tools/pyast/pyast.py` already extracted `App(...)`'s
+  own `volumes=`/`secrets=` into a dict but only ever read the `image` key
+  back out; the other two were captured then discarded. `ir.App` gains
+  `DefaultVolumes`/`DefaultSecrets`; `applyAppDefaults` fills a
+  Function/Class's own `Volumes`/`Config.Secrets` ONLY when it declares
+  neither, mirroring the existing class→method fallback shape one level
+  up (App → class/function). A callable with its OWN `volumes=`/`secrets=`
+  is never overwritten; entrypoints are excluded (they run locally, not in
+  a container). `realrun.go`'s existing "which declared secrets weren't
+  covered by `--secret`" leak automatically benefits with zero additional
+  code.
+
+- **Smoke-run cost wording is now region/time-independent** (fix#169;
+  0645a09): `docs/guide/getting-started.md`'s "this costs a few cents"
+  baked in a price assumption that wouldn't stay accurate as AWS pricing
+  or calque's default instance choice changes.
+
+### Changed
+
+- **Docs sweep for stale status claims; `Verified through:` banners
+  bumped to v0.3.1** (63571c4): `docs/modal-compatibility-matrix.md` had
+  two rows describing already-closed issues (#97, #98) as open gaps;
+  fixed to reflect shipped state. Everything else the sweep's phrase list
+  matched was independently reconfirmed still accurate and left
+  unchanged.
+
+### CI
+
+- **GitHub Actions pinned to commit SHAs; Dependabot added for the
+  `github-actions` ecosystem** (calque#171; 1e275c7): every `uses:` line
+  was pinned by floating major/minor version tag, not a commit SHA —
+  calque's own `SECURITY.md` already treats supply-chain compromise as a
+  real concern for a tool that handles AWS credentials and launches cloud
+  infrastructure. `.github/dependabot.yml` (weekly) keeps SHA pins from
+  going stale silently.
+- **Markdown link-validation job** (calque#170; 2c121e2): new CI job
+  (mirroring the existing per-concern job pattern — golangci-lint, ruff,
+  race, govulncheck) checks every relative link across README/
+  CONTRIBUTING/docs/examples resolves to a real file, via `lychee` in
+  offline mode (internal links only, to avoid flaky CI from external-host
+  rate limits).
+
 ## [0.3.1] - 2026-08-12
 
 5 commits since v0.3.0: housekeeping release -- no CLI behavior changes.
