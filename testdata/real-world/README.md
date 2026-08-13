@@ -50,6 +50,25 @@ find," not a "confirmed absent").
 | `modal_comfyui.py` | `caru-ini/modal-comfyui`, `comfyui.py` | GPU serve (`@modal.web_server` raw port) with memory-snapshot support (`enable_memory_snapshot`, two `@modal.enter(snap=True/False)`), current-era API | **NEW finding** — [calque#140](https://github.com/spore-host/calque/issues/140): image built across multiple reassigning statements (`image = image.env(...)`, later `image = image.add_local_dir(...)`) loses every earlier layer including the base; dry-run also crashes on a module-level helper (`wait_for_port`, the #139 pattern) inside `@enter` |
 | `fasthtml_modal_deploy.py` | `arihanv/fasthtml-modal`, `deploy.py` | Minimal serve (`@asgi_app` wrapping a third-party, non-Modal `fasthtml_app` object imported from a sibling module) | Covered by the analyze pass (zero leaks — genuinely clean); directly hits the **NEW #139 finding** on dry-run (`fasthtml_app` is a bare imported name, not a `.local()` call, so it's out of `collectLocalExtras`'s scope entirely) |
 
+## Scripts, pass 2 (calque#150 torture-test — corpus expansion beyond AI-Almanac)
+
+Sourced via `gh api search/code` (working again this pass, unlike pass 1's
+documented GitHub code-search outage) plus direct `contents` fetches,
+targeting idioms neither AI-Almanac nor pass 1 exercised: multi-app
+composition, `**kwargs`-splat decorator args, `@modal.experimental.clustered`
+multi-node training, `modal.Dict`/`modal.Queue` used for real hot-path
+coordination (not just declared), and a function defined inside a factory
+function rather than at module scope. Full triage/ranking/predicted-findings
+detail lives in [calque#150](https://github.com/spore-host/calque/issues/150).
+
+| File | Origin (owner/repo, path) | Shape | Triage outcome |
+|---|---|---|---|
+| `earth_mover_forecast_datacube.py` | `earth-mover/forecast-datacube-demo`, `modal_hrrr.py` + `src/modal_app.py` + `src/lib_modal.py` (merged; `src/lib.py`'s 525 lines of non-Modal xarray/icechunk logic stubbed) | Batch, multi-app composition (`app.include(applib)`), every `@applib.function`/`@app.function` splats its ENTIRE kwarg set from a module dict (`**MODAL_FUNCTION_KWARGS`), `modal.Cron(...)` at real production frequency | Covered — `**kwargs`-splat is handled correctly (`_decorator_kwargs`'s existing `kw.arg is None` branch emits an honest "decorator uses **kwargs splat; args not statically visible" leak, confirmed NOT a bug); `App.include` hits the existing calque#91 leak; `Cron` hits the existing calque#91 leak. `--dry-run` fails fast on a real (non-calque) missing `dask` import — expected, this pipeline needs its full real dependency chain to execute |
+| `alphafast_af3_predict.py` | `RomeroLab/alphafast`, `modal/af3_predict.py` + `modal/config.py` (merged; CC-BY-NC-SA 4.0, header preserved) | `@cls`+`@modal.enter()`+plain-`@modal.method()` GPU inference at production scale, `modal.Dict`/`Queue.from_name()` as real hot-path data transfer, non-literal bare-Name `gpu=` | **NEW finding** — [calque#151](https://github.com/spore-host/calque/issues/151): a bare reference to a module constant holding `modal.Dict`/`Queue`/`NetworkFileSystem.from_name(...)` ships verbatim (calque#139's free-reference shipping) and crashes at runtime with a confusing Modal-SDK auth error, instead of an honest leak — confirmed via a minimal synthetic repro, not just this script. `InferenceWorker.warmup` (the method that never references the Dict/Queue) dry-runs cleanly with 0 failed items once a `python` shim is on PATH (its `@enter` body shells to a literal `"python"` — a real dependency on the AlphaFast container's own environment, not a calque bug) — confirmed as a viable Part E real-AWS target |
+| `avatarl_modal_train.py` | `tokenbender/avataRL`, `modal_train.py` | Multi-node distributed training, `@modal.experimental.clustered(n_nodes, rdma=)` stacked under `@app.function(gpu=...)`, f-string multi-GPU `gpu=` specs including an upgrade-pin+multi-GPU compound case (`f"H100!:{n_proc_per_node}"`) | **NEW finding** — [calque#152](https://github.com/spore-host/calque/issues/152): `@modal.experimental.clustered` has zero recognition anywhere in calque; a literal single-GPU `gpu=` stacked with `@modal.experimental.clustered(size=N)` passes the §7 coupling guard as `clean_swap`, silently missing that the workload is genuinely multi-node. Every occurrence in THIS script happens to also have a non-literal `gpu=` f-string masking the gap behind an existing leak — a synthetic repro was needed to isolate and confirm it. Parse/analyze only; no real-AWS attempt (needs actual multi-GPU H100/H200 nodes) |
+| `phosphobot_vllm_app.py` | `phospho-app/phosphobot`, `modal/vllm/app.py` | GPU serve, THREE decorators stacked on one function (`@app.function`+`@modal.concurrent(max_inputs=)`+`@modal.web_server(port=, startup_timeout=)`) | Covered — serve-shape detection (`leaves & _SERVE_DECOS`) correctly classifies this as serve despite the 3-way stack; refused gracefully per the documented non-goal, no new gap. `gpu=f"A100-80GB:{N_GPU}"` hits the existing non-literal-gpu leak |
+| `slaf_distributed.py` | `slaf-project/slaf`, `slaf/ml/distributed.py` | `@app.function(..., serialized=True, name=...)` decorating `distributed_prefetch_worker`, defined INSIDE the `create_app()` factory function rather than at module scope; `modal.Queue`/`Dict.from_name()` called inline inside the function body for real cross-worker coordination | Covered — confirmed pyast's recursive AST walk DOES find a function nested inside a factory function (was an open question in calque#150's plan); `distributed_prefetch_worker` is correctly picked as the warm unit, and its bare `import modal` reference is correctly shipped via calque#146. `--dry-run` fails fast on a real (non-calque) missing `slaf` import — expected, not attempted to resolve since real execution needs the actual `slaf` package + a live Modal Queue backend |
+
 ## Aggregate triage summary
 
 - **7 scripts sourced**, all real/production-shaped (real `requirements.txt`/
@@ -72,6 +91,41 @@ find," not a "confirmed absent").
   `docs/modal-compatibility-matrix.md` or issues already closed in prior
   passes (calque#76 through #98). No inflation: most of what these real
   scripts exercise, calque already handles or already knows it doesn't.
+
+## Aggregate triage summary, pass 2 (calque#150)
+
+- **5 scripts sourced**, all real/production-shaped, deliberately targeting
+  idioms neither AI-Almanac nor pass 1 exercised (multi-app composition,
+  `**kwargs`-splat decorators, `@modal.experimental.clustered`, real
+  Dict/Queue coordination, a function nested inside a factory function).
+- **2 genuinely new findings**, filed as calque#151/#152 — both confirmed
+  via a minimal synthetic repro before filing (per calque#150's Part A
+  decision gate), not just inferred from the real-world script alone, since
+  in both cases the real script's own occurrence happened to be masked by
+  an unrelated, already-known leak (a non-literal `gpu=` in avataRL's case;
+  `process_chunk` — the method that actually uses the Dict/Queue — being
+  out of this pass's real-AWS scope in alphafast's case). Neither is a
+  crash in calque itself — #151 is a confusing runtime error instead of an
+  honest leak; #152 is a silent incorrect verdict (the more serious of the
+  two, since §7's whole design premise is "never silently substitute across
+  a coupling signal").
+- **2 open questions from the plan resolved, both cleanly**: `**kwargs`-splat
+  decorator args are already handled correctly (`_decorator_kwargs`'s
+  existing `kw.arg is None` branch) — the plan's top-ranked predicted
+  finding did NOT confirm as a bug. A function nested inside a factory
+  function (`slaf`) IS correctly found and parsed by pyast's recursive AST
+  walk — also not a bug.
+- **One real-AWS target confirmed viable**: `alphafast_af3_predict.py`'s
+  `InferenceWorker.warmup` dry-runs with 0 failed items (once a `python`
+  shim is on PATH for its own `@enter` body's real dependency on that
+  binary existing — not a calque gap). This is calque#150 Part E's sole
+  planned real-AWS target; not yet attempted in this pass (Part A/B only).
+- **Everything else** — serve-shape detection under a 3-decorator stack,
+  `App.include`, `Cron` object form, non-literal `gpu=` (f-string and
+  bare-Name forms), autoscaling/secrets leaks — mapped cleanly onto rows
+  already tracked or issues already closed. No inflation: most of what
+  these real scripts exercise, calque already handles or already knows it
+  doesn't.
 
 ## Re-running this corpus
 
