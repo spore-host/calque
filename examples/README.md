@@ -175,13 +175,13 @@ cache instead of rebuilding it.
 
 ---
 
-## 6. Cross-app invocation — a real, permanent non-goal, honestly leaked
+## 6. Cross-app invocation — not currently supported, honestly leaked
 
 Not everything gets ported. `Function.from_name(...)`/`Cls.from_name(...)`
 look up an **already-deployed separate Modal app** by name — calque has no
-notion of a separately-deployed app to call into, so this is a deliberate,
-permanent non-goal rather than a bug to eventually fix. The point of this
-journey is what calque does INSTEAD of silently ignoring it or crashing.
+notion of a separately-deployed app to call into, so this is not currently
+supported. The point of this journey is what calque does INSTEAD of
+silently ignoring it or crashing.
 
 ```
 ./calque analyze examples/cross_app.py
