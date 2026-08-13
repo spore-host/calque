@@ -56,6 +56,14 @@ type realOpts struct {
 	// PATH) — for a picked unit whose real signature takes `bytes`.
 	// "" (the default) reproduces prior behavior byte-for-byte.
 	itemFile string
+	// entrypoint selects which @app.local_entrypoint() to drive when
+	// --script has more than one (mirrors run --dry-run's own
+	// --entrypoint, resolveEntrypoint) — previously real/ramp/fleetrun had
+	// no way to specify this at all. "" (the default) is only valid for a
+	// script with 0 or 1 entrypoints; ambiguous "" on 2+ becomes a leak +
+	// synthesized-placeholder fallback, matching warmUnitForScript's
+	// existing parse-failure fallback shape.
+	entrypoint string
 }
 
 // The real warm-unit bodies: actual vLLM. @enter loads the model ONCE; the
@@ -122,7 +130,7 @@ func realRun(o realOpts) (err error) {
 	// .map()/.starmap() iterable when it's long enough; else (the default,
 	// --script unset) this is byte-identical to the pre-existing synthesized
 	// canned-sentence placeholder.
-	app, unit, _ := warmUnitForScript(ctx, o.script, rep)
+	app, unit, _ := warmUnitForScript(ctx, o.script, o.entrypoint, rep)
 	var items []warm.Item
 	if o.itemFile != "" {
 		// calque real --item-file PATH: a REAL file's raw bytes as the

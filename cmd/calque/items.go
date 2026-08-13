@@ -149,7 +149,7 @@ func manifestBodyForUnit(app ir.App, unit warmUnit, rep *leak.Report) (calexec.M
 // .local()/free-ref closure, which warmUnitForScript's callers previously
 // had no reason to keep around since only items.go's realOrSyntheticItems
 // consumed the unit itself.
-func warmUnitForScript(ctx context.Context, scriptPath string, rep *leak.Report) (ir.App, warmUnit, bool) {
+func warmUnitForScript(ctx context.Context, scriptPath, entrypoint string, rep *leak.Report) (ir.App, warmUnit, bool) {
 	if scriptPath == "" {
 		return ir.App{}, warmUnit{}, false
 	}
@@ -160,7 +160,20 @@ func warmUnitForScript(ctx context.Context, scriptPath string, rep *leak.Report)
 			"--script %q could not be parsed (%v); using synthesized placeholder items (calque#136)", scriptPath, err)
 		return ir.App{}, warmUnit{}, false
 	}
-	unit, ok := pickWarmUnit(app, "")
+	// calque#79/#90: real/ramp/fleetrun previously had no way to pick an
+	// entrypoint at all — a multi-entrypoint script (e.g. AI-Almanac's
+	// blending_app.py, 7 entrypoints) silently defaulted to whichever
+	// pickWarmUnit("") happened to find first, with no error and no way
+	// to override it, unlike run --dry-run's own --entrypoint flag
+	// (resolveEntrypoint). entrypoint="" preserves prior behavior
+	// exactly for the single/no-entrypoint case.
+	epName, eerr := resolveEntrypoint(app, entrypoint)
+	if eerr != nil {
+		rep.Addf(leak.PrimMap, leak.KindSemanticGap, scriptPath, 0,
+			"--script %q: %v; using synthesized placeholder items (calque#136)", scriptPath, eerr)
+		return ir.App{}, warmUnit{}, false
+	}
+	unit, ok := pickWarmUnit(app, epName)
 	return app, unit, ok
 }
 

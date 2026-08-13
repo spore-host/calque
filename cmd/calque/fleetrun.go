@@ -80,7 +80,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	// draw from --script's REAL .map()/.starmap() iterable when it's long enough,
 	// else the pre-existing synthesized placeholder (unchanged when --script is
 	// unset, the default).
-	app, unit, _ := warmUnitForScript(ctx, o.script, rep)
+	app, unit, _ := warmUnitForScript(ctx, o.script, o.entrypoint, rep)
 	allItems := realOrSyntheticItems(unit, o.n, func(i int) any {
 		return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
 	}, rep)

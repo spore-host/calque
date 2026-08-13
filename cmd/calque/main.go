@@ -214,6 +214,7 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 	spot := fs.Bool("spot", false, "acquire on the Spot market (different capacity pool than on-demand; interruptible; K is then a SPOT rate)")
 	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
 	script := fs.String("script", "", "optional Modal script to parse for its REAL .map()/.starmap() iterable (calque#136); empty => today's synthesized-prompt items, unchanged")
+	entrypoint := fs.String("entrypoint", "", "which @app.local_entrypoint() to select when --script has more than one (mimics `modal run file.py::entrypoint`, calque#90); required if --script has 2+ entrypoints")
 	secrets := secretsFlag{}
 	fs.Var(secrets, "secret", "NAME=VALUE, repeatable — injected into the runner's environment before @enter runs (generic counterpart to Modal's secrets=[...], which was previously only recorded, never injected)")
 	itemFile := fs.String("item-file", "", "path to a file whose raw bytes become the SINGLE real item driven through the picked unit's body (e.g. for a `def f(input_bundle: bytes)` signature) — mutually exclusive with --n's synthesized/literal items")
@@ -222,12 +223,13 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 		return realOpts{}, 0, false, false, err
 	}
 	if *bucket == "" || *runID == "" {
-		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--secret NAME=VALUE] [--item-file PATH] --i-understand-this-spends-money")
+		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--entrypoint NAME] [--secret NAME=VALUE] [--item-file PATH] --i-understand-this-spends-money")
 	}
 	opts = realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
-		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script, secrets: secrets, itemFile: *itemFile,
+		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script, entrypoint: *entrypoint,
+		secrets: secrets, itemFile: *itemFile,
 	}
 	return opts, *shardsFlag, *poolFlag, *confirmFlag, nil
 }

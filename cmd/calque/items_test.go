@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -268,5 +271,92 @@ func TestItemFromFile_ReturnsOneItemWithExactBytes(t *testing.T) {
 func TestItemFromFile_MissingFileErrors(t *testing.T) {
 	if _, err := itemFromFile("/nonexistent/path/does-not-exist.bin"); err == nil {
 		t.Error("itemFromFile on a nonexistent path returned nil error, want an error")
+	}
+}
+
+// setPyastDirEnv points pyastDir() (main.go) at the real tools/pyast
+// directory for the duration of the test — warmUnitForScript calls
+// pyastDir() internally (unlike the free_refs_*_e2e_test.go tests, which
+// call parse.Parse directly with an explicit dir), so it needs the
+// CALQUE_PYAST_DIR env var set rather than a parameter, since `go test`'s
+// working directory is the package dir (cmd/calque), not the repo root
+// pyastDir()'s "tools/pyast" relative default assumes.
+func setPyastDirEnv(t *testing.T) {
+	t.Helper()
+	dir, err := filepath.Abs("../../tools/pyast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CALQUE_PYAST_DIR", dir)
+}
+
+// TestWarmUnitForScript_SelectsRequestedEntrypoint is the regression test
+// for the gap this session found running real/fleetrun against AI-Almanac's
+// blending_app.py (7 entrypoints): warmUnitForScript previously called
+// pickWarmUnit(app, "") unconditionally — real/ramp/fleetrun had NO way to
+// select an entrypoint at all, unlike run --dry-run's own --entrypoint
+// flag. A multi-entrypoint script either picked an arbitrary unit or (once
+// resolveEntrypoint's ambiguity error existed elsewhere) would have had no
+// path to supply the disambiguating name. Uses the real parser (shells out
+// to pyast) against the existing entrypoint_scoped_invoke.py fixture —
+// two entrypoints invoking two UNRELATED callables, the same shape
+// pickWarmUnitScopedToSelectedEntrypoint already proves at the ir.App
+// level; this proves the wiring from a script PATH + entrypoint STRING
+// down to the same correct result.
+func TestWarmUnitForScript_SelectsRequestedEntrypoint(t *testing.T) {
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Skip("uv not on PATH; skipping pyast contract test")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; skipping pyast contract test")
+	}
+	setPyastDirEnv(t)
+	script, err := filepath.Abs("../../testdata/scripts/entrypoint_scoped_invoke.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := &leak.Report{}
+
+	_, unit, ok := warmUnitForScript(context.Background(), script, "do_evaluate", rep)
+	if !ok {
+		t.Fatal("warmUnitForScript(do_evaluate) failed")
+	}
+	if !unit.plainFunction || unit.method.Name != "evaluate" {
+		t.Errorf("warmUnitForScript(do_evaluate) = %+v, want the plain function evaluate, NOT train_step", unit)
+	}
+
+	_, unit, ok = warmUnitForScript(context.Background(), script, "do_train", rep)
+	if !ok {
+		t.Fatal("warmUnitForScript(do_train) failed")
+	}
+	if unit.plainFunction || unit.class.Name != "Trainer" || unit.method.Name != "train_step" {
+		t.Errorf("warmUnitForScript(do_train) = %+v, want Trainer.train_step", unit)
+	}
+}
+
+// TestWarmUnitForScript_AmbiguousEntrypointFallsBackToSyntheticWithLeak
+// proves an unresolved-ambiguity script ("" requested, 2+ entrypoints)
+// degrades to the SAME synthesized-placeholder fallback as a parse
+// failure — a loud leak, not a silent arbitrary pick.
+func TestWarmUnitForScript_AmbiguousEntrypointFallsBackToSyntheticWithLeak(t *testing.T) {
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Skip("uv not on PATH; skipping pyast contract test")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; skipping pyast contract test")
+	}
+	setPyastDirEnv(t)
+	script, err := filepath.Abs("../../testdata/scripts/entrypoint_scoped_invoke.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := &leak.Report{}
+
+	_, unit, ok := warmUnitForScript(context.Background(), script, "", rep)
+	if ok {
+		t.Fatalf("warmUnitForScript with ambiguous entrypoint = %+v, want ok=false", unit)
+	}
+	if rep.Len() != 1 || !strings.Contains(rep.Leaks[0].Detail, "multiple entrypoints") {
+		t.Errorf("expected a single 'multiple entrypoints' leak, got %+v", rep.Leaks)
 	}
 }

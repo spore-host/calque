@@ -148,7 +148,7 @@ func runRamp(o rampOpts) (err error) {
 	// selection (below) would need to compose with a script-picked body too.
 	// Left as a follow-up; ramp's items/card DO already reflect --script
 	// (calque#134/#136), only the executed body doesn't yet.
-	_, unit, _ := warmUnitForScript(ctx, o.script, rep)
+	_, unit, _ := warmUnitForScript(ctx, o.script, "", rep)
 
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: prep.PrepCommand(artifactPfx), TTL: o.ttl,
