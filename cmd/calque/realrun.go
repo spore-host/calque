@@ -343,6 +343,7 @@ func realRun(o realOpts) (err error) {
 		RootVolumeGiB:  200, // vLLM image + weights blow past spawn's 20 GiB default
 		Spot:           o.spot, SpotMaxPrice: o.spotMaxPrice,
 		IamInstanceProfile: iamProfile,
+		RunID:              o.runID, Command: "real",
 	}.Build()
 	if o.spot {
 		// Honesty (§9/§10): a spot run measures K against a SPOT R_a, and the box

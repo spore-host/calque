@@ -1,6 +1,8 @@
 package plan
 
 import (
+	"time"
+
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 )
 
@@ -71,6 +73,14 @@ type SpawnLauncher struct {
 	// as a zero-value default only so existing tests that don't care about
 	// IAM don't need updating, never as an intentional caller choice.
 	IamInstanceProfile string
+	// RunID and Command populate the calque:run-id/calque:command tags
+	// (calque#166) — without these, an interrupted run leaves an instance
+	// discoverable only by launch time/instance type (see
+	// docs/guide/troubleshooting.md's pre-#166 workaround). Empty RunID
+	// skips tagging entirely (some callers, e.g. spawn-run's per-callable
+	// launches, may not have a single run-id concept yet).
+	RunID   string
+	Command string // "real", "ramp", "smoke", "spawn-run", ...
 }
 
 // Build translates SpawnLauncher's fields into a spawnaws.LaunchConfig for
@@ -99,5 +109,22 @@ func (s SpawnLauncher) Build() spawnaws.LaunchConfig {
 		Spot:               s.Spot,               // Spot market: different capacity pool than on-demand
 		SpotMaxPrice:       s.SpotMaxPrice,       // "" => spawn caps at on-demand price
 		IamInstanceProfile: s.IamInstanceProfile, // calque#148: empty => instance has NO S3/AWS credentials at all
+		Tags:               s.tags(),
+	}
+}
+
+// tags builds the calque:* tag set (calque#166). Returns nil (not an empty
+// map) when RunID is unset, so callers that don't yet have a run-id concept
+// launch exactly as before — spawn's own buildTags() treats a nil user-tag
+// map as "no additional tags", not an error.
+func (s SpawnLauncher) tags() map[string]string {
+	if s.RunID == "" {
+		return nil
+	}
+	return map[string]string{
+		"calque:run-id":     s.RunID,
+		"calque:managed":    "true",
+		"calque:command":    s.Command,
+		"calque:created-at": time.Now().UTC().Format(time.RFC3339),
 	}
 }

@@ -53,7 +53,10 @@ Two different things need permissions, and they're easy to conflate:
 Per run: one EC2 instance (terminated at the end, or on error via a
 deferred cleanup — see "if a run is interrupted" below), and a handful of
 S3 objects under `s3://YOUR-BUCKET/runs/<run-id>/` (artifacts, manifest,
-results, summary, bootstrap log).
+results, summary, bootstrap log). The instance carries `calque:run-id`,
+`calque:managed=true`, and `calque:command` tags (calque#166) — useful for
+finding it by tag filter if a run gets interrupted; see
+[`troubleshooting.md`](troubleshooting.md).
 
 **One thing that's NOT per-run**: the IAM role+instance profile itself
 (`calque-real-run`) is created ONCE and REUSED across every subsequent

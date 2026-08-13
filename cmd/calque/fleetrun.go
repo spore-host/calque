@@ -534,6 +534,7 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 		IamInstanceProfile: iamProfile,
+		RunID:              o.runID, Command: "fleet",
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
 	tgt := *baseTgt // per-shard copy — Acquire mutates Region; avoid a cross-goroutine race

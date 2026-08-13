@@ -164,6 +164,7 @@ func runRamp(o rampOpts) (err error) {
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 		IamInstanceProfile: iamProfile,
+		RunID:              o.runID, Command: "ramp",
 	}.Build()
 	if o.spot {
 		// Honesty (§9/§10): a spot ramp measures K against a SPOT R_a, and the box
