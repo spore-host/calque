@@ -44,6 +44,39 @@ jobs:
       - name: go test
         run: go test -count=1 ./...
 
+  # -race variant of the full test suite (calque#159) — separate job so a
+  # race failure's output doesn't get lost inside `go`'s own build/test
+  # steps, and so this doesn't slow down the fast path when only that
+  # matters. Particularly worthwhile as fleet/pool/session concurrency
+  # grows.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  # Known-vulnerability scan (calque#159) — appropriate for a tool that
+  # handles AWS credentials and launches cloud infrastructure.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   # Go idiom/correctness lint (calque#164) — unchecked error returns,
   # staticcheck-style issues, unused identifiers. Separate job (not folded
   # into `go` above) so a lint failure's output doesn't get lost in the
