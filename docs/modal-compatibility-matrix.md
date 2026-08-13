@@ -1,12 +1,15 @@
 # Modal compatibility matrix
 
-**Status:** Authoritative current behavior. Verified through: v0.3.0.
+**Status:** Authoritative current behavior. Verified through: v0.3.1.
 calque's goal is broad enough Modal-idiom mimicry that real Modal code
 ports to AWS **unchanged**. This document is the single most direct
 answer to "does calque support my script."
 
 **Provenance:**
-- Verified against calque v0.3.0 / commit `19b4a1a` (2026-08-12).
+- Verified against calque v0.3.1 (2026-08-13) — re-checked #97/#98/#168's
+  tracking-column status against current issue state during a repo-wide
+  stale-doc-phrase sweep; content otherwise last verified at commit
+  `19b4a1a` (2026-08-12).
 - Modal API doc survey last refreshed: 2026-08-07.
 - Real-world corpus survey last refreshed: 2026-08-13 (calque#150 pass —
   see `testdata/real-world/README.md`'s "pass 2" section for the 5 scripts
@@ -50,7 +53,7 @@ real gap — should not stay this way) · ⬜ not present at all.
 | Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
 |---|---|---|---|---|---|
 | `modal.App(name, ...)` | Deployment/namespace unit; functions don't run just by being deployed. | 🔥 | ✅ `pyast.py:238-240` → `ir.App.Name` | None known. | — |
-| `App(image=..., secrets=..., volumes=...)` (app-level defaults) | Inherited by every Function/Cls unless overridden. | ⚪ | 🟨 `pyast.py:242-245` — recorded as a helper leak, never wired into `ir.App.Image` etc. | A function relying on the app-level default (not setting its own `image=`) silently gets no image at all in calque today. | not yet filed |
+| `App(image=..., secrets=..., volumes=...)` (app-level defaults) | Inherited by every Function/Cls unless overridden. | ⚪ | 🟨 `pyast.py:242-245` — recorded as a helper leak, never wired into `ir.App.Image` etc. | A function relying on the app-level default (not setting its own `image=`) silently gets no image at all in calque today. | [#168](https://github.com/spore-host/calque/issues/168) |
 | `@app.function(...)` | Registers an independently-autoscaled serverless function pool. | 🔥 | ✅ (as config carrier) / see §F for execution-shape gap | — | — |
 | `@app.cls(...)` | Same kwarg surface as `.function`, plus lifecycle hooks + method pooling. | 🔥 | ✅ | — | — |
 | `@app.local_entrypoint(name=None)` | Runs **locally**, not in a container; kicks off `.remote()`/`.map()` calls. Multiple entrypoints need `modal run file.py::fn`. | 🔥 | ✅ (fixed 2026-08-07, calque#78 — multiple entrypoints in one script all preserved) | — | closed |
@@ -288,20 +291,18 @@ a generic "unmodeled arg" message.
    2026-08-09); see docs/behind-the-seam-register.md.
 9. ~~**`.spawn()`+`.get()` classification**~~ — closed.
    [#88](https://github.com/spore-host/calque/issues/88) (closed 2026-08-07).
-   The actual fan-out driver (related to calque's existing
-   `internal/exec/shard.go` fan-out, keyed by callable identity rather than
-   item index) is tracked separately as
-   [#97](https://github.com/spore-host/calque/issues/97) — needs real-AWS
-   verification, no offline test path.
+   The actual fan-out driver, keyed by callable identity rather than item
+   index, shipped as `calque spawn-run` (`cmd/calque/spawnrun.go`) and is
+   closed and live-verified on real AWS —
+   [#97](https://github.com/spore-host/calque/issues/97) (closed).
 10. **`modal.Sandbox`** — tracked, explicitly deferred; different execution
     model entirely. [#89](https://github.com/spore-host/calque/issues/89)
 11. ~~**`calque run --entrypoint <name>`**~~ — closed (validate+inform
     scope). [#90](https://github.com/spore-host/calque/issues/90) (closed
-    2026-08-07). Confirmed via a live repro that `--entrypoint` doesn't yet
-    STEER which callable `pickWarmUnit` selects (no call-site-to-entrypoint
-    attribution exists) — tracked as
-    [#98](https://github.com/spore-host/calque/issues/98). Argument
-    passthrough also not attempted.
+    2026-08-07). `--entrypoint` now DOES steer which callable `pickWarmUnit`
+    selects — call-site-to-entrypoint attribution shipped and is
+    live-verified end-to-end — [#98](https://github.com/spore-host/calque/issues/98)
+    (closed).
 12. Lower-priority/rare: `modal.Dict`/`Queue`, `@modal.batched`,
     `modal.NetworkFileSystem`, `modal.CloudBucketMount`, `modal.Cron`/`Period`
     object forms, `cloud=`, `App.include`/`.deploy`/`.run` lifecycle nuances.

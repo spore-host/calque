@@ -1,6 +1,6 @@
 # Troubleshooting
 
-**Status:** Authoritative current behavior. Verified through: v0.3.0.
+**Status:** Authoritative current behavior. Verified through: v0.3.1.
 
 Real, previously-hit problems, told as symptom → cause → fix. Most were
 found and fixed during calque's own live-AWS validation passes (see

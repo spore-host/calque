@@ -1,6 +1,6 @@
 # GPU sharing support matrix (calque#104): live hardware verification
 
-**Status:** Authoritative current behavior. Verified through: v0.3.0.
+**Status:** Authoritative current behavior. Verified through: v0.3.1.
 Resolves the g7 MIG ambiguity that NVIDIA's own
 datasheets could not settle (Workstation Edition datasheet omits MIG;
 developer blog confirms MIG only for Server Edition; the MIG User Guide's

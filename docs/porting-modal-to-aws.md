@@ -1,6 +1,6 @@
 # Porting a Modal app to AWS with calque (calque#133)
 
-**Status:** Authoritative current behavior. Verified through: v0.3.0.
+**Status:** Authoritative current behavior. Verified through: v0.3.1.
 
 `docs/modal-compatibility-matrix.md` answers "does calque support construct X, in
 general" — a construct-by-construct census. This doc answers the question someone
