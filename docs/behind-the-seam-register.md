@@ -16,8 +16,9 @@ the census stays honest.
 |---|---|---|
 | Autoscaling kwargs — `concurrency_limit`, `allow_concurrent_inputs`, `min_containers`, `max_containers`, `keep_warm`, `container_idle_timeout` (S1) | `internal/parse/parse.go` `readConfigKwargs` | "autoscaling/warm-pool config — belongs to the real brain behind the seam (§4), not ported in the spike (§1)" |
 | `.map.aio()` async future (S2) | `tools/pyast/pyast.py` `visit_Call` → `parse.invocationKinds` | "async result futures / detach — deferred per §18; the spike is block-and-wait only" |
-| `.spawn()` (S2, calque#88) | `tools/pyast/pyast.py` `visit_Call` → `parse.invocationKinds` | now CLASSIFIED (`ir.InvokeSpawn`, findable via `ir.App.FindFunction`/`FindClass`) but still not executed: "classified but not executed — block-and-wait fan-out … deferred per §18 (calque#97 tracks the driver)" |
-| `secrets=`, `schedule=`, `region=` | `readConfigKwargs` | recorded but NOT honored (§B); a payload that needs them fails visibly |
+| `.spawn()` (S2, calque#88) | `tools/pyast/pyast.py` `visit_Call` → `parse.invocationKinds` | CLASSIFIED (`ir.InvokeSpawn`, findable via `ir.App.FindFunction`/`FindClass`) **AND now executed**: calque#97 shipped a real block-and-wait fan-out driver (`calque spawn-run`, `cmd/calque/spawnrun.go`) — one instance per distinct `.spawn()`-classified callable, live-verified on real AWS. **No longer behind the seam** — kept in this table only as a historical note; see the README's CLI section or `docs/guide/which-verb.md` for current usage. The remaining semantic gap (Modal's real decoupled contract — a persistable `FunctionCall` handle, reconstructable via `.from_id()` from a different process, 7-day result retention) is NOT reproduced by calque's block-and-wait driver; see `docs/modal-compatibility-matrix.md` for that distinction. |
+| `schedule=`, `region=` | `readConfigKwargs` | recorded but NOT honored (§B); a payload that needs them fails visibly |
+| `secrets=` | `readConfigKwargs` records the declared secret names; `cmd/calque real --secret NAME=VALUE` (repeatable) injects them | calque does NOT resolve Modal's own secret store (`Secret.from_name(...)`) automatically — it has no live Modal control-plane connection (see calque#151 for what happens if a bare reference to a live-control-plane construct like `modal.Dict`/`Queue` is attempted; the same "no live connection" reasoning applies to secrets). What calque DOES do: `--secret` lets the caller supply the same env-var VALUES a script's body expects, by another name, so the payload code itself stays unchanged. `realrun.go` leaks which of a script's own declared secret names weren't covered by any `--secret` flag. This is a real, generic capability — not a full reproduction of Modal's secret store — see `docs/porting-modal-to-aws.md` for the full migration story. |
 | Serve entrypoints (§F/M9) | `pyast` `entry_kind` → `run.go` | "serve shape … execution shape deferred" (see [serve-architecture.md](serve-architecture.md)) |
 | Volume mid-run `reload()` (§E/M8) | `pyast` `volume_writes` → `parse` | "mid-run re-read of a mutated volume is not reproduced" |
 | `Function.from_name("other-app", "fn").remote(...)` — cross-app invocation (calque#87, decided non-goal calque#137) | `tools/pyast/pyast.py` `visit_Call` → `internal/parse/parse.go` (captures app name, object name, args) | recognized, never executed: calque runs exactly ONE script's `ir.App` per invocation, and has no path to locate/parse a SEPARATE deployed app's source — unlike `.spawn()` (calque#97), whose targets live inside the already-parsed `ir.App`. Building real orchestration would mean inventing a deployment-registry concept (name→script resolution) disproportionate to how rare this idiom is. Permanent non-goal, not a "needs design" gap. |
@@ -58,9 +59,9 @@ the census stays honest.
   client sharing an MPS context on ANY one crash, not just the crashed
   client — implemented, not just documented. Reuses `internal/tenancy`'s
   check-out/check-in `Registry` unmodified (built generically in #107 for
-  exactly this reuse). Not yet wired into any CLI path — that's process
-  wiring, deferred to a follow-up once a real institutional workload needs
-  it.
+  exactly this reuse). **Now wired into `calque session checkout --backend
+  mps`** (`cmd/calque/session.go`), gated behind `mps.OptInFlagName`
+  (`--i-understand-shared-gpu-has-no-isolation`) as described above.
 - **NEFF / Trainium / Inferentia.** No Neuron path; CUDA/GPU only. Attach point:
   `internal/target` card vocabulary + `internal/image` base.
 - **GPU topology / multi-node / gang scheduling.** The gpu guard (§7) explicitly

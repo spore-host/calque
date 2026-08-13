@@ -1,13 +1,20 @@
 # Design note: disambiguating "session" — interactive tenancy vs. today's N-item ramp (calque#106)
 
-**Status:** decision record. Was design-only when filed; the primitives it
-scoped have since shipped as real code — `internal/mig` (MIG slice
+**Status:** decision record — historical design rationale, superseded by
+shipped code for everything it scoped. Was design-only when filed; every
+primitive it called for has since shipped: `internal/mig` (MIG slice
 provisioning), `internal/mps` (MPS trusted-tenant mode), `internal/tenancy`
 (generic check-out/check-in registry), closed via #107/#108. The CLI-level
 rename this note calls for (`calque session` → `calque ramp`, freeing
-`session` for the new interactive-tenancy verb) has now shipped (#117,
-`cmd/calque/ramp.go`). The new `calque session` (interactive tenancy)
-CLI verb itself is still unbuilt — see "What this unblocks" below.
+`session` for the new interactive-tenancy verb) shipped via #117
+(`cmd/calque/ramp.go`). **The new `calque session` CLI verb (interactive
+tenancy: `checkout`/`checkin`/`status`/`list`) has ALSO shipped** —
+`cmd/calque/session.go` implements the full check-out/check-in lifecycle
+this note describes below; see the README's "Institutional GPU sharing"
+section or `docs/guide/cli-reference.md` for current usage. This doc's
+value going forward is the *design rationale* for the collision/rename
+decision and the lifecycle model — not a status page for whether the verb
+exists.
 
 ## The collision
 
@@ -126,6 +133,8 @@ already provisioned, rather than provisioning it.
   software-cooperative (MPS), not in how a user checks in/out.
 - **#109 (M12/M13 joint boundary doc)**: can cite this note's boundary
   statement directly rather than re-deriving it.
-- **The `session`→`ramp` rename**: shipped (#117) — `session` is now free
-  for the new interactive-tenancy verb described above, which is not yet
-  built.
+- **The `session`→`ramp` rename**: shipped (#117) — `session` was freed
+  for the new interactive-tenancy verb described above.
+- **The new `calque session` verb itself**: shipped — `cmd/calque/session.go`
+  implements `checkout`/`checkin`/`status`/`list` per this note's lifecycle
+  design.

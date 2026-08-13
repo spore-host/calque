@@ -1,5 +1,18 @@
 # calque — Spike Build Spec
 
+> **⚠️ HISTORICAL DOCUMENT — superseded, kept for founding-context only.**
+> This is calque's ORIGINAL build spec, written before the project's
+> thesis was reframed. Section 9 below ("crossover K... the one number the
+> spike exists to produce") is **retracted** — per the v0.2.0 CHANGELOG
+> entry: "crossover-K was never the project's actual goal ('that was
+> something invented by Claude,' per Scott)." calque's current, authoritative
+> thesis is unchanged-idiom-fidelity migration (Modal-shaped code runs on
+> AWS unchanged) — see the top-level `README.md` and `CHANGELOG.md`'s
+> `[0.2.0]` entry for the reframing. K's cost model is still real, shipped
+> code (`internal/cost`) and can still be reported, but it is not calque's
+> headline claim. Read this doc for historical context on the original
+> spike scope, NOT as a description of calque's current goals.
+
 **For:** Claude Code
 **Language:** Go (control plane), Python (worker payload only)
 **Status:** Spike. Prove one thing, fake everything else, log what breaks.
