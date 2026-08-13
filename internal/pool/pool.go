@@ -299,6 +299,7 @@ func (w *Worker) runOne(ctx context.Context, ref ClaimRef, receipt string) {
 			MethodArgs: man.MethodArgs, Starmap: man.Starmap, Extras: man.Extras,
 			ExtraConsts: man.ExtraConsts, ExtraImports: man.ExtraImports, ExtraClasses: man.ExtraClasses,
 			Secrets: man.Secrets, PayloadIsBase64Bytes: man.PayloadIsBase64Bytes,
+			Base64ArgIndices: man.Base64ArgIndices,
 		}
 	}
 	w.Supervisor.Sink = w.Results.Sink(man)

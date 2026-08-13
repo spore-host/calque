@@ -68,6 +68,60 @@ func TestBootstrapCommandHostModeWithPipInstallsUvAndPackages(t *testing.T) {
 	}
 }
 
+// TestBootstrapCommandHostModeWithPipEnsuresGitPresent is the regression
+// test for a real bug found running app.py's run_benchmark_local on real
+// AWS (m6i.large, AL2023): a --pip package spec can be a git URL (momp has
+// no PyPI release, only "momp @ git+https://github.com/hholb/ROMP.git@main")
+// — uv pip install shells out to a real git binary for that, which AL2023
+// does NOT ship by default. The bootstrap script must ensure git is present
+// (apt-get-first/dnf-fallback, matching this file's existing distro-
+// detection pattern) BEFORE the uv pip install line, not just uv/python3.
+func TestBootstrapCommandHostModeWithPipEnsuresGitPresent(t *testing.T) {
+	c := BootstrapConfig{
+		Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json",
+		Region: "us-west-2", HostMode: true, WorkerDir: "/tmp/calque",
+		PipPackages: []string{"momp @ git+https://github.com/hholb/ROMP.git@main"}, PythonVersion: "3.11",
+	}
+	cmd := c.Command()
+	if !strings.Contains(cmd, "command -v git") {
+		t.Errorf("expected a git presence check before uv pip install; got:\n%s", cmd)
+	}
+	gitIdx := strings.Index(cmd, "command -v git")
+	pipInstallIdx := strings.Index(cmd, "uv pip install")
+	if gitIdx == -1 || pipInstallIdx == -1 || gitIdx > pipInstallIdx {
+		t.Errorf("git presence check must run BEFORE uv pip install; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandStagesFilesBeforeWarmdRuns proves StageFiles
+// downloads each URL to its exact destination path (parent dirs made
+// first), in deterministic order, BEFORE warmd is invoked — needed for
+// a script body that shells out to a hardcoded absolute path its
+// original Docker image would have placed there (e.g. AI-Almanac's
+// app.py hardcoding "/app/scripts/generate_config.py", ROMP's own
+// Dockerfile convention, not anything Modal defines).
+func TestBootstrapCommandStagesFilesBeforeWarmdRuns(t *testing.T) {
+	c := BootstrapConfig{
+		Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json",
+		Region: "us-west-2", HostMode: true, WorkerDir: "/tmp/calque",
+		StageFiles: map[string]string{
+			"https://example.com/generate_config.py": "/app/scripts/generate_config.py",
+		},
+	}
+	cmd := c.Command()
+	for _, w := range []string{
+		`sudo mkdir -p "/app/scripts"`,
+		`sudo curl -LsSf "https://example.com/generate_config.py" -o "/app/scripts/generate_config.py"`,
+	} {
+		if !strings.Contains(cmd, w) {
+			t.Errorf("missing %q in:\n%s", w, cmd)
+		}
+	}
+	if strings.Index(cmd, "curl -LsSf \"https://example.com") > strings.Index(cmd, "AWS_REGION=") {
+		t.Errorf("staged file download must happen BEFORE warmd runs; got:\n%s", cmd)
+	}
+}
+
 // TestBootstrapCommandHostModeWithPipDefaultsPythonVersion proves an
 // unset PythonVersion still gets SOME pinned version (not left to
 // whatever the AMI's system python3 happens to be) when PipPackages is

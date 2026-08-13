@@ -72,6 +72,7 @@ class Runner:
         extra_classes: list[dict] | None = None,
         secrets: dict[str, str] | None = None,
         payload_is_base64_bytes: bool = False,
+        base64_arg_indices: list[int] | None = None,
     ) -> None:
         self.enter_body = enter_body
         self.method_body = method_body
@@ -123,6 +124,15 @@ class Runner:
         # default) never touches the payload at all — every other
         # invocation kind (map/starmap/spawn) is byte-for-byte unchanged.
         self.payload_is_base64_bytes = payload_is_base64_bytes
+        # base64_arg_indices (calque real --arg-file IDX=PATH): the multi-arg
+        # sibling of payload_is_base64_bytes — for a Starmap unit whose real
+        # signature mixes a bytes positional arg with non-bytes ones (e.g.
+        # `def f(job_id: str, config: dict, bundle: bytes)`), the WHOLE
+        # payload can't be a single base64 string the way --item-file's
+        # one-bytes-arg case is. Instead only these tuple positions get
+        # base64-decoded before the splat call binds them; every other
+        # position (a plain str/dict/int literal) passes through unchanged.
+        self.base64_arg_indices = set(base64_arg_indices or [])
         self.entered = False
         # The warm namespace: a stand-in for the @cls instance `self`. Bodies see
         # it as `self`; whatever @enter assigns (self.llm = ...) lives here and is
@@ -176,6 +186,17 @@ class Runner:
         # payload untouched (flag defaults False).
         if self.payload_is_base64_bytes and isinstance(payload, str):
             payload = base64.b64decode(payload)
+        # calque real --arg-file IDX=PATH: only SPECIFIC positions of a
+        # Starmap tuple arrived as base64 strings — decode just those,
+        # leaving every other position's plain str/dict/int literal
+        # untouched. Distinct from payload_is_base64_bytes above: that one
+        # treats the WHOLE payload as the single bytes value; this one only
+        # applies when starmap's tuple-of-args shape is ALSO in play.
+        if self.base64_arg_indices and isinstance(payload, (list, tuple)):
+            payload = [
+                base64.b64decode(v) if i in self.base64_arg_indices and isinstance(v, str) else v
+                for i, v in enumerate(payload)
+            ]
         # Call the compiled @method function (built once in enter()). Under
         # concurrency (C>1) many threads call this at once — each call binds only
         # its own args and shares `self.state`, exactly as concurrent @method calls
@@ -376,8 +397,24 @@ os.dup2(sys.stderr.fileno(), sys.stdout.fileno())  # library stdout -> stderr
 _EMIT_LOCK = threading.Lock()
 
 
+def _json_default(obj: Any) -> Any:
+    """json.dumps' default= hook: a real Modal body's return value can embed raw
+    bytes anywhere in its structure (e.g. AI-Almanac's run_benchmark_local returns
+    {"files": [{"data": path.read_bytes(), ...}, ...]}) — plain json.dumps refuses
+    with 'Object of type bytes is not JSON serializable'. Base64-encode it into a
+    plain string, the same encoding Go's own []byte auto-marshaling already uses
+    for the INPUT side (Config.PayloadIsBase64Bytes/Base64ArgIndices) — so a
+    caller inspecting a raw result already knows the convention, even though (for
+    an arbitrary nested position, unlike the input side's known indices) there is
+    no separate flag marking exactly which output positions were bytes.
+    """
+    if isinstance(obj, bytes):
+        return base64.b64encode(obj).decode("ascii")
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def _emit(obj: dict) -> None:
-    line = json.dumps(obj) + "\n"
+    line = json.dumps(obj, default=_json_default) + "\n"
     with _EMIT_LOCK:
         _PROTO.write(line)
         _PROTO.flush()  # flush every line so warmd sees responses as they land
@@ -458,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
                     extra_classes=msg.get("extra_classes") or [],
                     secrets=msg.get("secrets") or {},
                     payload_is_base64_bytes=bool(msg.get("payload_is_base64_bytes", False)),
+                    base64_arg_indices=msg.get("base64_arg_indices") or None,
                 )
                 # concurrency=C>1 => items run in a C-wide thread pool so inference
                 # overlaps (vLLM batches in-flight requests). Absent/1 => the serial

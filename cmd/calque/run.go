@@ -345,6 +345,31 @@ func pickWarmUnit(app ir.App, epName string) (warmUnit, bool) {
 	return warmUnit{}, false
 }
 
+// pickWarmUnitByName selects the specific @app.function or @cls method named
+// name, bypassing pickWarmUnit's automatic entrypoint/`.map()`-preference
+// scan entirely. Needed when the target callable isn't reachable through any
+// @app.local_entrypoint() at all (e.g. AI-Almanac's app.py: its only
+// entrypoint invokes the sibling run_benchmark, never run_benchmark_local —
+// pickWarmUnit's scan would silently pick run_benchmark, the first function
+// in source order, with no way to ask for a different one) or isn't the
+// auto-picked default for some other reason. ok is false if no function or
+// method named name exists anywhere in app.
+func pickWarmUnitByName(app ir.App, name string) (warmUnit, bool) {
+	for _, f := range app.Functions {
+		if f.Name == name {
+			return warmUnit{class: syntheticClass(f), method: f, plainFunction: true}, true
+		}
+	}
+	for _, c := range app.Classes {
+		for _, mth := range c.Methods {
+			if mth.Name == name {
+				return warmUnit{class: c, method: mth}, true
+			}
+		}
+	}
+	return warmUnit{}, false
+}
+
 // syntheticClass wraps a plain @app.function's config in a zero-value ir.Class
 // so the rest of run.go (which reads unit.class.* throughout) doesn't need a
 // separate code path for the plain-function case.

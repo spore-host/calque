@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	calexec "github.com/spore-host/calque/internal/exec"
@@ -30,6 +32,64 @@ func itemFromFile(path string) ([]warm.Item, error) {
 		return nil, fmt.Errorf("read --item-file %q: %w", path, err)
 	}
 	return []warm.Item{{Index: 0, Payload: data}}, nil
+}
+
+// itemFromArgs builds the SINGLE item a real-AWS run should drive from
+// argFiles (IDX -> file path, raw bytes) and argJSON (IDX -> literal JSON
+// value), for a picked unit whose real signature mixes a bytes positional
+// arg with non-bytes ones (calque real --arg-file/--arg-json — the
+// positional-args sibling of itemFromFile, needed when the whole payload
+// can't be treated as a single bytes value the way --item-file's design
+// requires; e.g. run_benchmark_local(job_id: str, config: dict, bundle:
+// bytes, runtime_env: dict | None)). Every index from 0 through the
+// highest given must be covered by exactly one of the two maps — a gap or a
+// double-cover is a caller error, not a best-effort fallback, since a
+// missing/duplicated positional arg would silently mis-bind the shipped
+// body's real signature. base64Indices reports which resulting tuple
+// positions hold file bytes (encoding/json auto-base64-encodes each
+// position's own []byte value, same mechanism as itemFromFile) — the
+// caller ships this as Config.Base64ArgIndices so the runner decodes only
+// those positions back to bytes (runner.py's item(), gated on
+// self.base64_arg_indices).
+func itemFromArgs(argFiles, argJSON map[int]string) ([]warm.Item, []int, error) {
+	n := 0
+	for idx := range argFiles {
+		if idx+1 > n {
+			n = idx + 1
+		}
+	}
+	for idx := range argJSON {
+		if idx+1 > n {
+			n = idx + 1
+		}
+	}
+	tuple := make([]any, n)
+	base64Indices := make([]int, 0, len(argFiles))
+	for idx := 0; idx < n; idx++ {
+		filePath, fromFile := argFiles[idx]
+		jsonLit, fromJSON := argJSON[idx]
+		switch {
+		case fromFile && fromJSON:
+			return nil, nil, fmt.Errorf("arg index %d given via both --arg-file and --arg-json", idx)
+		case fromFile:
+			data, err := os.ReadFile(filePath)
+			if err != nil {
+				return nil, nil, fmt.Errorf("read --arg-file %d=%q: %w", idx, filePath, err)
+			}
+			tuple[idx] = data
+			base64Indices = append(base64Indices, idx)
+		case fromJSON:
+			var v any
+			if err := json.Unmarshal([]byte(jsonLit), &v); err != nil {
+				return nil, nil, fmt.Errorf("--arg-json %d=%q is not valid JSON: %w", idx, jsonLit, err)
+			}
+			tuple[idx] = v
+		default:
+			return nil, nil, fmt.Errorf("arg index %d has no --arg-file or --arg-json (positions must be contiguous from 0, each covered exactly once)", idx)
+		}
+	}
+	sort.Ints(base64Indices)
+	return []warm.Item{{Index: 0, Payload: tuple}}, base64Indices, nil
 }
 
 // realOrSyntheticItems returns the warm.Item batch for a run: n items built
@@ -150,6 +210,21 @@ func manifestBodyForUnit(app ir.App, unit warmUnit, rep *leak.Report) (calexec.M
 // had no reason to keep around since only items.go's realOrSyntheticItems
 // consumed the unit itself.
 func warmUnitForScript(ctx context.Context, scriptPath, entrypoint string, rep *leak.Report) (ir.App, warmUnit, bool) {
+	return warmUnitForScriptFn(ctx, scriptPath, entrypoint, "", rep)
+}
+
+// warmUnitForScriptFn is warmUnitForScript plus function (calque real
+// --function NAME): when non-empty, selects that specific @app.function/
+// @cls method by name (pickWarmUnitByName) instead of running pickWarmUnit's
+// automatic entrypoint/`.map()`-preference scan at all — entrypoint is still
+// resolved/validated (a bad --entrypoint should still error), but function
+// takes priority over its selection once resolution succeeds. Needed when
+// the target callable isn't reachable through any @app.local_entrypoint()
+// at all (e.g. AI-Almanac's app.py: its only entrypoint invokes the sibling
+// run_benchmark, never run_benchmark_local, so pickWarmUnit's scan would
+// silently pick run_benchmark instead). "" (the default) reproduces
+// warmUnitForScript's behavior byte-for-byte.
+func warmUnitForScriptFn(ctx context.Context, scriptPath, entrypoint, function string, rep *leak.Report) (ir.App, warmUnit, bool) {
 	if scriptPath == "" {
 		return ir.App{}, warmUnit{}, false
 	}
@@ -159,6 +234,21 @@ func warmUnitForScript(ctx context.Context, scriptPath, entrypoint string, rep *
 		rep.Addf(leak.PrimMap, leak.KindSemanticGap, scriptPath, 0,
 			"--script %q could not be parsed (%v); using synthesized placeholder items (calque#136)", scriptPath, err)
 		return ir.App{}, warmUnit{}, false
+	}
+	// --function selects a specific callable by name directly — this is
+	// deliberately checked BEFORE entrypoint resolution, since the target
+	// callable may not be reachable through any @app.local_entrypoint() at
+	// all (the exact AI-Almanac app.py shape this exists for): requiring a
+	// valid/unambiguous --entrypoint first would wrongly refuse a
+	// perfectly resolvable --function request on a multi-entrypoint script.
+	if function != "" {
+		unit, ok := pickWarmUnitByName(app, function)
+		if !ok {
+			rep.Addf(leak.PrimMap, leak.KindSemanticGap, scriptPath, 0,
+				"--function %q not found as any @app.function or @cls method; using synthesized placeholder items (calque#136)", function)
+			return ir.App{}, warmUnit{}, false
+		}
+		return app, unit, true
 	}
 	// calque#79/#90: real/ramp/fleetrun previously had no way to pick an
 	// entrypoint at all — a multi-entrypoint script (e.g. AI-Almanac's

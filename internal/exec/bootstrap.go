@@ -2,6 +2,8 @@ package exec
 
 import (
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -44,6 +46,17 @@ type BootstrapConfig struct {
 	// instead of depending on the AMI's system Python. Empty lets uv pick its
 	// own default (currently the latest stable CPython).
 	PythonVersion string
+	// StageFiles downloads each key (a URL curl can fetch — http(s):// or a
+	// raw.githubusercontent.com link) to its value (an ABSOLUTE destination
+	// path on the instance), before warmd runs. For a real script whose body
+	// shells out to a hardcoded absolute path it assumes its ORIGINAL Docker
+	// image would have placed there (e.g. AI-Almanac's app.py hardcodes
+	// "/app/scripts/generate_config.py" — that's the upstream ROMP image's
+	// own Dockerfile convention, `WORKDIR /app` + `COPY scripts/`, not
+	// anything Modal itself defines) — this stages the SAME file at the
+	// SAME path without needing to build/pull that whole image. Directories
+	// are created as needed; nil/empty is a no-op.
+	StageFiles map[string]string
 }
 
 // Command builds the shell command the instance runs (via spawn JobArrayCommand /
@@ -82,6 +95,20 @@ func (b BootstrapConfig) Command() string {
 		fmt.Sprintf("aws s3 cp --recursive %s/ %s/", art, wd),
 		fmt.Sprintf("chmod +x %s/warmd", wd),
 	)
+	if len(b.StageFiles) > 0 {
+		urls := make([]string, 0, len(b.StageFiles))
+		for u := range b.StageFiles {
+			urls = append(urls, u)
+		}
+		sort.Strings(urls) // deterministic script output regardless of map iteration order
+		for _, u := range urls {
+			dest := b.StageFiles[u]
+			lines = append(lines,
+				fmt.Sprintf("sudo mkdir -p %q", filepath.Dir(dest)),
+				fmt.Sprintf("sudo curl -LsSf %q -o %q", u, dest),
+			)
+		}
+	}
 
 	if b.HostMode {
 		// Smoke test / real-AWS host-mode: run warmd directly on the host —
@@ -108,6 +135,20 @@ func (b BootstrapConfig) Command() string {
 				fmt.Sprintf("uv venv --python %s %s/.venv", pyVer, wd),
 			)
 			if len(b.PipPackages) > 0 {
+				// A --pip package spec can be a git URL (e.g. "momp @
+				// git+https://github.com/hholb/ROMP.git@main", for a package
+				// with no PyPI release) — `uv pip install` shells out to a
+				// real `git` binary for that, which AL2023 (the AMI spawn
+				// auto-selects for non-GPU instance types like m6i.large)
+				// does NOT ship by default, unlike aws/dnf. Found live: a
+				// git-URL --pip spec failed fast with "Git executable not
+				// found" on an otherwise-correct uv/venv/pip-install
+				// sequence. apt-get-first/dnf-fallback mirrors this file's
+				// existing distro-detection pattern for the no-deps host-
+				// mode path below.
+				lines = append(lines,
+					"command -v git >/dev/null || (sudo apt-get update && sudo apt-get install -y git || sudo dnf install -y git)",
+				)
 				// `uv venv` creates a plain venv (python3/pip only) — it
 				// does NOT copy the uv binary itself in. Installing into
 				// that venv means invoking the TOP-LEVEL uv with
@@ -127,7 +168,18 @@ func (b BootstrapConfig) Command() string {
 			// PythonBin to this exact "<wd>/.venv/bin/python3" path
 			// (internal/exec.ManifestBody.PythonBin) or warmd falls back
 			// to plain "python3", which was never pip-installed into.
+			//
+			// The venv's bin/ is ALSO prepended to PATH before launching
+			// warmd — not for warmd itself, but for the picked unit's OWN
+			// body if it shells out to a BARE command name (e.g.
+			// subprocess.run(["momp-run", ...]), AI-Almanac's app.py) —
+			// warmd -> runner.py -> that subprocess call all inherit this
+			// same process environment/PATH, so a console-script entry
+			// point installed into the venv (via a package like `momp`,
+			// not just a plain pip package name) resolves correctly
+			// without the body needing to know the venv's absolute path.
 			lines = append(lines,
+				fmt.Sprintf(`export PATH="%s/.venv/bin:$PATH"`, wd),
 				fmt.Sprintf("AWS_REGION=%s %s/warmd run --manifest %s", b.Region, wd, manifest),
 			)
 			return strings.Join(lines, "\n")

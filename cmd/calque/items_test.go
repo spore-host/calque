@@ -360,3 +360,180 @@ func TestWarmUnitForScript_AmbiguousEntrypointFallsBackToSyntheticWithLeak(t *te
 		t.Errorf("expected a single 'multiple entrypoints' leak, got %+v", rep.Leaks)
 	}
 }
+
+// TestWarmUnitForScriptFn_FunctionSelectsByNameRegardlessOfEntrypoint proves
+// --function picks the named callable directly, bypassing pickWarmUnit's
+// automatic scan entirely — needed for AI-Almanac's app.py, where the only
+// @app.local_entrypoint() invokes run_benchmark (the GCS-backed sibling),
+// never run_benchmark_local; pickWarmUnit's scan alone has no way to reach
+// run_benchmark_local at all. Reuses entrypoint_scoped_invoke.py's `evaluate`
+// (only ever invoked from do_evaluate) to prove the SAME shape: selecting it
+// by --function name works even without passing --entrypoint at all.
+func TestWarmUnitForScriptFn_FunctionSelectsByNameRegardlessOfEntrypoint(t *testing.T) {
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Skip("uv not on PATH; skipping pyast contract test")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; skipping pyast contract test")
+	}
+	setPyastDirEnv(t)
+	script, err := filepath.Abs("../../testdata/scripts/entrypoint_scoped_invoke.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := &leak.Report{}
+
+	// No --entrypoint at all (would otherwise be ambiguous, 2 entrypoints) —
+	// --function must still resolve directly to evaluate.
+	_, unit, ok := warmUnitForScriptFn(context.Background(), script, "", "evaluate", rep)
+	if !ok {
+		t.Fatalf("warmUnitForScriptFn(--function evaluate) failed; leaks: %+v", rep.Leaks)
+	}
+	if !unit.plainFunction || unit.method.Name != "evaluate" {
+		t.Errorf("warmUnitForScriptFn(--function evaluate) = %+v, want the plain function evaluate", unit)
+	}
+	if rep.Len() != 0 {
+		t.Errorf("expected no leak when --function resolves cleanly; got %+v", rep.Leaks)
+	}
+}
+
+// TestWarmUnitForScriptFn_UnknownFunctionFallsBackToSyntheticWithLeak proves
+// a --function name that matches nothing degrades to the same synthesized-
+// placeholder fallback as a parse failure, loudly.
+func TestWarmUnitForScriptFn_UnknownFunctionFallsBackToSyntheticWithLeak(t *testing.T) {
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Skip("uv not on PATH; skipping pyast contract test")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; skipping pyast contract test")
+	}
+	setPyastDirEnv(t)
+	script, err := filepath.Abs("../../testdata/scripts/entrypoint_scoped_invoke.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := &leak.Report{}
+
+	_, unit, ok := warmUnitForScriptFn(context.Background(), script, "", "does_not_exist", rep)
+	if ok {
+		t.Fatalf("warmUnitForScriptFn(--function does_not_exist) = %+v, want ok=false", unit)
+	}
+	if rep.Len() != 1 || !strings.Contains(rep.Leaks[0].Detail, "does_not_exist") {
+		t.Errorf("expected a single leak naming the missing function, got %+v", rep.Leaks)
+	}
+}
+
+// TestPickWarmUnitByName_FindsPlainFunctionByName and its sibling below
+// exercise pickWarmUnitByName directly (no parser involved) against
+// synthetic ir.App values, covering both callable shapes it must resolve:
+// a plain @app.function and an @cls method.
+func TestPickWarmUnitByName_FindsPlainFunctionByName(t *testing.T) {
+	app := ir.App{Functions: []ir.Function{
+		{Name: "run_benchmark", Args: []string{"job_id", "config", "outputs_bucket"}},
+		{Name: "run_benchmark_local", Args: []string{"job_id", "config", "input_bundle", "runtime_env"}},
+	}}
+
+	unit, ok := pickWarmUnitByName(app, "run_benchmark_local")
+	if !ok {
+		t.Fatal("pickWarmUnitByName(run_benchmark_local) failed")
+	}
+	if !unit.plainFunction || unit.method.Name != "run_benchmark_local" {
+		t.Errorf("pickWarmUnitByName(run_benchmark_local) = %+v, want the plain function run_benchmark_local", unit)
+	}
+}
+
+func TestPickWarmUnitByName_FindsClsMethodByName(t *testing.T) {
+	app := ir.App{Classes: []ir.Class{
+		{Name: "Trainer", EnterBody: "self.model = 1", Methods: []ir.Function{
+			{Name: "train_step", Args: []string{"self", "batch"}},
+		}},
+	}}
+
+	unit, ok := pickWarmUnitByName(app, "train_step")
+	if !ok {
+		t.Fatal("pickWarmUnitByName(train_step) failed")
+	}
+	if unit.plainFunction || unit.class.Name != "Trainer" || unit.method.Name != "train_step" {
+		t.Errorf("pickWarmUnitByName(train_step) = %+v, want Trainer.train_step", unit)
+	}
+}
+
+func TestPickWarmUnitByName_UnknownNameReturnsNotOK(t *testing.T) {
+	app := ir.App{Functions: []ir.Function{{Name: "run_benchmark"}}}
+
+	if _, ok := pickWarmUnitByName(app, "does_not_exist"); ok {
+		t.Error("pickWarmUnitByName(does_not_exist) = ok=true, want false")
+	}
+}
+
+// TestItemFromArgs_BuildsTupleWithFileBytesAndJSONLiterals proves
+// itemFromArgs assembles a SINGLE item whose Payload is a tuple mixing raw
+// file bytes (position covered by --arg-file) with plain JSON literals
+// (positions covered by --arg-json) in the correct order, and reports
+// exactly which positions are base64 bytes — the shape run_benchmark_local's
+// real signature (job_id: str, config: dict, input_bundle: bytes,
+// runtime_env: dict | None) needs.
+func TestItemFromArgs_BuildsTupleWithFileBytesAndJSONLiterals(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/bundle.bin"
+	wantBytes := []byte{0x00, 0x01, 0xff, 'h', 'i'}
+	if err := os.WriteFile(path, wantBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	items, base64Indices, err := itemFromArgs(
+		map[int]string{2: path},
+		map[int]string{0: `"job-42"`, 1: `{"model_name": "romp"}`},
+	)
+	if err != nil {
+		t.Fatalf("itemFromArgs: %v", err)
+	}
+	if len(items) != 1 || items[0].Index != 0 {
+		t.Fatalf("items = %+v, want one Index-0 item", items)
+	}
+	tuple, ok := items[0].Payload.([]any)
+	if !ok || len(tuple) != 3 {
+		t.Fatalf("Payload = %+v (%T), want a 3-element []any", items[0].Payload, items[0].Payload)
+	}
+	if tuple[0] != "job-42" {
+		t.Errorf("tuple[0] = %v, want %q", tuple[0], "job-42")
+	}
+	cfg, ok := tuple[1].(map[string]any)
+	if !ok || cfg["model_name"] != "romp" {
+		t.Errorf("tuple[1] = %v, want a map with model_name=romp", tuple[1])
+	}
+	gotBytes, ok := tuple[2].([]byte)
+	if !ok || !bytes.Equal(gotBytes, wantBytes) {
+		t.Errorf("tuple[2] = %v (%T), want %v", tuple[2], tuple[2], wantBytes)
+	}
+	if len(base64Indices) != 1 || base64Indices[0] != 2 {
+		t.Errorf("base64Indices = %v, want [2]", base64Indices)
+	}
+}
+
+// TestItemFromArgs_GapInIndicesErrors proves a missing position (0 and 2
+// given, 1 skipped) fails loudly instead of silently mis-binding the
+// shipped body's real positional args.
+func TestItemFromArgs_GapInIndicesErrors(t *testing.T) {
+	if _, _, err := itemFromArgs(map[int]string{2: "/tmp/x"}, map[int]string{0: `"a"`}); err == nil {
+		t.Error("itemFromArgs with a gap at index 1 returned nil error, want an error")
+	}
+}
+
+// TestItemFromArgs_DoubleCoveredIndexErrors proves the same index given via
+// BOTH --arg-file and --arg-json is a caller error, not a silent
+// last-one-wins pick.
+func TestItemFromArgs_DoubleCoveredIndexErrors(t *testing.T) {
+	if _, _, err := itemFromArgs(map[int]string{0: "/tmp/x"}, map[int]string{0: `"a"`}); err == nil {
+		t.Error("itemFromArgs with index 0 double-covered returned nil error, want an error")
+	}
+}
+
+// TestItemFromArgs_BadJSONErrors proves an invalid JSON literal fails
+// loudly with a clear cause instead of an opaque downstream JSON error once
+// the manifest is written.
+func TestItemFromArgs_BadJSONErrors(t *testing.T) {
+	if _, _, err := itemFromArgs(nil, map[int]string{0: "not valid json"}); err == nil {
+		t.Error("itemFromArgs with invalid JSON returned nil error, want an error")
+	}
+}

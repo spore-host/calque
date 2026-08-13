@@ -113,6 +113,19 @@ type Config struct {
 	// behavior: payload passed through completely unchanged, whatever
 	// JSON-native shape it already is (str/int/dict/list/...).
 	PayloadIsBase64Bytes bool `json:"payload_is_base64_bytes,omitempty"`
+	// Base64ArgIndices marks WHICH positions of a Starmap payload tuple
+	// arrived as base64-encoded STRINGS (calque real --arg-file IDX=PATH)
+	// and must be decoded back to real `bytes` before the splat call binds
+	// them — the multi-arg sibling of PayloadIsBase64Bytes, needed when a
+	// picked unit's real signature mixes a bytes positional arg with
+	// non-bytes ones (e.g. `def f(job_id: str, config: dict, bundle:
+	// bytes)`), so the whole payload can't be a single base64 string the
+	// way --item-file's one-bytes-arg case is. Every other index in the
+	// same payload (e.g. a dict/str literal from --arg-json) is passed
+	// through completely unchanged. Nil/empty (the default) never touches
+	// any payload — Starmap payloads without this behave exactly as
+	// calque#93 originally shipped them.
+	Base64ArgIndices []int `json:"base64_arg_indices,omitempty"`
 }
 
 // ExtraFunc is one .local()-referenced (calque#92) or bare-referenced
@@ -695,6 +708,7 @@ func (s *Supervisor) warmUp(rn *runner) error {
 		"concurrency": conc, "extras": extras, "extra_consts": extraConsts,
 		"extra_imports": extraImports, "extra_classes": extraClasses,
 		"secrets": s.Config.Secrets, "payload_is_base64_bytes": s.Config.PayloadIsBase64Bytes,
+		"base64_arg_indices": s.Config.Base64ArgIndices,
 	}); err != nil {
 		return err
 	}

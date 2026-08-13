@@ -1,7 +1,9 @@
 package warm
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -340,6 +342,66 @@ func TestExtrasShippedAndCallable(t *testing.T) {
 	}
 }
 
+// TestResultContainingRawBytesRoundTripsAsBase64 is the regression test for
+// a real bug found running AI-Almanac's app.py::run_benchmark_local through
+// this exact Supervisor+runner.py pair (not a synthetic body): its return
+// value nests raw bytes anywhere in an arbitrary structure (files: [{data:
+// path.read_bytes(), ...}, ...]) — plain json.dumps in runner.py's _emit()
+// refused with "Object of type bytes is not JSON serializable", failing
+// every item whose real Modal body returns bytes not at the top level (the
+// INPUT side already had this exact problem solved via
+// PayloadIsBase64Bytes/Base64ArgIndices; the OUTPUT side had no equivalent
+// at all). The fix base64-encodes any bytes value via json.dumps' default=
+// hook, so ANY nesting depth is covered, not just a known top-level shape.
+func TestResultContainingRawBytesRoundTripsAsBase64(t *testing.T) {
+	sink := newMemSink()
+	sup := &Supervisor{
+		Python: python(t),
+		Script: runnerScript(t),
+		Sink:   sink,
+		Config: Config{
+			EnterBody:  `self.ok = True`,
+			MethodBody: `return {"files": [{"filename": "out.bin", "data": bytes([0, 1, 255, 104, 105])}], "ok": True}`,
+			MethodArg:  "payload",
+		},
+	}
+	failed, err := sup.Run(context.Background(), items(1))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %v, want none (a real body returning nested bytes must not fail the item)", failed)
+	}
+	r, ok := sink.results[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	m, ok := r.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("Result = %+v (%T), want a map", r.Result, r.Result)
+	}
+	files, ok := m["files"].([]any)
+	if !ok || len(files) != 1 {
+		t.Fatalf("files = %+v, want a 1-element list", m["files"])
+	}
+	file, ok := files[0].(map[string]any)
+	if !ok {
+		t.Fatalf("files[0] = %+v, want a map", files[0])
+	}
+	dataStr, ok := file["data"].(string)
+	if !ok {
+		t.Fatalf("data = %+v (%T), want a base64 STRING (JSON has no native bytes type)", file["data"], file["data"])
+	}
+	decoded, err := base64.StdEncoding.DecodeString(dataStr)
+	if err != nil {
+		t.Fatalf("data %q is not valid base64: %v", dataStr, err)
+	}
+	want := []byte{0, 1, 255, 104, 105}
+	if !bytes.Equal(decoded, want) {
+		t.Errorf("decoded data = %v, want %v", decoded, want)
+	}
+}
+
 // TestStarmapSplatsRealTuples (calque#93): a .starmap()'d unit's method takes
 // TWO positional params (a, b); each item's payload is a real 2-element
 // tuple, e.g. [3, 4]. Config.Starmap=true + MethodArgs=["a","b"] must compile
@@ -383,6 +445,60 @@ func TestStarmapSplatsRealTuples(t *testing.T) {
 		if !ok || got != want {
 			t.Errorf("index %d: sum=%v, want %v (tuple-splat bound the wrong values, or didn't splat at all)", i, r.Result, want)
 		}
+	}
+}
+
+// TestBase64ArgIndicesDecodesOnlyMarkedTuplePositions (calque real
+// --arg-file/--arg-json) proves a Starmap payload tuple mixing a raw-bytes
+// position with plain literal positions round-trips correctly: Go's
+// encoding/json auto-base64-encodes the []byte element when the item is
+// sent to the runner over the JSON wire protocol, and Base64ArgIndices
+// tells the runner exactly which tuple position to decode back to bytes
+// before splatting — every other position passes through unchanged. This
+// is the mechanism run_benchmark_local's real signature (job_id: str,
+// config: dict, input_bundle: bytes) needs, since payload_is_base64_bytes
+// alone only covers a WHOLE payload being bytes, not one position of a
+// multi-arg tuple.
+func TestBase64ArgIndicesDecodesOnlyMarkedTuplePositions(t *testing.T) {
+	sink := newMemSink()
+	sup := &Supervisor{
+		Python: python(t),
+		Script: runnerScript(t),
+		Sink:   sink,
+		Config: Config{
+			EnterBody:        `self.ok = True`,
+			MethodBody:       "return [job_id, len(bundle), bundle[:2].hex()]",
+			MethodArg:        "job_id",
+			MethodArgs:       []string{"job_id", "bundle"},
+			Starmap:          true,
+			Base64ArgIndices: []int{1},
+		},
+	}
+	rawBytes := []byte{0x00, 0x01, 0xff, 'h', 'i'}
+	its := items([]any{"job-42", rawBytes})
+	failed, err := sup.Run(context.Background(), its)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %v, want none", failed)
+	}
+	r, ok := sink.results[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	got, ok := r.Result.([]any)
+	if !ok || len(got) != 3 {
+		t.Fatalf("Result = %+v (%T), want a 3-element list", r.Result, r.Result)
+	}
+	if got[0] != "job-42" {
+		t.Errorf("job_id = %v, want %q (non-base64 position must pass through unchanged)", got[0], "job-42")
+	}
+	if n, ok := got[1].(float64); !ok || int(n) != len(rawBytes) {
+		t.Errorf("len(bundle) = %v, want %d (base64 position must decode back to the real bytes, not stay a string)", got[1], len(rawBytes))
+	}
+	if got[2] != "0001" {
+		t.Errorf("bundle[:2].hex() = %v, want %q (confirms real byte VALUES, not just length, survived the decode)", got[2], "0001")
 	}
 }
 

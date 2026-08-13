@@ -64,6 +64,26 @@ type realOpts struct {
 	// synthesized-placeholder fallback, matching warmUnitForScript's
 	// existing parse-failure fallback shape.
 	entrypoint string
+	// function, when set, drives this specific @app.function/@cls method by
+	// NAME (calque real --function NAME) instead of pickWarmUnit's automatic
+	// entrypoint/`.map()`-preference scan — takes priority over entrypoint's
+	// own selection. Needed when the target callable isn't reachable through
+	// any @app.local_entrypoint() at all (e.g. AI-Almanac's app.py: its only
+	// entrypoint invokes the sibling run_benchmark, never
+	// run_benchmark_local). "" (the default) reproduces prior behavior
+	// byte-for-byte.
+	function string
+	// argFiles/argJSON (calque real --arg-file IDX=PATH / --arg-json
+	// IDX=JSON) together build a REAL positional-args tuple for a picked
+	// unit whose signature mixes a bytes arg with non-bytes ones (e.g.
+	// run_benchmark_local(job_id: str, config: dict, input_bundle: bytes,
+	// runtime_env: dict | None)) — itemFile's single-whole-payload-is-bytes
+	// design can't express this. Every index from 0 up to the highest given
+	// must be covered by exactly one of the two maps; mutually exclusive
+	// with itemFile and with --n's synthesized/literal items. nil/empty
+	// (the default) reproduces prior behavior byte-for-byte.
+	argFiles map[int]string
+	argJSON  map[int]string
 	// pipPackages are third-party Python packages (calque real --pip
 	// PACKAGE, repeatable) to install via uv on the instance before
 	// running a --script-picked unit's REAL body — closes host mode's
@@ -75,6 +95,13 @@ type realOpts struct {
 	// pythonVersion pins the interpreter uv installs (calque real
 	// --python-version X.Y) — only meaningful alongside pipPackages.
 	pythonVersion string
+	// stageFiles are URL -> absolute-destination-path pairs (calque real
+	// --stage-file URL=PATH, repeatable) downloaded via curl on the
+	// instance before warmd runs — for a picked unit's body that shells
+	// out to a hardcoded absolute path its original Docker image would
+	// have placed there. nil/empty (the default) reproduces prior
+	// behavior byte-for-byte.
+	stageFiles map[string]string
 }
 
 // The real warm-unit bodies: actual vLLM. @enter loads the model ONCE; the
@@ -141,9 +168,30 @@ func realRun(o realOpts) (err error) {
 	// .map()/.starmap() iterable when it's long enough; else (the default,
 	// --script unset) this is byte-identical to the pre-existing synthesized
 	// canned-sentence placeholder.
-	app, unit, _ := warmUnitForScript(ctx, o.script, o.entrypoint, rep)
+	if o.itemFile != "" && (len(o.argFiles) > 0 || len(o.argJSON) > 0) {
+		return fmt.Errorf("--item-file and --arg-file/--arg-json are mutually exclusive")
+	}
+	app, unit, _ := warmUnitForScriptFn(ctx, o.script, o.entrypoint, o.function, rep)
 	var items []warm.Item
-	if o.itemFile != "" {
+	var base64ArgIndices []int
+	forceStarmap := false
+	switch {
+	case len(o.argFiles) > 0 || len(o.argJSON) > 0:
+		// calque real --arg-file IDX=PATH / --arg-json IDX=JSON: a REAL
+		// positional-args tuple for a picked unit whose signature mixes a
+		// bytes arg with non-bytes ones (e.g. run_benchmark_local(job_id:
+		// str, config: dict, bundle: bytes, runtime_env: dict | None)) —
+		// itemFile's single-whole-payload-is-bytes design can't express
+		// this. The unit's own Invoke kind (likely not .starmap() at all —
+		// this may be a plain function that just happens to take several
+		// positional args) is irrelevant here: forceStarmap makes the
+		// runner splat the tuple regardless of what static parsing detected.
+		items, base64ArgIndices, err = itemFromArgs(o.argFiles, o.argJSON)
+		if err != nil {
+			return err
+		}
+		forceStarmap = true
+	case o.itemFile != "":
 		// calque real --item-file PATH: a REAL file's raw bytes as the
 		// single item, for a picked unit whose signature takes `bytes`
 		// (e.g. a netCDF/tarball bundle) — skips realOrSyntheticItems'
@@ -154,7 +202,7 @@ func realRun(o realOpts) (err error) {
 		if err != nil {
 			return err
 		}
-	} else {
+	default:
 		items = realOrSyntheticItems(unit, o.n, func(i int) any {
 			return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
 		}, rep)
@@ -182,8 +230,19 @@ func realRun(o realOpts) (err error) {
 		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
 			"real run driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
 	}
+	if forceStarmap {
+		// --arg-file/--arg-json: the picked unit's real signature is a
+		// tuple of positional args regardless of what static .starmap()
+		// detection found (it may not be .starmap()'d at all — just a
+		// plain multi-arg function like run_benchmark_local) — force the
+		// runner to splat it. body.MethodArgs was already set from the
+		// unit's own real parameter list (nonSelfArgs) by
+		// manifestBodyForUnit above.
+		body.Starmap = true
+	}
 	body.Secrets = o.secrets
 	body.PayloadIsBase64Bytes = o.itemFile != ""
+	body.Base64ArgIndices = base64ArgIndices
 	// calque real --secret NAME=VALUE closes the gap the parser's own
 	// static leak ("secrets recorded but NOT injected in the spike",
 	// internal/parse/parse.go) flags — but only for the names the caller
@@ -243,6 +302,7 @@ func realRun(o realOpts) (err error) {
 		ManifestKey: layout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
 		LogKey: layout.LogKey, HostMode: hostMode, ModelEnv: o.model,
 		PipPackages: o.pipPackages, PythonVersion: o.pythonVersion,
+		StageFiles: o.stageFiles,
 	}
 
 	// Price once via truffle (also R_a).

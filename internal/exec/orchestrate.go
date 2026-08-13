@@ -50,18 +50,23 @@ type Manifest struct {
 	// (calque real --item-file PATH) — every item's Payload has arrived
 	// as a base64 string (Go's own automatic []byte JSON encoding) and
 	// must be decoded back to real bytes before the shipped body sees it.
-	PayloadIsBase64Bytes bool             `json:"payload_is_base64_bytes,omitempty"`
-	Items                []warm.Item      `json:"items"`
-	Bucket               string           `json:"bucket"`
-	ResultPrefix         string           `json:"result_prefix"`
-	SummaryKey           string           `json:"summary_key"`
-	PythonBin            string           `json:"python_bin"`
-	RunnerPath           string           `json:"runner_path"`
-	Occupancy            string           `json:"occupancy_path"`
-	VolumeSync           []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
-	VolumeCommit         []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
-	Concurrency          int              `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
-	BatchSize            int              `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
+	PayloadIsBase64Bytes bool `json:"payload_is_base64_bytes,omitempty"`
+	// Base64ArgIndices mirrors warm.Config's field of the same name
+	// (calque real --arg-file IDX=PATH) — which positions of a Starmap
+	// payload tuple arrived as base64 strings and need decoding back to
+	// bytes before the splat call binds them.
+	Base64ArgIndices []int            `json:"base64_arg_indices,omitempty"`
+	Items            []warm.Item      `json:"items"`
+	Bucket           string           `json:"bucket"`
+	ResultPrefix     string           `json:"result_prefix"`
+	SummaryKey       string           `json:"summary_key"`
+	PythonBin        string           `json:"python_bin"`
+	RunnerPath       string           `json:"runner_path"`
+	Occupancy        string           `json:"occupancy_path"`
+	VolumeSync       []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
+	VolumeCommit     []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
+	Concurrency      int              `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
+	BatchSize        int              `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
 }
 
 // VolumeSyncSpec tells warmd to `aws s3 sync <URI> <MountPath>` before @enter, so
@@ -156,6 +161,11 @@ type ManifestBody struct {
 	// PayloadIsBase64Bytes mirrors warm.Config's field of the same name
 	// (calque real --item-file PATH).
 	PayloadIsBase64Bytes bool
+	// Base64ArgIndices mirrors warm.Config's field of the same name
+	// (calque real --arg-file IDX=PATH) — the multi-arg sibling of
+	// PayloadIsBase64Bytes for a Starmap unit whose real signature mixes
+	// a bytes positional arg with non-bytes ones.
+	Base64ArgIndices []int
 	// PythonBin overrides the interpreter warmd invokes on the instance
 	// (calque#148 follow-up) — "" (the default) keeps the pre-existing
 	// hardcoded "python3". Set to a uv-managed venv's interpreter path
@@ -185,8 +195,8 @@ func writeManifest(ctx context.Context, c *s3.Client, l RunLayout, body Manifest
 		EnterBody: body.EnterBody, MethodBody: body.MethodBody, MethodArg: body.MethodArg,
 		MethodArgs: body.MethodArgs, Starmap: body.Starmap, Extras: body.Extras, ExtraConsts: body.ExtraConsts,
 		ExtraImports: body.ExtraImports, ExtraClasses: body.ExtraClasses, Secrets: body.Secrets,
-		PayloadIsBase64Bytes: body.PayloadIsBase64Bytes,
-		Items:                items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
+		PayloadIsBase64Bytes: body.PayloadIsBase64Bytes, Base64ArgIndices: body.Base64ArgIndices,
+		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: pythonBin, RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
 		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency, BatchSize: l.BatchSize,
 	}

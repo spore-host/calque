@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -196,6 +197,58 @@ func (p pipFlag) Set(pkg string) error {
 	return nil
 }
 
+// stageFileFlag implements flag.Value for a repeatable
+// `--stage-file URL=PATH` flag, mirroring secretsFlag's map-shaped
+// pattern.
+type stageFileFlag map[string]string
+
+func (s stageFileFlag) String() string {
+	return fmt.Sprintf("%d staged file(s)", len(s))
+}
+
+func (s stageFileFlag) Set(kv string) error {
+	url, path, ok := strings.Cut(kv, "=")
+	if !ok || url == "" || path == "" {
+		return fmt.Errorf("--stage-file must be URL=PATH, got %q", kv)
+	}
+	s[url] = path
+	return nil
+}
+
+// intKeyedFlag implements flag.Value for a repeatable `--flag IDX=VALUE`
+// flag keyed by a tuple position (int), used by --arg-file/--arg-json — the
+// generic positional-args mechanism for a picked unit whose real signature
+// mixes a bytes positional arg with non-bytes ones (e.g. AI-Almanac's
+// run_benchmark_local(job_id: str, config: dict, input_bundle: bytes,
+// runtime_env: dict | None)), where --item-file's single-whole-payload-is-
+// bytes design doesn't apply. VALUE's own interpretation (a file path vs. a
+// raw JSON literal) is up to the specific flag using this type, not this
+// type itself.
+type intKeyedFlag map[int]string
+
+func (f intKeyedFlag) String() string {
+	return fmt.Sprintf("%d indexed value(s)", len(f))
+}
+
+func (f intKeyedFlag) Set(kv string) error {
+	idxStr, value, ok := strings.Cut(kv, "=")
+	if !ok {
+		return fmt.Errorf("must be IDX=VALUE, got %q", kv)
+	}
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		return fmt.Errorf("IDX must be an integer, got %q: %w", idxStr, err)
+	}
+	if idx < 0 {
+		return fmt.Errorf("IDX must be >= 0, got %d", idx)
+	}
+	if _, exists := f[idx]; exists {
+		return fmt.Errorf("index %d given more than once", idx)
+	}
+	f[idx] = value
+	return nil
+}
+
 // secretsFlag implements flag.Value for a repeatable `--secret NAME=VALUE`
 // flag — Go's flag package has no built-in repeatable/map flag type, so
 // this is the standard "collect into a map, one flag.Var call per
@@ -233,25 +286,32 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
 	script := fs.String("script", "", "optional Modal script to parse for its REAL .map()/.starmap() iterable (calque#136); empty => today's synthesized-prompt items, unchanged")
 	entrypoint := fs.String("entrypoint", "", "which @app.local_entrypoint() to select when --script has more than one (mimics `modal run file.py::entrypoint`, calque#90); required if --script has 2+ entrypoints")
+	function := fs.String("function", "", "drive this specific @app.function/@cls method by NAME instead of pickWarmUnit's automatic entrypoint/`.map()`-preference scan — for a callable not reachable through any @app.local_entrypoint() at all (e.g. a sibling function only a different entrypoint invokes); takes priority over --entrypoint's own selection")
 	secrets := secretsFlag{}
 	fs.Var(secrets, "secret", "NAME=VALUE, repeatable — injected into the runner's environment before @enter runs (generic counterpart to Modal's secrets=[...], which was previously only recorded, never injected)")
-	itemFile := fs.String("item-file", "", "path to a file whose raw bytes become the SINGLE real item driven through the picked unit's body (e.g. for a `def f(input_bundle: bytes)` signature) — mutually exclusive with --n's synthesized/literal items")
+	itemFile := fs.String("item-file", "", "path to a file whose raw bytes become the SINGLE real item driven through the picked unit's body (e.g. for a `def f(input_bundle: bytes)` signature) — mutually exclusive with --n's synthesized/literal items and with --arg-file/--arg-json")
+	argFiles := intKeyedFlag{}
+	fs.Var(argFiles, "arg-file", "IDX=PATH, repeatable — the picked unit's real signature is a tuple of positional args (like .starmap()); position IDX's arg becomes PATH's raw bytes, base64-decoded back to bytes on the runner side. For a signature mixing bytes with non-bytes args (e.g. `def f(job_id: str, config: dict, bundle: bytes)`), where --item-file's single-whole-payload-is-bytes design doesn't apply. Combine with --arg-json for the non-bytes positions; every position must be covered by exactly one of --arg-file/--arg-json.")
+	argJSON := intKeyedFlag{}
+	fs.Var(argJSON, "arg-json", "IDX=JSON, repeatable — position IDX's arg is this literal JSON value (e.g. a string, number, or object), unmarshaled and passed through unchanged. Sibling of --arg-file for the non-bytes positions of the same tuple.")
 	var pipPackages []string
 	fs.Var(pipFlag{&pipPackages}, "pip", "third-party Python package to install via uv on the instance before running a --script-picked unit's REAL body (calque#148), repeatable — needed when the script's own pip_install(...) chain wasn't statically resolvable (e.g. built via a factory function)")
 	pythonVersion := fs.String("python-version", "", "Python version for uv to install on the instance (calque#148), e.g. 3.11 — only meaningful alongside --pip; empty lets uv pick its own default")
+	stageFiles := stageFileFlag{}
+	fs.Var(stageFiles, "stage-file", "URL=PATH, repeatable — downloads URL to the absolute PATH on the instance (parent dirs created) before warmd runs; for a script body that shells out to a hardcoded absolute path its original Docker image would have placed there")
 	confirmFlag := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
 	if err := fs.Parse(args); err != nil {
 		return realOpts{}, 0, false, false, err
 	}
 	if *bucket == "" || *runID == "" {
-		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--entrypoint NAME] [--secret NAME=VALUE] [--item-file PATH] [--pip PACKAGE] [--python-version X.Y] --i-understand-this-spends-money")
+		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--entrypoint NAME] [--function NAME] [--secret NAME=VALUE] [--item-file PATH] [--arg-file IDX=PATH] [--arg-json IDX=JSON] [--pip PACKAGE] [--python-version X.Y] [--stage-file URL=PATH] --i-understand-this-spends-money")
 	}
 	opts = realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
-		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script, entrypoint: *entrypoint,
+		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script, entrypoint: *entrypoint, function: *function,
 		pipPackages: pipPackages, pythonVersion: *pythonVersion,
-		secrets: secrets, itemFile: *itemFile,
+		secrets: secrets, itemFile: *itemFile, argFiles: argFiles, argJSON: argJSON, stageFiles: stageFiles,
 	}
 	return opts, *shardsFlag, *poolFlag, *confirmFlag, nil
 }

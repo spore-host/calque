@@ -498,6 +498,67 @@ func TestWorker_SecretsAndPayloadBase64BytesSurviveIntoConfig(t *testing.T) {
 	}
 }
 
+// TestWorker_Base64ArgIndicesSurvivesIntoConfig is
+// TestWorker_SecretsAndPayloadBase64BytesSurviveIntoConfig's sibling for
+// Base64ArgIndices (calque real --arg-file/--arg-json, the multi-arg
+// positional-args mechanism for a signature mixing a bytes arg with
+// non-bytes ones) — proves runOne's warm.Config construction carries it
+// through too, not silently dropped the same way this line has now dropped
+// three separate rounds of new fields before their own regression tests
+// existed.
+func TestWorker_Base64ArgIndicesSurvivesIntoConfig(t *testing.T) {
+	q := newFakeQueue()
+	fetcher := &fakeFetcher{}
+	results := &fakeResults{}
+	sup := &warm.Supervisor{Python: python(t), Script: runnerScript(t)}
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+
+	man := calexec.Manifest{
+		EnterBody:        `self.ok = True`,
+		MethodBody:       "return [job_id, len(bundle)]",
+		MethodArg:        "job_id",
+		MethodArgs:       []string{"job_id", "bundle"},
+		Starmap:          true,
+		Base64ArgIndices: []int{1},
+	}
+	man.Items = items([]any{"job-1", []byte("hello")})
+	stageManifest(t, fetcher, "s3://b/claim1.json", man)
+	q.submit(ClaimRef{RunID: "run-1", Model: "resnet", ManifestURI: "s3://b/claim1.json"})
+
+	w := &Worker{
+		Queue: q, Fetcher: fetcher, Results: results, Supervisor: sup,
+		Config: WorkerConfig{Model: "resnet", IdleTimeout: time.Second},
+		now:    clk.now,
+	}
+
+	done := make(chan struct{})
+	var served int
+	var runErr error
+	go func() { served, runErr = w.Run(context.Background()); close(done) }()
+
+	if !drainClock(t, clk, done) {
+		t.Fatal("worker did not drain within 5s")
+	}
+	if runErr != nil {
+		t.Fatalf("Run error: %v", runErr)
+	}
+	if served != 1 {
+		t.Fatalf("claims served = %d, want 1", served)
+	}
+	got := results.sinks[0].Results()
+	r, ok := got[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	list, ok := r.Result.([]any)
+	if !ok || len(list) != 2 || list[0] != "job-1" {
+		t.Fatalf("Result = %+v, want [\"job-1\", 5]", r.Result)
+	}
+	if n, ok := list[1].(float64); !ok || int(n) != 5 {
+		t.Errorf("len(bundle) = %v, want 5 — proves Base64ArgIndices actually reached warm.Config through runOne, not silently dropped", list[1])
+	}
+}
+
 // TestWorker_MismatchedModelClaimIsAckedNotRun: a claim whose Model doesn't
 // match this pool's configured model must be dropped (acked, not executed) —
 // per docs/pool-queue-contract.md decision 2, this should never happen under
