@@ -1,5 +1,7 @@
 # Which command should I use?
 
+**Status:** Authoritative current behavior. Verified through: v0.3.0.
+
 calque has one workload shape (a Modal-decorated script's warm unit, driven
 over real or synthetic items) but several ways to acquire and drive
 hardware for it. This page is purely "which one, when" — for the *why*

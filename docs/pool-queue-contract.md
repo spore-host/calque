@@ -1,7 +1,12 @@
 # Design note: calque's sticky-worker queue contract (M12/#99)
 
-**Status:** spike, decision record. Answers the three questions #99 posed
-before any M12 implementation issue (#100-103) starts. No code in this pass.
+**Status:** Historical design decision. Implemented by: v0.2.0
+(`internal/pool`, `calque pool` — see the README's "Institutional GPU
+sharing" section and `docs/guide/cli-reference.md` for current usage).
+Answers the three questions #99 posed before any M12 implementation issue
+(#100-103) started; correctly said "No code in this pass" AT THE TIME it
+was written — that's no longer true, the design below is now real,
+shipped code.
 
 ## The core incompatibility this resolves
 

@@ -1,8 +1,15 @@
 # Design note: M12 (idle fleet) / M13 (institutional sharing) joint boundary (calque#109)
 
-**Status:** decision record, design-only (no code). Produced so neither
-milestone's implementation issues re-derive or accidentally redesign the
-other's boundary later — both reference this note.
+**Status:** Historical design decision. Implemented by: v0.2.0 (both
+`internal/pool`/M12 and `internal/mig`+`internal/mps`+`internal/tenancy`/
+M13 have since shipped, following the boundary this note establishes).
+Current user documentation: README's "Institutional GPU sharing" section,
+`docs/pool-queue-contract.md`, `docs/gpu-sharing-support-matrix.md`. This
+note's own layering statement (below) is still the live architecture
+rule both layers follow — it was design-only when filed so neither
+milestone's implementation issues would re-derive or accidentally
+redesign the other's boundary; that purpose is now historical, but the
+boundary itself remains correct and referenced.
 
 ## The layering statement
 

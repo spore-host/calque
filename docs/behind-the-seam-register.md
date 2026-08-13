@@ -1,6 +1,10 @@
 # Behind-the-seam register (M10 — what calque deliberately does NOT port)
 
-**Status:** living decision record (§1/§4/§18). The spike proves Modal-shaped GPU
+**Status:** Authoritative current behavior. Verified through: v0.3.0.
+Living decision record (§1/§4/§18) — kept current as primitives ship
+(several rows below have moved from "deferred" to "shipped" as the
+project progressed; check each row's own status, not just this header).
+The spike proves Modal-shaped GPU
 code runs unchanged on AWS. Everything below is **explicitly out of scope** — not
 because it's hard, but because porting it would mean building the "brain" the seam
 (§4) exists to defer. Each entry names the attach point a future build would touch,

@@ -60,11 +60,53 @@ files — file an issue instead. Runtime leak reports (`internal/leak`) are
 
 ## Anything that spends money
 
-The billable commands (`real`, `session`, `smoke`) are gated behind an explicit
-`--i-understand-this-spends-money` flag and default to a dry-run posture. Preserve
-that: any new path that can acquire AWS resources must be opt-in and impossible to
-trigger by accident. Never commit credentials, AMIs tied to an account, or measured
-run artifacts.
+The commands that acquire billable AWS hardware (`smoke`, `real`, `ramp`,
+`pool create`/`scale`, `spawn-run`) are gated behind an explicit
+`--i-understand-this-spends-money` flag and default to a dry-run posture.
+`calque session` is NOT in this set — it never acquires or terminates an
+EC2 instance itself, only checks a slice in/out on one someone else
+already acquired (see `docs/tenancy-vs-session.md`); its risk category is
+different (no hardware isolation under `--backend mps`), gated behind its
+own `--i-understand-shared-gpu-has-no-isolation` flag instead. Preserve
+this distinction: any new path that can acquire AWS resources must be
+opt-in and impossible to trigger by accident, gated behind the flag whose
+risk category actually matches. Never commit credentials, AMIs tied to an
+account, or measured run artifacts.
+
+## Before tagging a release
+
+No version tag should move without checking the authoritative user-facing
+docs against the CLI. Before tagging: diff the current CLI's flag surface
+(`docs/guide/cli-reference.md`) against README/`docs/porting-modal-to-aws.md`/
+`docs/modal-compatibility-matrix.md`'s claims, and confirm no doc still
+describes pre-this-release behavior as current. See the two status-banner
+forms below — a doc marked "Authoritative current behavior" is exactly the
+kind that should be checked here.
+
+## Doc status banners
+
+Every doc in `docs/` should open with one of two status lines, so a reader
+(and a release-checklist reviewer) can tell at a glance whether it
+describes CURRENT behavior or a DESIGN DECISION that may already be
+superseded by shipped code:
+
+```
+**Status:** Authoritative current behavior. Verified through: vX.Y.Z.
+```
+or
+```
+**Status:** Historical design decision. Implemented by: vX.Y.Z.
+Current user documentation: `docs/guide/...` or wherever the shipped
+behavior is actually described.
+```
+
+A design-record doc (the second form) is allowed to describe intent that
+was never built, or that's since been superseded — that's fine, as long
+as the banner makes it unambiguous this ISN'T a live status page. Several
+docs in this repo were found describing already-shipped features as
+"still unbuilt" (or vice versa) simply because nobody updated the status
+line after the code landed — the banner exists so that class of drift is
+easy to spot and fix in one glance, not a full re-read.
 
 ## Questions
 

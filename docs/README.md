@@ -3,6 +3,16 @@
 An index of what each design doc actually answers — start here rather than
 guessing from filenames.
 
+**Doc status banners:** every doc below opens with one of two status
+lines — `Authoritative current behavior` (describes calque as it works
+today) or `Historical design decision` (a design record whose scope has
+since shipped or been superseded — read it for the *why*, not as a
+status page). See `CONTRIBUTING.md`'s "Doc status banners" section for
+the full convention. This exists because several docs in this repo were
+found describing already-shipped features as "still unbuilt" simply
+because nobody updated the status line after the code landed — the
+banner makes that class of drift easy to spot in one glance.
+
 - [`guide/`](guide/README.md) — task-oriented HOW-TO docs (getting started,
   which command to use, CLI reference, troubleshooting). Complementary to
   the design docs below, not a replacement — start there if you just want

@@ -1,7 +1,9 @@
 # Design note: disambiguating "session" — interactive tenancy vs. today's N-item ramp (calque#106)
 
-**Status:** decision record — historical design rationale, superseded by
-shipped code for everything it scoped. Was design-only when filed; every
+**Status:** Historical design decision. Implemented by: v0.2.0 (everything
+it scoped has shipped). Current user documentation: README's
+"Institutional GPU sharing" section, `docs/guide/cli-reference.md`. Was
+design-only when filed; every
 primitive it called for has since shipped: `internal/mig` (MIG slice
 provisioning), `internal/mps` (MPS trusted-tenant mode), `internal/tenancy`
 (generic check-out/check-in registry), closed via #107/#108. The CLI-level

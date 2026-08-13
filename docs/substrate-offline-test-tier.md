@@ -1,6 +1,7 @@
 # Design note: Substrate as calque's offline AWS test tier (calque#114)
 
-**Status:** shipped, then PARTIALLY REGRESSED by calque#106's later
+**Status:** Authoritative current behavior. Verified through: v0.3.0.
+Shipped, then PARTIALLY REGRESSED by calque#106's later
 `Acquirer` → `lagotto/pkg/snipe.Snipe` migration — see "Regression" below.
 `github.com/scttfrdmn/substrate/emulator` (Scott's event-sourced AWS
 emulator) was calque's middle test tier: hand-written fakes at one end,

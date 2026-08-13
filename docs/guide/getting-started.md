@@ -1,5 +1,7 @@
 # Getting started
 
+**Status:** Authoritative current behavior. Verified through: v0.3.0.
+
 This walks from a fresh clone to your first REAL, billable AWS run — the path
 [`examples/README.md`](../../examples/README.md) deliberately stops short of
 (it stays entirely zero-spend). If you just want to see calque's story without
