@@ -140,8 +140,10 @@ product: an omission you can see is a decision, not a bug.
 
 ## Where to go next
 
+- Ready to spend real money and run something for real?
+  [`../docs/guide/getting-started.md`](../docs/guide/getting-started.md) picks up
+  exactly where this page leaves off — first billable smoke test, then a real AWS run.
 - The full pipeline, CLI, and design notes: [`../README.md`](../README.md).
 - What calque deliberately does *not* port, with attach points:
   [`../docs/behind-the-seam-register.md`](../docs/behind-the-seam-register.md).
-- Running for real (billable, gated behind `--i-understand-this-spends-money`):
-  see the CLI section of the top-level README.
+- Every flag, for every command: [`../docs/guide/cli-reference.md`](../docs/guide/cli-reference.md).

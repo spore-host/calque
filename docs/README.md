@@ -3,6 +3,10 @@
 An index of what each design doc actually answers — start here rather than
 guessing from filenames.
 
+- [`guide/`](guide/README.md) — task-oriented HOW-TO docs (getting started,
+  which command to use, CLI reference, troubleshooting). Complementary to
+  the design docs below, not a replacement — start there if you just want
+  to run something; start here if you want to understand a decision.
 - [`modal-compatibility-matrix.md`](modal-compatibility-matrix.md) — does
   calque support MY script? A construct-by-construct census of Modal's real
   API surface against calque's current behavior, sourced from Modal's own

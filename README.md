@@ -71,6 +71,10 @@ running end to end against the unchanged script — parse, gate, plan, warm-exec
 See [`examples/`](examples/) for four annotated journeys (analyze, dry-run, Bedrock
 route-away, and an unsupported-workload refusal), each with real output.
 
+**Ready to run something for real?** [`docs/guide/getting-started.md`](docs/guide/getting-started.md)
+picks up exactly where this section leaves off — smoke test, first real (billable) AWS
+run, then driving your own script's own real body on real hardware.
+
 > **Notes.** `analyze`/`run` reach two best-effort network sources (the Bedrock
 > catalog and the `hf-bedrock-map` API); offline they print a `warn:` line and fall
 > back — a networkless run is not a failure. The binary finds the Python helper
@@ -194,6 +198,17 @@ calque ramp    --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] \
       [--rungs 1,100,1000] \                                    # acquire once, hold, run every rung on it
       --i-understand-this-spends-money
 ```
+
+`calque real --script your_app.py` drives **that script's own real body**, not the
+hardcoded vLLM reference — with flags for the shapes a real script's real signature
+needs: `--function` (select a specific callable by name), `--secret`/`--item-file`/
+`--arg-file`/`--arg-json` (real secrets and real positional payloads, including a
+signature that mixes file bytes with other typed args), `--pip`/`--python-version`
+(install real dependencies calque couldn't statically resolve), `--stage-file`
+(stage a file at a hardcoded path a script's body expects). Full detail, every flag
+for every command: [`docs/guide/cli-reference.md`](docs/guide/cli-reference.md).
+Not sure which command fits your workload? See
+[`docs/guide/which-verb.md`](docs/guide/which-verb.md).
 
 The route-away gate runs on `run`/`real`/`ramp` too: if the model (or `--model`) is already an exact
 Bedrock API call, calque prints the offer and stops **before** acquiring anything.
