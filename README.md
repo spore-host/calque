@@ -180,38 +180,37 @@ The Go control plane understands **decorators** (configuration). It does **not**
 
 ## CLI
 
-```
-calque analyze <script.py> [...]                      # static passes (gate, gpu, leaks, census)
-calque run [--n N] [--region R] [--dry-run] <script.py>   # full pipeline, unchanged script (dry-run default)
-```
+- **`calque analyze <script.py>`** — static passes only (parse, `gpu=` guard, Bedrock
+  gate, leak report). Zero AWS calls, zero cost.
+- **`calque run <script.py>`** — the full pipeline, driven locally against a synthetic
+  sample (`--dry-run`, the default — never launches a billable instance).
+- **`calque smoke`** — the first billable action: an acquire-only de-risking test
+  (acquire → bring up → run a trivial job → collect → terminate) before trusting the
+  plumbing with real inference.
+- **`calque real`** — real inference/compute on acquired hardware — a single instance,
+  or `--shards N` to fan out across a fleet. `--script your_app.py` drives that
+  script's own real body (not a stand-in), with flags for whatever its real signature
+  needs (`--function`, `--secret`, `--item-file`/`--arg-file`/`--arg-json`, `--pip`,
+  `--stage-file`, ...).
+- **`calque ramp`** — acquire one instance patiently, hold it, run an N-item ramp
+  across it over SSM (efficient repeated-N testing without re-paying acquisition).
+- **`calque pool`** — a warm, shared model pool that survives across separate runs/claims.
+- **`calque spawn-run`** — block-and-wait fan-out for a script using Modal's
+  `.spawn()`/`.get()` idiom.
+- **`calque session`** — check a MIG slice or MPS client-slot in/out on an
+  already-running instance (institutional multi-tenancy).
 
-The three commands below acquire billable GPU hardware and are gated behind an explicit
-`--i-understand-this-spends-money` flag — they refuse to launch without it:
+`smoke`/`real`/`ramp`/`pool create`/`pool scale`/`spawn-run` acquire billable AWS
+hardware and refuse to run without an explicit `--i-understand-this-spends-money`
+flag. The route-away gate runs on `run`/`real`/`ramp` too: if the model is already an
+exact Bedrock API call, calque prints the offer and stops **before** acquiring
+anything.
 
-```
-calque smoke   --bucket B --run-id ID [--region R] [--ttl 30m] \
-      --i-understand-this-spends-money                          # acquire-only smoke test
-calque real    --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] \
-      [--model HF_REPO] [--n 1] [--shards 1] \                  # single instance, or --shards N to fan out
-      --i-understand-this-spends-money                          #   across a fleet (§15)
-calque ramp    --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] \
-      [--rungs 1,100,1000] \                                    # acquire once, hold, run every rung on it
-      --i-understand-this-spends-money
-```
-
-`calque real --script your_app.py` drives **that script's own real body**, not the
-hardcoded vLLM reference — with flags for the shapes a real script's real signature
-needs: `--function` (select a specific callable by name), `--secret`/`--item-file`/
-`--arg-file`/`--arg-json` (real secrets and real positional payloads, including a
-signature that mixes file bytes with other typed args), `--pip`/`--python-version`
-(install real dependencies calque couldn't statically resolve), `--stage-file`
-(stage a file at a hardcoded path a script's body expects). Full detail, every flag
-for every command: [`docs/guide/cli-reference.md`](docs/guide/cli-reference.md).
-Not sure which command fits your workload? See
-[`docs/guide/which-verb.md`](docs/guide/which-verb.md).
-
-The route-away gate runs on `run`/`real`/`ramp` too: if the model (or `--model`) is already an exact
-Bedrock API call, calque prints the offer and stops **before** acquiring anything.
+**Not sure which command fits your workload?** See
+[`docs/guide/which-verb.md`](docs/guide/which-verb.md). **Every flag, for every
+command, exactly as the code accepts it:** see
+[`docs/guide/cli-reference.md`](docs/guide/cli-reference.md) — that page is the
+single source of truth for flag syntax; this README intentionally doesn't duplicate it.
 
 ## Institutional GPU sharing
 
@@ -238,16 +237,14 @@ lifecycle design.
 
 ### `calque session`: check-out/check-in on an already-running instance
 
-`calque session checkout --instance-id ID --user U --backend mig|mps [--ttl 2h]` binds one
-user to one MIG slice or MPS client-slot on an instance someone else already acquired — it
-never launches or terminates EC2 instances itself, matching
-[`docs/tenancy-vs-session.md`](docs/tenancy-vs-session.md)'s explicit scope boundary. `mig`
-needs no extra confirmation (hardware-isolated); `mps` requires the same
-`--i-understand-shared-gpu-has-no-isolation` flag `internal/mps` already gates on. Checkout
-prints the checked-out slice ID and a session token; `calque session checkin --slice ID
---session-token T` requires that exact token back and refuses (without releasing the slice)
-if it doesn't match. `calque session status --instance-id ID` and `calque session list
---instance-id ID` report live occupancy and per-slice holders.
+`calque session` binds one user to one MIG slice or MPS client-slot on an instance
+someone else already acquired — it never launches or terminates EC2 instances itself,
+matching [`docs/tenancy-vs-session.md`](docs/tenancy-vs-session.md)'s explicit scope
+boundary. `mig` (hardware-isolated) needs no extra confirmation; `mps` (cooperative, no
+isolation) requires a separate consent flag from the ordinary spend gate, since the risk
+is a different kind. Checkout returns a slice ID and a session token; checkin requires
+that exact token back. Full subcommand/flag detail:
+[`docs/guide/cli-reference.md`](docs/guide/cli-reference.md).
 
 ## Design notes
 
