@@ -9,6 +9,154 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-12
+
+9 commits since v0.2.0: end-to-end real-AWS validation of calque against the
+real [AI-Almanac](https://github.com/AI-Almanac/ai-almanac) Modal script
+corpus — two functions ran unmodified on real AWS hardware with results
+byte-identical to a local reference run — which surfaced several real
+parser/runner correctness gaps (fixed below) and produced four new reusable
+`calque real` CLI primitives, plus a fleet-wide liveness/item-redrive slice
+for `calque fleetrun`.
+
+### Added
+
+- **Fleet-wide worker-pool liveness detection + item-level re-drive**
+  (calque#145 slice 3; 674acc9, a02409e): D2's per-shard wait now fails fast
+  via `WaitForSummaryLivenessAny`/`ErrFleetStale` if EVERY worker in the pool
+  has gone stale, instead of dead-waiting the full deadline when there's no
+  survivor left to claim a redelivered SQS message — a single dead worker
+  among survivors is not fleet death, since SQS's own visibility-timeout
+  redelivery already recovers that case. A new "D4a" pass resubmits just a
+  shard's permanently-failed item indices (`calpool.Summary.Failed`) to the
+  SAME healthy pool via `SubShard`, instead of routing to D4's expensive
+  dedicated-instance fallback; the redrive writes to the original shard's
+  `ResultPrefix`, so `CollectShards`' existing index-keyed union merges the
+  results in for free. New fixture `testdata/scripts/fail_some_items.py`
+  fails on first attempt for specific inputs then succeeds on retry, used to
+  live-validate the slice on a real fleet run: 10/10 items collected, 0
+  missing.
+
+- **Generic secrets injection, volume-sync wiring, and real file-bytes
+  payloads for `calque real`** (1d40dca): three reusable primitives closing
+  gaps found while scoping "does calque produce a real, valid result on real
+  AWS" against the AI-Almanac corpus — none corpus-specific, all three are
+  walls any real-world Modal script could hit. `--secret NAME=VALUE`
+  (repeatable) injects name/value pairs into the runner's environment before
+  `@enter` runs — the generic counterpart to Modal's `secrets=[...]`, which
+  calque's parser only ever recorded until now; `realrun.go` also leaks
+  which of a script's own declared secret names weren't covered. Volume-sync
+  plumbing (`plan.ResolveVolumes`/`VolumeSyncSpec`, warmd's `aws-s3-sync`
+  stage-then-commit) — already complete and tested — is now actually wired
+  into `realrun.go`/`fleetrun.go` (D2, D4, D4a) instead of every real writer
+  passing `nil, nil`; volumes are derived automatically from the picked
+  unit's own `modal.Volume.from_name(...)` reference, no new flag. New
+  `ir.App.CommittedVolumes` tracks which volumes the script actually
+  `.commit()`'s vs. download-only. `--item-file PATH` wraps a real file's raw
+  bytes as a single item for a unit whose signature takes `bytes`, gated on
+  `Config.PayloadIsBase64Bytes`.
+
+- **Real script dependency installation via `uv`, not the AMI's system
+  Python** (f757b9e; uv-invocation fix 7dd55dd): host mode's "dependencies
+  must already be on the AMI" limitation was previously just a leak, never
+  an actual fix — confirmed by calque#148's live validation, where
+  AI-Almanac's `blending_app.py` failed with `No module named 'xarray'` once
+  the IAM fix (below) let the run reach that point. New `calque real --pip
+  PACKAGE` (repeatable) + `--python-version X.Y` let the caller supply the
+  real dependency list explicitly, since calque's own image-chain resolution
+  can't always statically see a script's real `pip_install(...)` list (e.g.
+  built via a factory function). Installs via `uv`, fresh every boot via its
+  own curl script, regardless of AMI/distro (Amazon Linux 2023 — spawn's
+  auto-selected AMI for non-GPU instance types — has no apt-get at all, now
+  given a dnf fallback for the no-deps path too), pins a specific Python
+  version, and installs into an isolated venv. The first cut of the venv
+  bootstrap command invoked a nonexistent `<venv>/bin/uv` (`uv venv` doesn't
+  copy the uv binary into the venv); the follow-up fix invokes the
+  top-level `uv` with `--python <venv>/bin/python3` instead, uv's documented
+  way to target an existing venv — caught immediately by this session's own
+  fast-fail bootstrap-log check rather than a 15-minute dead-wait.
+  `ManifestBody` gains a `PythonBin` field kept in sync with the venv path
+  warmd's manifest-driven interpreter selection reads.
+
+- **Multi-arg positional payloads, `--function` selection, and bytes-safe
+  output encoding** (9c0dc5a): closes the gap `--item-file` left — a real
+  signature mixing a bytes arg with non-bytes ones (AI-Almanac's
+  `run_benchmark_local(job_id: str, config: dict, input_bundle: bytes,
+  runtime_env: dict | None)`) can't be expressed as a single
+  whole-payload-is-bytes item. `--function NAME` selects a specific
+  `@app.function`/`@cls` method directly (`pickWarmUnitByName`), bypassing
+  entrypoint-based selection, since `run_benchmark_local` isn't reachable
+  through any `@app.local_entrypoint()` at all. `--arg-file IDX=PATH` /
+  `--arg-json IDX=JSON` build a real positional tuple mixing file bytes with
+  literal JSON values; runner.py's `Base64ArgIndices` decodes only the
+  marked tuple positions back to bytes before the splat call binds them.
+  `--stage-file URL=PATH` downloads a file to a hardcoded absolute path a
+  script's body expects. Also fixes a real bug found running
+  `run_benchmark_local` end-to-end: runner.py's output-side JSON encoding had
+  no bytes handling at all — a body returning nested bytes (e.g. file
+  contents in a results list) failed every item; `json.dumps`' `default=`
+  hook now base64-encodes any bytes value at any nesting depth, the
+  output-side counterpart to the existing input-side decoding. Live-verified
+  on real AWS (m6i.large): `app.py`'s `run_benchmark_local` ran unmodified
+  against the real public `momp` package and real Ethiopia climate data,
+  produced 5 real ROMP output files, byte-identical to a local reference
+  run.
+
+### Fixed
+
+- **Module-level bare-referenced imports and classes are now shipped**
+  (calque#146/#147; fcdcf05): a picked warm unit's body could bare-reference
+  a module-level `import X` statement (e.g. `Path(...)` after `from pathlib
+  import Path`, or even `import modal` itself) or a plain, non-`@app.cls`
+  helper class, with no way to ship either — calque#139 shipped
+  functions/constants but explicitly left imports unresolved, and classes
+  were never considered. Both were unconditional `NameError`s on execution
+  despite the script parsing cleanly, discovered by running the real
+  AI-Almanac corpus through `calque run --dry-run`: all 3 real scripts hit
+  this on their very first `@enter` call. `tools/pyast`'s
+  `_module_bindings` now also collects module-level import statements and
+  plain classes; `ir.App` gains `ModuleImports`/`ModuleClasses`, and
+  `ModuleConst` is promoted from a bare string to `{Source, FreeRefs}` so
+  the transitive resolution walk continues through a shipped constant whose
+  own RHS needs an import too (calque#146.2). Also found and fixed while
+  tracing the fleet-pool execution path: `Worker.runOne`'s `warm.Config`
+  construction silently dropped `MethodArgs`/`Starmap`/`Extras`/
+  `ExtraConsts` entirely, so any fleet-pool claim for a script using
+  `.starmap()` or sibling functions/constants would mis-bind or `NameError`
+  even though the identical manifest ran fine through the single-instance
+  path — fixed to mirror `runOnInstance`'s full field set (now also
+  `ExtraImports`/`ExtraClasses`).
+
+- **`--entrypoint` now works on `calque real`/`fleetrun`** (9f3948a):
+  neither command accepted an `--entrypoint` flag at all, unlike `run
+  --dry-run`'s own `--entrypoint`/`resolveEntrypoint` — `warmUnitForScript`
+  called `pickWarmUnit(app, "")` unconditionally, so a multi-entrypoint
+  script (e.g. AI-Almanac's `blending_app.py`, 7 entrypoints) had no way to
+  pick which one to drive on real AWS, found while attempting a live
+  validation run, which failed immediately with "flag provided but not
+  defined: -entrypoint" before any spend happened. `warmUnitForScript` now
+  calls the existing `resolveEntrypoint` and degrades to the same
+  synthesized-placeholder-with-leak fallback as a parse failure when the
+  requested name doesn't resolve or is ambiguous.
+
+- **IAM instance profile now attached to single-instance real-AWS launches**
+  (calque#148; 85fb8c4): every single-instance real-AWS launch path
+  (`calque real`, fleetrun's D4 dedicated-instance fallback, `smoke`,
+  `ramp`, spawn-run) launched EC2 instances with NO IAM instance profile at
+  all — confirmed via `spawn/pkg/aws/client.go`'s `Launch`, a pure
+  passthrough with no implicit default. Found via a real run against
+  `blending_app.py` that timed out after 15 minutes with zero bootstrap log
+  ever landing in S3; live SSM investigation on a throwaway instance
+  confirmed `describe-instances --query IamInstanceProfile` returned `[]`,
+  so the bootstrap's `aws s3 cp` calls (including the observability trap's
+  own failure-log upload) had nothing to authenticate with. New
+  `internal/plan/iam.go` mirrors `internal/pool`'s existing
+  `WorkerPolicy`/`CreateOrGetInstanceProfile` pattern for a single-instance
+  run (`RealRunPolicy`: S3 GetObject/PutObject/ListBucket scoped to the
+  run's own bucket, no SQS) via `RealRunInstanceProfile`, wired into every
+  affected call site; `SpawnLauncher` gains an `IamInstanceProfile` field
+  threaded through `Build()`.
+
 ## [0.2.0] - 2026-08-10
 
 32 commits since v0.1.0: quota-aware fleet launching, spot support, multi-
