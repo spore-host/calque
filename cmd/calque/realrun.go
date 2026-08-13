@@ -64,6 +64,17 @@ type realOpts struct {
 	// synthesized-placeholder fallback, matching warmUnitForScript's
 	// existing parse-failure fallback shape.
 	entrypoint string
+	// pipPackages are third-party Python packages (calque real --pip
+	// PACKAGE, repeatable) to install via uv on the instance before
+	// running a --script-picked unit's REAL body — closes host mode's
+	// previous "dependencies must already be on the AMI" gap (calque#148
+	// follow-up) for scripts whose image chain wasn't statically
+	// resolvable. nil/empty (the default) reproduces prior behavior
+	// byte-for-byte.
+	pipPackages []string
+	// pythonVersion pins the interpreter uv installs (calque real
+	// --python-version X.Y) — only meaningful alongside pipPackages.
+	pythonVersion string
 }
 
 // The real warm-unit bodies: actual vLLM. @enter loads the model ONCE; the
@@ -204,6 +215,15 @@ func realRun(o realOpts) (err error) {
 	// before calque#79) gets an empty slice both ways — byte-for-byte
 	// unchanged behavior.
 	volumeSync, volumeCommit := volumeSpecsForApp(app, o.bucket, rep)
+	// calque#148 follow-up: when --pip supplies real deps, warmd must
+	// invoke the SAME uv-managed venv's interpreter the bootstrap command
+	// below creates (BootstrapConfig.PipPackages) — the manifest's
+	// PythonBin and the bootstrap's venv path MUST derive from the same
+	// hostWorkerDir or warmd falls back to a bare "python3" that was
+	// never pip-installed into.
+	if len(o.pipPackages) > 0 {
+		body.PythonBin = hostWorkerDir + "/.venv/bin/python3"
+	}
 	if err := calexec.WriteManifestBody(ctx, s3c, layout, body, hostWorkerDir, items, volumeSync, volumeCommit); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
@@ -222,6 +242,7 @@ func realRun(o realOpts) (err error) {
 		BaseImage: "vllm/vllm-openai:latest", Bucket: o.bucket, ArtifactPrefix: layout.ArtifactPfx,
 		ManifestKey: layout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
 		LogKey: layout.LogKey, HostMode: hostMode, ModelEnv: o.model,
+		PipPackages: o.pipPackages, PythonVersion: o.pythonVersion,
 	}
 
 	// Price once via truffle (also R_a).

@@ -25,6 +25,25 @@ type BootstrapConfig struct {
 	// acquire-only smoke test to isolate acquisition + instance-role S3 + collect +
 	// terminate from the docker/GPU/model layer. Real inference uses docker mode.
 	HostMode bool
+	// PipPackages are third-party Python packages the picked unit's REAL body
+	// needs (calque#148 follow-up) — host-mode previously had NO dependency-
+	// install step at all, just a bare `command -v python3` check + a leak
+	// saying "dependencies must already be on the AMI." When non-empty,
+	// installed via `uv` (curl-installed fresh every boot, not a package-
+	// manager assumption — works identically on any distro, unlike the
+	// apt-get-only fallback this replaces for host mode's python3 check)
+	// into a fresh venv, so a real script's actual pip_install(...) list
+	// (or a caller-supplied override when the script's image chain wasn't
+	// statically resolvable, e.g. built via a factory function) can
+	// actually run instead of NameError-ing on a missing import. Also pins
+	// a specific Python version via `uv python install` rather than
+	// depending on whatever python3 the AMI happens to ship.
+	PipPackages []string
+	// PythonVersion pins the interpreter uv installs (e.g. "3.11") to match
+	// what the script's own image declared (Modal's debian_slim(python_version=)),
+	// instead of depending on the AMI's system Python. Empty lets uv pick its
+	// own default (currently the latest stable CPython).
+	PythonVersion string
 }
 
 // Command builds the shell command the instance runs (via spawn JobArrayCommand /
@@ -65,11 +84,54 @@ func (b BootstrapConfig) Command() string {
 	)
 
 	if b.HostMode {
-		// Smoke test: run warmd directly on the host — no docker, no GPU, no model.
-		// Isolates acquisition + instance-role S3 + collect + terminate. runner.py
-		// needs only python3, which DL AMIs (and most Ubuntu AMIs) have.
+		// Smoke test / real-AWS host-mode: run warmd directly on the host —
+		// no docker, no GPU-container layer. Isolates acquisition +
+		// instance-role S3 + collect + terminate from the docker/GPU/model
+		// layer for the smoke test; for a real --script run, this is the
+		// path that drives a picked unit's OWN parsed body (calque#79).
+		if len(b.PipPackages) > 0 || b.PythonVersion != "" {
+			// calque#148 follow-up: install uv fresh every boot (its own
+			// installer script, NOT a distro package-manager assumption —
+			// works identically on AL2023/Ubuntu/Debian, unlike the
+			// apt-get-only python3 fallback this replaces) and use it to
+			// pin a Python version + install the picked unit's REAL
+			// third-party deps into a venv, instead of leaking "must
+			// already be on the AMI" and NameError-ing on execution.
+			pyVer := b.PythonVersion
+			if pyVer == "" {
+				pyVer = "3.12"
+			}
+			lines = append(lines,
+				"command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh",
+				`export PATH="$HOME/.local/bin:$PATH"`,
+				fmt.Sprintf("uv python install %s", pyVer),
+				fmt.Sprintf("uv venv --python %s %s/.venv", pyVer, wd),
+			)
+			if len(b.PipPackages) > 0 {
+				quoted := make([]string, len(b.PipPackages))
+				for i, p := range b.PipPackages {
+					quoted[i] = fmt.Sprintf("%q", p)
+				}
+				lines = append(lines,
+					fmt.Sprintf("%s/.venv/bin/uv pip install %s", wd, strings.Join(quoted, " ")),
+				)
+			}
+			// warmd itself reads the interpreter path from the MANIFEST's
+			// own PythonBin field (cmd/warmd/main.go's pyOr), not an env
+			// var — the caller building this ManifestBody MUST set
+			// PythonBin to this exact "<wd>/.venv/bin/python3" path
+			// (internal/exec.ManifestBody.PythonBin) or warmd falls back
+			// to plain "python3", which was never pip-installed into.
+			lines = append(lines,
+				fmt.Sprintf("AWS_REGION=%s %s/warmd run --manifest %s", b.Region, wd, manifest),
+			)
+			return strings.Join(lines, "\n")
+		}
+		// No real deps needed (or none supplied) — unchanged pre-#148 path:
+		// runner.py needs only python3, which DL AMIs (and most Ubuntu
+		// AMIs) have.
 		lines = append(lines,
-			"command -v python3 >/dev/null || (apt-get update && apt-get install -y python3)",
+			"command -v python3 >/dev/null || (sudo apt-get update && sudo apt-get install -y python3 || sudo dnf install -y python3)",
 			fmt.Sprintf("AWS_REGION=%s %s/warmd run --manifest %s", b.Region, wd, manifest),
 		)
 		return strings.Join(lines, "\n")

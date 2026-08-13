@@ -178,6 +178,24 @@ func realCmd(args []string) error {
 // checked by the caller) without launching anything — split out from realCmd
 // so flag wiring (in particular --spot/--spot-max-price, calque#94) is
 // unit-testable on its own.
+// pipFlag implements flag.Value for a repeatable `--pip PACKAGE` flag —
+// Go's flag package has no built-in repeatable/slice flag type, so this
+// is the standard "collect into a slice, one flag.Var call per
+// occurrence" pattern, mirroring secretsFlag's map-shaped sibling below.
+type pipFlag struct{ packages *[]string }
+
+func (p pipFlag) String() string {
+	if p.packages == nil {
+		return ""
+	}
+	return strings.Join(*p.packages, ",")
+}
+
+func (p pipFlag) Set(pkg string) error {
+	*p.packages = append(*p.packages, pkg)
+	return nil
+}
+
 // secretsFlag implements flag.Value for a repeatable `--secret NAME=VALUE`
 // flag — Go's flag package has no built-in repeatable/map flag type, so
 // this is the standard "collect into a map, one flag.Var call per
@@ -218,17 +236,21 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 	secrets := secretsFlag{}
 	fs.Var(secrets, "secret", "NAME=VALUE, repeatable — injected into the runner's environment before @enter runs (generic counterpart to Modal's secrets=[...], which was previously only recorded, never injected)")
 	itemFile := fs.String("item-file", "", "path to a file whose raw bytes become the SINGLE real item driven through the picked unit's body (e.g. for a `def f(input_bundle: bytes)` signature) — mutually exclusive with --n's synthesized/literal items")
+	var pipPackages []string
+	fs.Var(pipFlag{&pipPackages}, "pip", "third-party Python package to install via uv on the instance before running a --script-picked unit's REAL body (calque#148), repeatable — needed when the script's own pip_install(...) chain wasn't statically resolvable (e.g. built via a factory function)")
+	pythonVersion := fs.String("python-version", "", "Python version for uv to install on the instance (calque#148), e.g. 3.11 — only meaningful alongside --pip; empty lets uv pick its own default")
 	confirmFlag := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
 	if err := fs.Parse(args); err != nil {
 		return realOpts{}, 0, false, false, err
 	}
 	if *bucket == "" || *runID == "" {
-		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--entrypoint NAME] [--secret NAME=VALUE] [--item-file PATH] --i-understand-this-spends-money")
+		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--entrypoint NAME] [--secret NAME=VALUE] [--item-file PATH] [--pip PACKAGE] [--python-version X.Y] --i-understand-this-spends-money")
 	}
 	opts = realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
 		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script, entrypoint: *entrypoint,
+		pipPackages: pipPackages, pythonVersion: *pythonVersion,
 		secrets: secrets, itemFile: *itemFile,
 	}
 	return opts, *shardsFlag, *poolFlag, *confirmFlag, nil

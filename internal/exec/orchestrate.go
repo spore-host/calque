@@ -156,6 +156,17 @@ type ManifestBody struct {
 	// PayloadIsBase64Bytes mirrors warm.Config's field of the same name
 	// (calque real --item-file PATH).
 	PayloadIsBase64Bytes bool
+	// PythonBin overrides the interpreter warmd invokes on the instance
+	// (calque#148 follow-up) — "" (the default) keeps the pre-existing
+	// hardcoded "python3". Set to a uv-managed venv's interpreter path
+	// (e.g. "<workerDir>/.venv/bin/python3") when BootstrapConfig.PipPackages
+	// is non-empty, so the manifest's own PythonBin matches whatever
+	// bootstrap actually creates — this MUST stay in sync with
+	// BootstrapConfig.Command()'s own venv path construction (both derive
+	// it from the same workerDir, but there is no shared helper enforcing
+	// that; a caller setting one without the other will point warmd at a
+	// python3 that was never actually pip-installed into).
+	PythonBin string
 }
 
 // WriteManifestBody is WriteManifestFull with a full ManifestBody instead of
@@ -166,13 +177,17 @@ func WriteManifestBody(ctx context.Context, c *s3.Client, l RunLayout, body Mani
 }
 
 func writeManifest(ctx context.Context, c *s3.Client, l RunLayout, body ManifestBody, workerDir string, items []warm.Item, volumeSync, volumeCommit []VolumeSyncSpec) error {
+	pythonBin := body.PythonBin
+	if pythonBin == "" {
+		pythonBin = "python3"
+	}
 	man := Manifest{
 		EnterBody: body.EnterBody, MethodBody: body.MethodBody, MethodArg: body.MethodArg,
 		MethodArgs: body.MethodArgs, Starmap: body.Starmap, Extras: body.Extras, ExtraConsts: body.ExtraConsts,
 		ExtraImports: body.ExtraImports, ExtraClasses: body.ExtraClasses, Secrets: body.Secrets,
 		PayloadIsBase64Bytes: body.PayloadIsBase64Bytes,
 		Items:                items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
-		PythonBin: "python3", RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
+		PythonBin: pythonBin, RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
 		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency, BatchSize: l.BatchSize,
 	}
 	buf, err := json.Marshal(man)
