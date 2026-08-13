@@ -1,8 +1,11 @@
 # examples
 
-Four journeys that show calque's whole story **without spending a cent** — no AWS
-GPU is launched by anything on this page. Each is a real command with its actual
-(abbreviated) output.
+Five journeys that show calque's whole story. The first four cost **nothing** —
+no AWS instance is launched by anything through §4. The fifth is different and
+clearly marked: it's a **recorded transcript** of a real, billable AWS run,
+included because real execution is one of calque's strongest proof points and
+deserves showing, not just describing in a changelog. Each journey is a real
+command with its actual (abbreviated) output.
 
 > These `.py` files are byte-for-byte copies of the canonical fixtures in
 > `testdata/scripts/` (which the parser tests and the spike spec reference by
@@ -135,6 +138,64 @@ LEAKS: 4 emitted across 2 primitives
 What to notice: the `gpu=` swap is **NOT substituted**, and each refusal is a
 structured leak with the reason. calque's graceful refusals are part of the
 product: an omission you can see is a decision, not a bug.
+
+---
+
+## 5. A real script, real AWS hardware, a real result — this one costs money
+
+> **This journey is NOT zero-spend.** It's a recorded transcript of an
+> actual billable run (`calque real`, ~$0.10/hr `m6i.large`, a few
+> minutes), included as evidence rather than something meant to be
+> re-run casually. If you want to run this yourself, read
+> [`../docs/guide/getting-started.md`](../docs/guide/getting-started.md)
+> first — it covers the AWS prerequisites and the `smoke`-before-`real`
+> de-risking step this transcript skips for brevity.
+
+Everything above proves calque parses, guards, and locally dry-runs a
+script faithfully. This journey proves the last mile: `AI-Almanac`'s real,
+unmodified `blending_app.py` — a script from a real customer's Modal app,
+never modified for calque — ran its own `inspect_netcdf_bundle` function on
+a real AWS instance, against a real netCDF climate-data file
+(`--item-file`, since the function's real signature takes `bytes`), and
+returned the exact same result a local reference execution of the same
+function did.
+
+```
+./calque real --bucket YOUR-BUCKET --run-id blending-demo \
+  --instance m6i.large --script blending_app.py \
+  --entrypoint inspect_local_netcdfs --item-file 1998.nc \
+  --i-understand-this-spends-money
+```
+
+```
+=== calque REAL GPU run (model=Qwen/Qwen2.5-1.5B-Instruct N=1 region=us-east-1 instance=m6i.large) ===
+[1/8] built warmd (linux/amd64)
+[2/8] uploaded artifacts
+[3/8] wrote manifest (1 items, inspect_netcdf_bundle's own @enter+@method)
+      priced m6i.large @ us-east-1 = $0.0960/hr (truffle)
+[4/8] acquiring m6i.large in us-east-1 (block-and-wait, AZ-sweep)...
+      acquired i-0c9e1996a0c0d4357 (us-east-1a) after 3s
+[5/8] waiting for warmd summary (vLLM load + 1 generations)...
+      ...running (15s)
+      ...running (30s)
+[6/8] summary: @enter x1 (0.1s load), 1 items, 0 failed, occupancy unmeasured (none)
+[7/8] collected 1/1 results (0 missing)
+      sample result[0]: dims: {day: 46, lat: 5, lon: 5, time: 26}, coords: [lat, lon, time, day], data_vars.tp.shape: [26, 46, 5, 5]
+
+[8/8] terminating i-0c9e1996a0c0d4357 ...
+      terminated i-0c9e1996a0c0d4357
+```
+
+What to notice: `0 failed`, and the `dims`/`coords`/`data_vars.tp.shape`
+values are **byte-identical** to running `inspect_netcdf_bundle` locally
+against the same file — the real function, unmodified, on real hardware,
+against real data, produced the real answer. The instance terminated
+cleanly afterward. `CHANGELOG.md`'s `[0.3.0]` entry has the full account,
+including two real bugs this exact validation pass found and fixed along
+the way (a missing IAM instance profile, and host-mode's missing
+dependency-install step) — the kind of finding that only shows up once you
+actually run something for real, which is the whole reason this journey
+exists.
 
 ---
 
