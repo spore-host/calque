@@ -217,7 +217,8 @@ single source of truth for flag syntax; this README intentionally doesn't duplic
 A second, related use case: once a workload is on infrastructure you control, an institution
 can make utilization and trust decisions Modal reasonably can't make for arbitrary public
 tenants. calque has real, tested primitives for this — a warm model pool, and two ways to
-divide one physical GPU across concurrent users:
+divide one physical GPU across concurrent users. Full design detail for all three, in one
+place: [`docs/institutional-sharing.md`](docs/institutional-sharing.md).
 
 - **Warm pools** (`calque pool`) — a model-scoped SQS queue with resident workers that keep a
   loaded model warm across separate claims, instead of paying `@enter`'s load cost per run. See

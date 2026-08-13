@@ -17,6 +17,9 @@ banner makes that class of drift easy to spot in one glance.
   which command to use, CLI reference, troubleshooting). Complementary to
   the design docs below, not a replacement — start there if you just want
   to run something; start here if you want to understand a decision.
+- [`institutional-sharing.md`](institutional-sharing.md) — landing page for
+  the pool/MIG/MPS/session material below: the core-vs-extension framing,
+  and which of the four docs answers which question.
 - [`modal-compatibility-matrix.md`](modal-compatibility-matrix.md) — does
   calque support MY script? A construct-by-construct census of Modal's real
   API surface against calque's current behavior, sourced from Modal's own
