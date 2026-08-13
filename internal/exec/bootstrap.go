@@ -108,12 +108,17 @@ func (b BootstrapConfig) Command() string {
 				fmt.Sprintf("uv venv --python %s %s/.venv", pyVer, wd),
 			)
 			if len(b.PipPackages) > 0 {
+				// `uv venv` creates a plain venv (python3/pip only) — it
+				// does NOT copy the uv binary itself in. Installing into
+				// that venv means invoking the TOP-LEVEL uv with
+				// --python pointed at the venv's interpreter, not
+				// expecting a uv binary inside .venv/bin.
 				quoted := make([]string, len(b.PipPackages))
 				for i, p := range b.PipPackages {
 					quoted[i] = fmt.Sprintf("%q", p)
 				}
 				lines = append(lines,
-					fmt.Sprintf("%s/.venv/bin/uv pip install %s", wd, strings.Join(quoted, " ")),
+					fmt.Sprintf("uv pip install --python %s/.venv/bin/python3 %s", wd, strings.Join(quoted, " ")),
 				)
 			}
 			// warmd itself reads the interpreter path from the MANIFEST's

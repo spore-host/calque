@@ -53,7 +53,7 @@ func TestBootstrapCommandHostModeWithPipInstallsUvAndPackages(t *testing.T) {
 		"uv python install 3.11",
 		"uv venv --python 3.11 /tmp/calque/.venv",
 		`"xarray"`, `"h5netcdf"`,
-		"/tmp/calque/.venv/bin/uv pip install",
+		"uv pip install --python /tmp/calque/.venv/bin/python3",
 	} {
 		if !strings.Contains(cmd, w) {
 			t.Errorf("missing %q in:\n%s", w, cmd)
