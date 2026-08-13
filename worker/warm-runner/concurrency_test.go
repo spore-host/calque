@@ -127,7 +127,7 @@ return payload * 10`,
 		},
 	}
 	_ = exec.Command("rm", "-f", "/tmp/calque_conc_crash").Run()
-	defer exec.Command("rm", "-f", "/tmp/calque_conc_crash").Run()
+	defer func() { _ = exec.Command("rm", "-f", "/tmp/calque_conc_crash").Run() }()
 
 	n := 12
 	its := make([]Item, n)

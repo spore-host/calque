@@ -19,7 +19,7 @@ import (
 
 func poolCmd(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: calque pool <create|scale|delete|status|list> --model M ...")
+		return fmt.Errorf("usage: calque pool <create|scale|delete|status|list> --model M")
 	}
 	switch args[0] {
 	case "create":

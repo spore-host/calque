@@ -1,0 +1,15 @@
+version: "2"
+
+# calque#164: sane defaults only. Deliberately NOT reaching for an
+# aggressive/opinionated ruleset (revive, gocritic strict, etc.) on day
+# one -- start with what `golangci-lint run` already enables out of the
+# box (errcheck, govet, ineffassign, staticcheck, unused), matching how
+# gofmt/go vet were adopted plainly rather than with extensive custom
+# config. A stricter ruleset is a deliberate follow-up once the baseline
+# is clean and false-positive rates are known.
+linters:
+  default: standard
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

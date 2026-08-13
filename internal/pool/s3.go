@@ -30,7 +30,7 @@ func (m *S3Manifests) Fetch(ctx context.Context, manifestURI string) ([]byte, er
 	if err != nil {
 		return nil, fmt.Errorf("fetch manifest %s: %w", manifestURI, err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 	buf, err := io.ReadAll(out.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest %s: %w", manifestURI, err)

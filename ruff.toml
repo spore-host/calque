@@ -1,0 +1,16 @@
+# calque#164: sane defaults only (ruff's own default rule set - pyflakes +
+# a slice of pycodestyle). Scoped to calque's OWN Python source
+# (tools/pyast, worker/warm-runner); testdata/ and examples/ are excluded
+# on purpose -- testdata/ holds real fetched third-party corpus scripts
+# (with their own real unused imports etc.) and deliberately-incomplete
+# synthetic fixtures (e.g. an intentionally-undefined name is the test
+# scenario, not a bug); examples/ is a byte-for-byte copy of some of
+# those same fixtures (guarded by examples_test.go), so it inherits the
+# same "intentionally broken" content. Linting either would be
+# permanent, correct-to-ignore noise, not a backlog worth clearing.
+extend-exclude = ["testdata", "examples"]
+
+[lint]
+# Default rule set (pyflakes "F" + a slice of pycodestyle "E"/"W") --
+# deliberately not opting into ruff's wider rule catalog on day one,
+# matching how golangci-lint was adopted with its own plain defaults.

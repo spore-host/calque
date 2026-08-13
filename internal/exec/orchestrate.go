@@ -118,7 +118,7 @@ func UploadArtifacts(ctx context.Context, c *s3.Client, l RunLayout, warmdBin, r
 			Key:    aws.String(l.ArtifactPfx + "/" + name),
 			Body:   f,
 		})
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			return fmt.Errorf("put %s: %w", name, err)
 		}
@@ -477,7 +477,7 @@ func tryGet(ctx context.Context, c *s3.Client, bucket, key string) ([]byte, bool
 	if err != nil {
 		return nil, false
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 	buf, rerr := io.ReadAll(out.Body)
 	if rerr != nil {
 		return nil, false

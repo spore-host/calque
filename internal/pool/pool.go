@@ -496,7 +496,7 @@ func (w *Worker) logf(format string, a ...interface{}) {
 	if w.Config.Log == nil {
 		return
 	}
-	fmt.Fprintf(w.Config.Log, "[pool worker] "+format+"\n", a...)
+	_, _ = fmt.Fprintf(w.Config.Log, "[pool worker] "+format+"\n", a...)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

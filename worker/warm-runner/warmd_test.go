@@ -152,7 +152,7 @@ return payload * 10`,
 	}
 	// clean any stale marker
 	_ = exec.Command("rm", "-f", "/tmp/calque_crash_marker").Run()
-	defer exec.Command("rm", "-f", "/tmp/calque_crash_marker").Run()
+	defer func() { _ = exec.Command("rm", "-f", "/tmp/calque_crash_marker").Run() }()
 
 	its := items(0, 1, 2, 3, 4)
 	failed, err := sup.Run(context.Background(), its)

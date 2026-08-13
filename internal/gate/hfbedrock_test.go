@@ -17,16 +17,16 @@ func hfServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/index.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"version":"v1","generatedAt":"2026-07-16T07:37:42Z","count":2}`))
+		_, _ = w.Write([]byte(`{"version":"v1","generatedAt":"2026-07-16T07:37:42Z","count":2}`))
 	})
 	mux.HandleFunc("/api/v1/hf/meta-llama/meta-llama-3-8b-instruct.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"hfId":"meta-llama/Meta-Llama-3-8B-Instruct","onBedrock":true,
+		_, _ = w.Write([]byte(`{"hfId":"meta-llama/Meta-Llama-3-8B-Instruct","onBedrock":true,
 			"regions":["us-east-1","us-west-2"],
 			"bedrock":[{"modelId":"meta.llama3-8b-instruct-v1:0","catalog":"foundation-model","confidence":"confirmed","regions":["us-east-1","us-west-2"]}]}`))
 	})
 	mux.HandleFunc("/api/v1/hf/qwen/qwen3-32b.json", func(w http.ResponseWriter, r *http.Request) {
 		// two Bedrock paths — the confirmed FM should win over the marketplace one.
-		w.Write([]byte(`{"hfId":"Qwen/Qwen3-32B","onBedrock":true,"regions":["us-west-2"],
+		_, _ = w.Write([]byte(`{"hfId":"Qwen/Qwen3-32B","onBedrock":true,"regions":["us-west-2"],
 			"bedrock":[
 			  {"modelId":"huggingface-reasoning-qwen3-32b","catalog":"marketplace","confidence":"validated","regions":["us-west-2"]},
 			  {"modelId":"qwen.qwen3-32b-v1:0","catalog":"foundation-model","confidence":"confirmed","regions":["us-west-2"]}]}`))

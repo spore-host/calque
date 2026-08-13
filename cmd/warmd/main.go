@@ -449,7 +449,7 @@ func getJSON(ctx context.Context, c *s3.Client, bucket, key string, v any) error
 	if err != nil {
 		return err
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 	return json.NewDecoder(out.Body).Decode(v)
 }
 
@@ -520,7 +520,7 @@ func pollSpotInterruption(ctx context.Context, leak spotLeaker) {
 			if err != nil {
 				continue // no signal, not an error — IMDS may be transiently unreachable
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
 				continue // 404 (the common case): no interruption pending
 			}

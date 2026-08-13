@@ -44,7 +44,7 @@ import (
 
 func sessionCmd(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: calque session <checkout|checkin|status|list> ...")
+		return fmt.Errorf("usage: calque session <checkout|checkin|status|list>")
 	}
 	switch args[0] {
 	case "checkout":

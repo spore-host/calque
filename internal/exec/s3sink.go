@@ -143,7 +143,7 @@ func getResult(ctx context.Context, client *s3.Client, bucket, key string) (warm
 	if err != nil {
 		return warm.Result{}, fmt.Errorf("get %s: %w", key, err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 	var r warm.Result
 	if err := json.NewDecoder(out.Body).Decode(&r); err != nil {
 		return warm.Result{}, fmt.Errorf("decode %s: %w", key, err)

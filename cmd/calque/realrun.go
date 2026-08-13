@@ -541,7 +541,7 @@ func getS3(ctx context.Context, c *s3.Client, bucket, key string) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 	b := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
 	for {

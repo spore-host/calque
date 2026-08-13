@@ -510,8 +510,8 @@ func analyze(scripts []string) error {
 				fmt.Printf("  %s: %s", short(r.Script), o.Render())
 				continue
 			}
-			switch {
-			case r.ModelRef == "":
+			switch r.ModelRef {
+			case "":
 				fmt.Printf("  %s: identity hidden (no repo id; %s shape) — cannot claim Bedrock match\n",
 					short(r.Script), r.Shape)
 			default:

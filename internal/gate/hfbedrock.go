@@ -204,9 +204,9 @@ func (c *HFBedrockClient) getJSONStatus(ctx context.Context, url string, v any) 
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return resp.StatusCode, nil
 	}
 	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {

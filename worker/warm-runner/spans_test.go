@@ -68,7 +68,7 @@ return payload * 10`,
 		},
 	}
 	_ = removeFile("/tmp/calque_span_marker")
-	defer removeFile("/tmp/calque_span_marker")
+	defer func() { _ = removeFile("/tmp/calque_span_marker") }()
 
 	failed, err := sup.Run(context.Background(), items(0, 1, 2, 3))
 	if err != nil {

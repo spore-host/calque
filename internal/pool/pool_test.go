@@ -50,8 +50,7 @@ type fakeQueue struct {
 }
 
 type queuedClaim struct {
-	ref     ClaimRef
-	receipt string
+	ref ClaimRef
 }
 
 func newFakeQueue() *fakeQueue {

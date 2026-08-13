@@ -75,7 +75,7 @@ func (r *Report) JSON(w io.Writer) error {
 // ordering so a skeptic diffing two runs sees a stable report.
 func (r *Report) Summary(w io.Writer) {
 	if len(r.Leaks) == 0 {
-		fmt.Fprintln(w, "LEAKS: none emitted (note: a suspiciously clean run is itself worth a second look)")
+		_, _ = fmt.Fprintln(w, "LEAKS: none emitted (note: a suspiciously clean run is itself worth a second look)")
 		return
 	}
 	byPrim := map[Primitive][]Leak{}
@@ -88,16 +88,16 @@ func (r *Report) Summary(w io.Writer) {
 	}
 	sort.Strings(prims)
 
-	fmt.Fprintf(w, "LEAKS: %d emitted across %d primitives\n", len(r.Leaks), len(prims))
+	_, _ = fmt.Fprintf(w, "LEAKS: %d emitted across %d primitives\n", len(r.Leaks), len(prims))
 	for _, p := range prims {
 		ls := byPrim[Primitive(p)]
-		fmt.Fprintf(w, "  %s (%d):\n", p, len(ls))
+		_, _ = fmt.Fprintf(w, "  %s (%d):\n", p, len(ls))
 		for _, l := range ls {
 			loc := l.Script
 			if l.Line > 0 {
 				loc = fmt.Sprintf("%s:%d", l.Script, l.Line)
 			}
-			fmt.Fprintf(w, "    - [%s] %s (%s)\n", l.Kind, strings.TrimSpace(l.Detail), loc)
+			_, _ = fmt.Fprintf(w, "    - [%s] %s (%s)\n", l.Kind, strings.TrimSpace(l.Detail), loc)
 		}
 	}
 }
