@@ -12,13 +12,68 @@ run something real.
   [`uv`](https://docs.astral.sh/uv/) — needed for everything below, including
   the zero-spend steps.
 - **For the billable steps (3 onward):** AWS credentials in your normal
-  credential chain (env vars, `~/.aws/credentials`, an assumed role, etc.)
-  with permission to run EC2 instances, read/write the S3 bucket you'll use,
-  and create/attach the IAM instance profile calque manages for you
-  (`internal/plan/iam.go` — scoped narrowly to that bucket, nothing account-wide).
+  credential chain (env vars, `~/.aws/credentials`, an assumed role, etc.).
   An **S3 bucket** you're willing to read/write is the only AWS resource you
   need to create yourself ahead of time; calque creates and tears down
   everything else (EC2 instances, IAM roles/profiles) per run.
+
+### What IAM permissions does my caller identity need?
+
+Two different things need permissions, and they're easy to conflate:
+
+1. **Your own credentials** (the ones running `calque` locally) need to be
+   able to: launch/terminate EC2 instances, read/write the S3 bucket, and
+   create/attach an IAM role+instance profile (`iam:CreateRole`,
+   `iam:CreateInstanceProfile`, `iam:AddRoleToInstanceProfile`,
+   `iam:PutRolePolicy`, `iam:AttachRolePolicy`, `iam:PassRole`) — an admin
+   role satisfies this trivially; a narrowly-scoped role needs all of the
+   above explicitly.
+2. **The EC2 instance itself** gets a SEPARATE, narrower role that calque
+   creates and manages for you — you never need to hand-write this one.
+   `internal/plan/iam.go`'s `RealRunPolicy` grants exactly:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": ["arn:aws:s3:::YOUR-BUCKET/*"]},
+       {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketLocation"], "Resource": ["arn:aws:s3:::YOUR-BUCKET"]}
+     ]
+   }
+   ```
+   scoped to the ONE bucket you passed via `--bucket` — nothing
+   account-wide. Additionally, `AmazonSSMManagedInstanceCore` is attached
+   automatically (needed so spawn's own acquisition/liveness machinery can
+   reach the instance) — this is spawn's convention, not something calque
+   adds on top.
+
+### What does calque actually create in my AWS account?
+
+Per run: one EC2 instance (terminated at the end, or on error via a
+deferred cleanup — see "if a run is interrupted" below), and a handful of
+S3 objects under `s3://YOUR-BUCKET/runs/<run-id>/` (artifacts, manifest,
+results, summary, bootstrap log).
+
+**One thing that's NOT per-run**: the IAM role+instance profile itself
+(`calque-real-run`) is created ONCE and REUSED across every subsequent
+real run, in every region, against every bucket you ever pass —
+`CreateOrGetInstanceProfile` is idempotent and just updates the existing
+role's inline policy if a later run uses a different bucket. If you audit
+your account after a run and still see this role, that's expected — it's
+a persistent, shared resource, not something a `--i-understand-this-*`
+flag ever tears down. Delete it yourself via the IAM console/CLI if you
+want it gone; calque has no `--i-understand-this-deletes-the-shared-role`
+verb for that (there's nothing sensitive stored in it — it's just a
+capability grant).
+
+### What region does calque use?
+
+`--region` defaults differently per command: `us-east-1` for `real`/
+`ramp`/`pool`/`spawn-run`, `us-west-2` for `run`/`smoke`. Pass `--region`
+explicitly if you need a specific one — GPU instance family capacity
+(especially for `g6e`/`g7e`) is genuinely region-dependent, so if an
+acquisition hangs at the wait-for-capacity stage, trying a different
+region is a real, common fix (see
+[`troubleshooting.md`](troubleshooting.md)).
 
 Nothing below launches AWS infrastructure until step 3 explicitly says so —
 and even then, every billable command refuses to run without an explicit

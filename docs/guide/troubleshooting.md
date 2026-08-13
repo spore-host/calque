@@ -147,6 +147,43 @@ resolution — you shouldn't need to do anything. If you still hit a
 script, check `calque analyze`'s leak report first (it names exactly which
 references it could/couldn't resolve) before assuming it's a new gap.
 
+## I killed a run (Ctrl-C, closed the terminal, lost network) before it finished — is an instance still running?
+
+**Cause:** calque's own clean-teardown logic (`defer ... Terminate(...)`) runs
+on any NORMAL error return from the Go process, including Ctrl-C's SIGINT
+in most terminals — but a hard kill (SIGKILL, terminal process killed
+out-of-band, laptop sleep during a long `ramp`/fleet run) bypasses Go's
+`defer` mechanism entirely. Nothing in the local process survives to run
+the termination call.
+
+**Fix:**
+1. **`--ttl` is the real backstop**, not a courtesy — every acquired
+   instance has a hard lifetime cap (`--ttl`, e.g. `40m` for `real`, `3h`
+   for `ramp`) that spawn/spored enforce independent of whether the
+   calque CLI process is even still running. If you're not in a hurry,
+   waiting out the TTL costs nothing extra to fix (though you still pay
+   for the compute until it expires).
+2. **To find and terminate it immediately** instead of waiting:
+   ```
+   aws ec2 describe-instances --region YOUR-REGION \
+     --filters "Name=instance-state-name,Values=running,pending" \
+     --query 'Reservations[].Instances[].[InstanceId,LaunchTime,InstanceType]' \
+     --output table
+   ```
+   calque doesn't currently tag instances with the `--run-id` you passed
+   (a real gap, worth filing if it bites you), so identify the right one
+   by launch time/instance type rather than a tag filter. Then:
+   ```
+   aws ec2 terminate-instances --region YOUR-REGION --instance-ids i-XXXXXXXX
+   ```
+3. **The IAM role/instance profile is NOT something you need to clean up**
+   — it's a persistent, shared, reused resource across every run (see
+   [`getting-started.md`](getting-started.md)'s resource-inventory note),
+   not a per-run artifact left behind by an interrupted run.
+4. **S3 objects under `runs/<run-id>/`** are harmless to leave — they're
+   just artifacts/results, cost negligible storage, and don't represent
+   ongoing spend the way a running instance does.
+
 ## Where do I actually look when something fails and this page doesn't cover it?
 
 1. **The run's own numbered progress lines** (`[N/8] ...`) — they name
