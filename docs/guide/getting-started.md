@@ -140,10 +140,11 @@ expensive job.
   --i-understand-this-spends-money
 ```
 
-This costs a few cents and a few minutes. If it fails, it fails **before**
-you've committed to a GPU instance or a real model download — read the
-error and the bootstrap log it uploads to S3 either way
-(`s3://YOUR-BUCKET/runs/<run-id>/bootstrap.log`); see
+This is billable but intentionally small — check the current on-demand
+price for the selected instance type in your region before proceeding. If
+it fails, it fails **before** you've committed to a GPU instance or a real
+model download — read the error and the bootstrap log it uploads to S3
+either way (`s3://YOUR-BUCKET/runs/<run-id>/bootstrap.log`); see
 [`troubleshooting.md`](troubleshooting.md) if it's not obvious.
 
 ## 4. Your first real run: `calque real --n 1`
