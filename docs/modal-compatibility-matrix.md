@@ -4,7 +4,15 @@
 mimicry that real Modal code ports to AWS **unchanged**. This document is the
 single most direct answer to "does calque support my script."
 
-This document merges three research passes (2026-08-07):
+**Provenance:**
+- Verified against calque v0.3.0 / commit `19b4a1a` (2026-08-12).
+- Modal API doc survey last refreshed: 2026-08-07.
+- Real-world corpus survey last refreshed: 2026-08-13 (calque#150 pass —
+  see `testdata/real-world/README.md`'s "pass 2" section for the 5 scripts
+  added and the 2 confirmed bugs — calque#151/#152 — that survey found).
+
+This document merges research passes from three sources, most recently
+refreshed 2026-08-13:
 
 1. **calque's current state** — a full read of `tools/pyast/pyast.py`,
    `internal/parse/parse.go`, `internal/ir/ir.go`, `internal/gpu/gpu.go`,
@@ -13,9 +21,13 @@ This document merges three research passes (2026-08-07):
 2. **Modal's documented API surface** — from `modal.com/docs` (guide + SDK
    reference).
 3. **Real-world frequency** — from `modal-labs/modal-examples` (212 files) plus
-   ~20 independent production repos found via GitHub code search.
+   ~20 independent production repos found via GitHub code search across two
+   passes (calque#79, calque#150).
 4. **Modal's CLI surface** — from `modal.com/docs/reference/cli/*`, compared
-   against calque's current CLI (`analyze`, `run`, `smoke`, `real`, `session`).
+   against calque's current CLI (`analyze`, `run`, `smoke`, `real`, `ramp`,
+   `pool`, `spawn-run`, `session`) — see `docs/guide/cli-reference.md` for
+   the full flag-level detail, kept separately since it changes faster than
+   this matrix's construct-level census does.
 
 Update this table as gaps close or Modal's docs change — that's cheaper than
 re-deriving the survey every time a new adopter's script surfaces a "new" gap.
@@ -77,7 +89,7 @@ real gap — should not stay this way) · ⬜ not present at all.
 | `cpu=` (plain number or `(request, limit)` tuple) | Physical cores; tuple limit is a throttle, not OOM-kill. | 🔥 | ✅ (fixed 2026-08-07, calque#77 — tuple form now leaks the dropped limit, mirroring `memory=`) | Recorded but not used for instance sizing (deliberate, behind the seam). | closed |
 | `memory=` (plain int MB or tuple) | MiB; tuple limit is a **hard OOM-kill** ceiling (different failure mode than CPU's throttle). | 🔥 | ✅ recorded+leaked correctly. | Same sizing-deferred caveat as `cpu=`. | — |
 | `retries=` (plain int or `modal.Retries(...)`) | Per-input retry cap; plain int = fixed delay, object = exponential backoff. | ⚪ | ✅ (plain int) wired into the warm supervisor's crash-restart cap — a genuine reliability knob that's honored. `Retries(...)` object form: recognized+leaked (falls back to default cap). | Exponential-backoff semantics not reproduced even when leaked — acceptable per behind-the-seam scope. | — |
-| `secrets=` | List of `Secret` objects, injected as env vars in list order (later overrides earlier on key clash). | 🔥 | 🟨 recorded, explicitly NOT injected — leaked clearly ("a payload needing them will fail"). | Working as intended per documented scope. | — |
+| `secrets=` | List of `Secret` objects, injected as env vars in list order (later overrides earlier on key clash). | 🔥 | 🟨 declared names recorded, NOT resolved from Modal's own secret store — see §K for the `--secret NAME=VALUE` escape hatch (calque#150) that lets a caller supply the same values directly. | See §K. | — |
 | `schedule=` (bare cron string) | — | ⚪ | 🟨 recorded, not honored, leaked. | See §H — the *object* forms (`modal.Cron`/`modal.Period`) aren't recognized at all, only a bare string kwarg. | [#91](https://github.com/spore-host/calque/issues/91) |
 | `region=` / `cloud=` | Placement hints. | ⚪ | 🟨 both recorded+leaked (`cloud=` fixed 2026-08-07, calque#91 — mirrors `region=`'s pattern exactly: `ir.Config.Cloud`, dedicated "recorded but NOT honored" leak). | calque always targets AWS regardless of `cloud=`'s value — recorded for visibility, not acted on (a script requesting GCP/OCI isn't rejected, just silently run against AWS anyway, same posture as every other portable-but-unhonored kwarg). | closed |
 | Autoscaling kwargs, old spellings: `concurrency_limit`, `allow_concurrent_inputs`, `min_containers`, `max_containers`, `keep_warm`, `container_idle_timeout` | Warm-pool/scaling config. | 🟡 | 🟨 explicit named set (`autoscalingKwargs` in `internal/parse/parse.go`), each gets a dedicated "behind the seam" leak. | — | — |
@@ -140,7 +152,7 @@ real gap — should not stay this way) · ⬜ not present at all.
 
 | Construct | calque behavior today | Frequency of the underlying real shape | Risk / gap |
 |---|---|---|---|
-| `@cls`+`@enter`+`.map()`'d method | The only shape `pickWarmUnit` (`cmd/calque/run.go`) selects without a fallback heuristic. | ⚪ minority (~5-10% of real scripts) | Working as designed, but the design targets a minority shape. |
+| `@cls`+`@enter`+`.map()`'d method | The shape `pickWarmUnit`'s automatic scan (`cmd/calque/run.go`) prefers without a fallback heuristic. `--function NAME` (calque#150) bypasses this scan entirely to select ANY specific callable directly, when the automatic preference isn't what you want. | ⚪ minority (~5-10% of real scripts) | Working as designed, but the automatic-scan design targets a minority shape — `--function` exists precisely because real scripts routinely need a different one selected. |
 | `@cls`+`@enter`, no `.map()`'d method | Falls back to "first method" — runnable, but an arbitrary pick if there's real ambiguity; no leak for this specific fallback. | 🟡 common | Acceptable for now; could use a leak noting the fallback was used. |
 | `@cls`, no `@enter` | Skipped entirely as a warm-unit candidate; separately leaked ("@cls has no @enter"). | 🧊 | Correct — a class with no warm-load-once body genuinely doesn't fit the model. |
 | Plain `@app.function`, no `@cls` anywhere | ✅ (closed, calque#80) `pickWarmUnit` selects the `.map()`'d function if any, else the first, wrapping it in a synthesized zero-value `ir.Class` so `dryRunWarm`'s existing `unit.class.*` reads need no changes. Also fixed `swapLegal` to accept `gpu.NoGPU` (a plain CPU function) — it previously treated "no gpu= declared" as an illegal swap, identical to a flagged multi-GPU/coupled one, invisible until a GPU-free plain function became reachable. | 🔥 **the most common real shape**, and the one that was blocking every AI-Almanac script | Verified against `testdata/scripts/plain_function.py` and a fresh clone of all three real AI-Almanac scripts — all now run past warm-unit selection. |
@@ -181,8 +193,8 @@ real gap — should not stay this way) · ⬜ not present at all.
 
 | Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
 |---|---|---|---|---|---|
-| `secrets=[Secret.from_name(...), ...]` | List of Secret objects, injected as env vars, list-order precedence. | 🔥 | 🟨 see §C — recorded, not injected, clearly leaked. | Working as designed. | — |
-| `Secret.from_dict(...)` / `Secret.from_dotenv(...)` / `Secret.from_local_environ(...)` | Alternate construction forms. | ⚪ | ⬜ (not distinguished from the generic `secrets=` case — all become `{"__unparsed__": ...}` markers at the AST layer) | Low risk — the effect (not injected, leaked) is the same regardless of construction form. | — |
+| `secrets=[Secret.from_name(...), ...]` | List of Secret objects, injected as env vars, list-order precedence. | 🔥 | 🟨 declared names recorded (see §C), NOT resolved from Modal's own secret store (calque has no live Modal control-plane connection) — but `calque real --secret NAME=VALUE` (repeatable, calque#150) lets the caller supply the same env-var VALUES directly, so the payload's own `os.environ["NAME"]` reads stay unchanged. `realrun.go` leaks which declared names weren't covered by any `--secret` flag. | A generic escape hatch, not automatic secret-store resolution — the caller must still know/provide the real values. See `docs/porting-modal-to-aws.md` §4. | — |
+| `Secret.from_dict(...)` / `Secret.from_dotenv(...)` / `Secret.from_local_environ(...)` | Alternate construction forms. | ⚪ | ⬜ (not distinguished from the generic `secrets=` case — all become `{"__unparsed__": ...}` markers at the AST layer) | Low risk — `--secret` covers the resulting need (an env var the payload reads) identically regardless of construction form. | — |
 
 ---
 
@@ -205,7 +217,7 @@ is porting *code*, not managing a Modal workspace.
 
 | Modal command | Purpose | calque equivalent | Gap |
 |---|---|---|---|
-| `modal run <file>[::entrypoint] [args]` | Ephemeral run; `::entrypoint` selects which `@app.local_entrypoint()` to invoke when a file has several; passes through arbitrary CLI args to it. | `calque run [--n N] [--region R] [--dry-run] [--entrypoint NAME] <script.py>` | 🟨 (fixed 2026-08-07, calque#90) `--entrypoint <name>` validates against `app.Entrypoints`, auto-selects when there's exactly one, and requires explicit selection when 2+ exist (mirroring Modal's own "ambiguous, pick one" posture) — verified via live repros for all four cases (none/one/many/wrong-name). Does NOT yet steer which callable `pickWarmUnit` selects ([#98](https://github.com/spore-host/calque/issues/98)) or pass through arguments — both confirmed gaps, not silent ones. |
+| `modal run <file>[::entrypoint] [args]` | Ephemeral run; `::entrypoint` selects which `@app.local_entrypoint()` to invoke when a file has several; passes through arbitrary CLI args to it. | `calque run [--n N] [--region R] [--dry-run] [--entrypoint NAME] <script.py>`; `calque real`/`calque ramp` add `--function NAME` (calque#150) | ✅ (calque#90) `--entrypoint <name>` validates against `app.Entrypoints`, auto-selects when there's exactly one, and requires explicit selection when 2+ exist (mirroring Modal's own "ambiguous, pick one" posture). ✅ (calque#98, closed) `--entrypoint` now steers which callable `pickWarmUnit` selects, via call-site-to-entrypoint attribution. ✅ (calque#150) `--function NAME` selects a specific `@app.function`/`@cls` method directly by name, for a target unreachable through ANY entrypoint (e.g. one entrypoint invokes a different sibling than the one you want) — wins over `--entrypoint` when both are given. Passing through arbitrary positional CLI args (Modal's `[args]`) is still not reproduced — a script's real args must go through `--item-file`/`--arg-file`/`--arg-json` instead, a different (bytes/JSON-typed) mechanism, not a generic argv passthrough. |
 | `modal deploy <file>` | Publishes a persistent app (survives disconnect); `--strategy rolling\|recreate`. | none | Legitimate scope difference — AWS has no equivalent to Modal's redeploy-in-place model; calque's execution is closer to always-ephemeral. Not a gap to close, just a documented difference. |
 | `modal serve <file>` | Hot-reload dev server for web endpoints. | none | Follows from calque not building the long-lived server at all (documented non-goal, `docs/serve-architecture.md`) — consistent, not a new gap. |
 | `modal shell [ref]` | Interactive shell inside a container matching a function's image/mounts/volumes, or attaching to a live sandbox. | none | No calque equivalent for interactively debugging a port — worth considering once basic execution-shape gaps (backlog #1-#7) are closed, since debugging-the-port is exactly what an adopter mid-migration needs. |
