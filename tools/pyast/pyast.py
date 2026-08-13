@@ -659,6 +659,13 @@ def _describe_fn(
         "args": _arg_names(node),
         "decorators": decos,
         "entry_kind": _entry_kind([d["name"] for d in decos]),
+        # calque#152: @modal.experimental.clustered(...) requests MULTI-NODE
+        # execution — a decorator-level construct invisible to both the §7
+        # guard's spec.Count (parsed from the gpu= STRING alone, e.g.
+        # "H100:8") and its couplingSignal (a body-text regex): neither
+        # check ever inspects the function's OWN decorator list. Matched by
+        # trailing name, same pattern as _SERVE_DECOS/_entry_kind above.
+        "is_clustered": any(d["name"].rsplit(".", 1)[-1] == "clustered" for d in decos),
         "local_calls": _local_calls(node),
         # calque#139: bare (non-.local()-suffixed) references to a module-level
         # helper function or constant, found ANYWHERE inside this function/
@@ -1082,10 +1089,24 @@ def analyze(path: str) -> dict[str, Any]:
     # a constant that itself needed an import was shipped with no way to
     # discover that dependency, so the import never got enqueued and the
     # runner NameError'd on the constant's own exec.
+    # calque#151: a module-level constant whose RHS is a live-Modal-control-
+    # plane construct (modal.Dict/Queue/NetworkFileSystem.from_name(...))
+    # must NOT be shipped the same way an ordinary literal constant is — the
+    # runner has no live Modal credentials/connection, so exec'ing this
+    # statement verbatim crashes with a confusing SDK auth error instead of
+    # an honest leak. Tag it here (reusing calque#91's own
+    # _unsupported_construct_from_name classifier) so the Go side
+    # (collectLocalExtras) can refuse to ship it and emit a clear leak
+    # instead.
     module_consts = {
         name: {
             "source": _stmt_source(src, node),
             "free_refs": _free_refs_in_expr(node.value, module_names),
+            "unshippable_construct": (
+                _unsupported_construct_from_name(_attr_chain(node.value.func))
+                if isinstance(node.value, ast.Call)
+                else None
+            ),
         }
         for name, node in module_const_nodes.items()
     }

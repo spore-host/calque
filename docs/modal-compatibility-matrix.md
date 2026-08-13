@@ -115,8 +115,8 @@ real gap — should not stay this way) · ⬜ not present at all.
 | `.commit()` / `.reload()` call sites | End-of-run persistence / mid-run re-read. | 🔥 (wherever Volumes are used) | ✅ `.commit()` honored as real end-of-run write-back. 🟨 `.reload()` leaked as unreproduced. | — | — |
 | `modal.NetworkFileSystem` (deprecated, being removed) | **Live-shared** filesystem — no commit/reload cycle, closer to EFS/NFS than Volume's snapshot model. | 🧊 (deprecated, Modal steers users to Volume) | ⬜ | If a real script still uses this, calque's Volume→S3-prefix mapping is the WRONG model (S3 has no live-shared-write semantics) — this would need an EFS-shaped mapping instead, not a Volume-shaped one. | [#91](https://github.com/spore-host/calque/issues/91) |
 | `modal.CloudBucketMount` | Direct S3/R2/GCS mount via `mountpoint-s3` — no append writes, no seek+write, must open in truncate mode, no rename. | 🧊 | ⬜ | A script using this directly against real S3 is a DIFFERENT (and more restrictive) primitive than Volume — calque's Volume mapping doesn't cover it. | [#91](https://github.com/spore-host/calque/issues/91) |
-| `modal.Dict` | Distributed KV store, cloudpickle values, 7-day inactivity TTL, capped `.len()` at 100,000. | 🧊 | ⬜ | — | [#91](https://github.com/spore-host/calque/issues/91) |
-| `modal.Queue` | FIFO **per-partition only**, 24h partition auto-expiry. | 🧊 | ⬜ | — | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.Dict` | Distributed KV store, cloudpickle values, 7-day inactivity TTL, capped `.len()` at 100,000. | 🧊 | ⬜ not modeled, but [#151](https://github.com/spore-host/calque/issues/151) closed the failure mode: a bare reference to a module-level `Dict.from_name(...)` constant used to ship verbatim and crash at runtime with a confusing Modal SDK auth error — it's now refused with a clear leak naming the construct instead. | — | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.Queue` | FIFO **per-partition only**, 24h partition auto-expiry. | 🧊 | ⬜ not modeled; same [#151](https://github.com/spore-host/calque/issues/151) honest-refusal fix applies to a bare reference to a `Queue.from_name(...)` constant. | — | [#91](https://github.com/spore-host/calque/issues/91) |
 
 ---
 
@@ -190,7 +190,7 @@ real gap — should not stay this way) · ⬜ not present at all.
 
 | Construct | Modal semantics | Frequency | calque status |
 |---|---|---|---|
-| `@modal.experimental.clustered(size=N, rdma=False)` | Gang-scheduled multi-node; whole-cluster restart on any single-node preemption. | 🧊 (Beta) | 🟨 the underlying signal (multi-GPU `gpu="H100:8"` + coupling-signal body regex) is exactly what calque's §7 guard flags as `FlagCouple`/`FlagMulti` and refuses. Confirms the guard's target is real and documented — no further action needed; this is explicitly out of scope by design (§1). |
+| `@modal.experimental.clustered(size=N, rdma=False)` | Gang-scheduled multi-node; whole-cluster restart on any single-node preemption. | 🧊 (Beta) | ✅ [#152](https://github.com/spore-host/calque/issues/152) closed: this decorator is now recognized directly (`ir.Function.IsClustered`) and unconditionally forces `FlagCouple` in the §7 guard, regardless of the per-node `gpu=` count. **Previously a real, confirmed gap**: since the decorator carries no `gpu=` string and no body-text coupling token itself, a real script with a LITERAL single-GPU `gpu="A100"` stacked under `@modal.experimental.clustered(...)` (the shape found in `tokenbender/avataRL`'s `modal_train.py`) silently passed the guard as `CleanSwap` — exactly the silent-downgrade class §7 exists to prevent. Still explicitly out of scope to actually RUN multi-node (§1) — this closes the detection gap, not the execution gap. |
 
 ---
 

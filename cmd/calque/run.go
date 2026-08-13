@@ -445,6 +445,19 @@ func collectLocalExtras(app ir.App, unit warmUnit, rep *leak.Report) ([]warm.Ext
 			continue
 		}
 		if mc, ok := app.ModuleConsts[name]; ok {
+			if mc.UnshippableConstruct != "" {
+				// calque#151: this constant's RHS is a live-Modal-control-
+				// plane construct (Dict/Queue/NetworkFileSystem.from_name(...))
+				// — shipping it verbatim would exec the real Modal SDK call
+				// on the runner, which has no live credentials, crashing with
+				// a confusing SDK auth error instead of an honest leak.
+				// Refuse to ship; leak instead. Not enqueued further (its
+				// own free_refs, e.g. "modal", would otherwise still get
+				// pulled in for a construct we've just refused to ship).
+				rep.Addf(leak.PrimMap, leak.KindSemanticGap, app.Script, 0,
+					"%s: bare reference resolves to a module-level %s; calque has no live Modal control-plane connection to execute this construct (calque#91) — not shipped", name, mc.UnshippableConstruct)
+				continue
+			}
 			consts = append(consts, warm.ExtraConst{Name: name, Source: mc.Source})
 			// calque#146.2: a constant's OWN RHS can itself reference an
 			// import or another constant (e.g. `forecast_volume =

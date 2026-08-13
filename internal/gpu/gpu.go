@@ -118,12 +118,24 @@ func couplingSignal(body string) string {
 	return ""
 }
 
-// evaluate decides the disposition for one gpu= site given its raw spec and the
-// concatenated body text that would run on the card.
-func evaluate(raw, body string) (ir.GPUSpec, Disposition, string) {
+// evaluate decides the disposition for one gpu= site given its raw spec, the
+// concatenated body text that would run on the card, and whether the site
+// carries @modal.experimental.clustered(...) (calque#152) — a decorator-level
+// multi-node request invisible to both spec.Count (parsed from the gpu=
+// STRING alone) and couplingSignal (a body-text regex): neither ever
+// inspects the callable's own decorator list, so without this explicit
+// check a literal single-GPU gpu= on a clustered function silently passed
+// as CleanSwap.
+func evaluate(raw, body string, clustered bool) (ir.GPUSpec, Disposition, string) {
 	spec := ParseSpec(raw)
 	if spec.Card == "" {
+		if clustered {
+			return spec, FlagCouple, "@modal.experimental.clustered(...) requests multi-node execution; coupled across nodes regardless of gpu="
+		}
 		return spec, NoGPU, "no gpu= declared"
+	}
+	if clustered {
+		return spec, FlagCouple, "@modal.experimental.clustered(...) requests multi-node execution; coupled across nodes regardless of the per-node gpu= count"
 	}
 	if spec.Count > 1 {
 		return spec, FlagMulti, "requests >1 GPU (" + raw + "); multi-GPU is out of single-node scope"
@@ -142,8 +154,8 @@ func evaluate(raw, body string) (ir.GPUSpec, Disposition, string) {
 // for, §9). Flagged sites are left for the caller to refuse.
 func RewriteApp(app ir.App, rep *leak.Report) *Log {
 	log := &Log{}
-	eval := func(owner, raw, body string, line int) {
-		spec, disp, reason := evaluate(raw, body)
+	eval := func(owner, raw, body string, line int, clustered bool) {
+		spec, disp, reason := evaluate(raw, body, clustered)
 		sub := Substitution{
 			Script: app.Script, Owner: owner, Line: line,
 			Requested: spec, Disposition: disp, Reason: reason,
@@ -162,19 +174,23 @@ func RewriteApp(app ir.App, rep *leak.Report) *Log {
 	}
 
 	for _, f := range app.Functions {
-		eval(f.Name, f.GPU, f.Body, f.Line)
+		eval(f.Name, f.GPU, f.Body, f.Line, f.IsClustered)
 	}
 	for _, c := range app.Classes {
 		// A class's card runs the @enter body plus each @method body; scan them together
-		// so a coupling signal anywhere in the warm unit trips the guard.
+		// so a coupling signal anywhere in the warm unit trips the guard. Any
+		// method carrying @modal.experimental.clustered(...) makes the WHOLE
+		// class's card clustered — the class shares one gpu= site (c.GPU).
 		var b strings.Builder
 		b.WriteString(c.EnterBody)
 		b.WriteByte('\n')
+		clustered := false
 		for _, m := range c.Methods {
 			b.WriteString(m.Body)
 			b.WriteByte('\n')
+			clustered = clustered || m.IsClustered
 		}
-		eval(c.Name, c.GPU, b.String(), c.Line)
+		eval(c.Name, c.GPU, b.String(), c.Line, clustered)
 	}
 	return log
 }

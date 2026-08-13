@@ -72,6 +72,45 @@ func TestCollectLocalExtrasSkipsClassMethodAndLeaksHonestly(t *testing.T) {
 	}
 }
 
+// TestCollectLocalExtrasRefusesUnshippableConstructAndLeaksHonestly
+// (calque#151): a bare reference resolving to a module-level constant whose
+// RHS is a live-Modal-control-plane construct (modal.Dict/Queue/
+// NetworkFileSystem.from_name(...)) must NOT be shipped as a warm.ExtraConst
+// — the runner has no live Modal credentials, so exec'ing it verbatim would
+// crash with a confusing SDK auth error instead of an honest leak. Found via
+// calque#150's torture-test pass (RomeroLab/alphafast's InferenceWorker,
+// which bare-references a module-level modal.Dict.from_name(...) constant).
+func TestCollectLocalExtrasRefusesUnshippableConstructAndLeaksHonestly(t *testing.T) {
+	app := ir.App{
+		Functions: []ir.Function{
+			{Name: "use_dict", Body: "return data_dict.get(key)", FreeRefs: []string{"data_dict"}},
+		},
+		ModuleConsts: map[string]ir.ModuleConst{
+			"data_dict": {
+				Source:               `data_dict = modal.Dict.from_name("d", create_if_missing=True)`,
+				FreeRefs:             []string{"modal"},
+				UnshippableConstruct: "modal.Dict",
+			},
+		},
+	}
+	unit := warmUnit{method: app.Functions[0], class: syntheticClass(app.Functions[0])}
+	rep := &leak.Report{}
+
+	extras, consts, imports, classes := collectLocalExtras(app, unit, rep)
+	if len(extras) != 0 || len(consts) != 0 || len(imports) != 0 || len(classes) != 0 {
+		t.Errorf("collectLocalExtras shipped extras=%+v consts=%+v imports=%+v classes=%+v, want none (data_dict is an unshippable modal.Dict)", extras, consts, imports, classes)
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "data_dict") && strings.Contains(l.Detail, "modal.Dict") && strings.Contains(l.Detail, "not shipped") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an honest 'not shipped' leak naming data_dict and modal.Dict; leaks=%+v", rep.Leaks)
+	}
+}
+
 // TestCollectLocalExtrasSelfReferenceTerminates (calque#92): a function whose
 // body .local()-calls itself must not infinite-loop the collector — visited
 // is checked before enqueueing, so a self-reference is a no-op re-visit.

@@ -81,6 +81,14 @@ type pyModuleFunc struct {
 type pyModuleConst struct {
 	Source   string   `json:"source"`
 	FreeRefs []string `json:"free_refs"`
+	// UnshippableConstruct is non-empty (e.g. "modal.Dict") when this
+	// constant's RHS is a live-Modal-control-plane construct
+	// (calque#151) — Dict/Queue/NetworkFileSystem.from_name(...). A bare
+	// reference resolving here must NOT be shipped verbatim the way an
+	// ordinary literal constant is: the runner has no live Modal
+	// credentials, so exec'ing it crashes with a confusing SDK auth error
+	// instead of an honest leak. "" for every ordinary constant.
+	UnshippableConstruct string `json:"unshippable_construct"`
 }
 
 // pyVolumeWrite is a volume.commit()/reload() call site (§E). Target is the var the
@@ -128,7 +136,13 @@ type pyFunc struct {
 	// script; already bare (no dotted chain, unlike LocalCalls), since a
 	// free-variable reference is never a call-site attribute chain.
 	FreeRefs []string `json:"free_refs"`
-	Body     string   `json:"body"`
+	// IsClustered mirrors pyast's is_clustered (calque#152): true when any of
+	// this function's decorators has trailing name "clustered" (i.e.
+	// @modal.experimental.clustered(...)) — a decorator-level multi-node
+	// request invisible to the §7 GPU guard's gpu= string parsing and
+	// body-text coupling regex alike.
+	IsClustered bool   `json:"is_clustered"`
+	Body        string `json:"body"`
 }
 
 type pyDecorator struct {
@@ -295,7 +309,7 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	if len(out.ModuleConsts) > 0 {
 		app.ModuleConsts = make(map[string]ir.ModuleConst, len(out.ModuleConsts))
 		for name, mc := range out.ModuleConsts {
-			app.ModuleConsts[name] = ir.ModuleConst{Source: mc.Source, FreeRefs: mc.FreeRefs}
+			app.ModuleConsts[name] = ir.ModuleConst{Source: mc.Source, FreeRefs: mc.FreeRefs, UnshippableConstruct: mc.UnshippableConstruct}
 		}
 	}
 	if len(out.ModuleFuncs) > 0 {
@@ -686,14 +700,15 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 
 func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any) ir.Function {
 	fn := ir.Function{
-		Name:      f.Name,
-		Body:      f.Body,
-		Line:      f.Lineno,
-		Invoke:    invokes[f.Name],
-		EntryKind: ir.EntryKind(f.EntryKind), // "serve" or "" (§F)
-		Args:      f.Args,
-		ItemArg:   firstItemArg(f.Args),
-		Items:     items[f.Name],
+		Name:        f.Name,
+		Body:        f.Body,
+		Line:        f.Lineno,
+		Invoke:      invokes[f.Name],
+		EntryKind:   ir.EntryKind(f.EntryKind), // "serve" or "" (§F)
+		Args:        f.Args,
+		ItemArg:     firstItemArg(f.Args),
+		Items:       items[f.Name],
+		IsClustered: f.IsClustered,
 	}
 	for _, lc := range f.LocalCalls {
 		fn.LocalCalls = append(fn.LocalCalls, leafName(lc))

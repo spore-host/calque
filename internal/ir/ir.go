@@ -99,6 +99,13 @@ type ModuleFunc struct {
 type ModuleConst struct {
 	Source   string
 	FreeRefs []string
+	// UnshippableConstruct is non-empty (e.g. "modal.Dict") when this
+	// constant's RHS is a live-Modal-control-plane construct
+	// (calque#151) — Dict/Queue/NetworkFileSystem.from_name(...). A bare
+	// reference resolving here must be refused, not shipped verbatim: the
+	// runner has no live Modal credentials, so exec'ing it crashes with a
+	// confusing SDK auth error instead of an honest leak.
+	UnshippableConstruct string
 }
 
 // ModuleClass is one PLAIN (non-`@app.cls`) module-level class's shippable
@@ -204,6 +211,13 @@ type Function struct {
 	// call result). See cmd/calque's realOrSyntheticItems, which falls back to
 	// synthesized placeholders when this is nil.
 	Items []any
+	// IsClustered is true when this callable carries an
+	// @modal.experimental.clustered(...) decorator (calque#152) — a
+	// decorator-level multi-node request that neither the §7 GPU guard's
+	// gpu= string parsing nor its body-text coupling regex can see on their
+	// own; RewriteApp (internal/gpu) reads this to force FlagCouple
+	// regardless of what the gpu= spec alone would conclude.
+	IsClustered bool
 }
 
 // EntryKind is a callable's execution shape (§F). Serve entrypoints are long-lived
