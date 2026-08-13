@@ -53,18 +53,24 @@ type Manifest struct {
 	// ExtraClasses mirrors warm.Config's field of the same name (calque#147)
 	// — plain (non-@app.cls) module-level classes a picked unit's body
 	// bare-instantiates.
-	ExtraClasses []warm.ExtraClass        `json:"extra_classes,omitempty"`
-	Items        []warm.Item              `json:"items"`
-	Bucket       string                   `json:"bucket"`
-	ResultPrefix string                   `json:"result_prefix"`
-	SummaryKey   string                   `json:"summary_key"`
-	PythonBin    string                   `json:"python_bin"`              // interpreter in the image
-	RunnerPath   string                   `json:"runner_path"`             // path to runner.py in the image
-	Occupancy    string                   `json:"occupancy_path"`          // path to occupancy.py in the image
-	VolumeSync   []calexec.VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged (aws s3 sync) before @enter (§3/§15)
-	VolumeCommit []calexec.VolumeSyncSpec `json:"volume_commit,omitempty"` // written back (mount -> S3) after @method drains (§E)
-	Concurrency  int                      `json:"concurrency,omitempty"`   // items in flight at once; 0/1 => serial (raises GPU occupancy)
-	BatchSize    int                      `json:"batch_size,omitempty"`    // items per micro-batch (one .generate(list) call); 0/1 => per-item
+	ExtraClasses []warm.ExtraClass `json:"extra_classes,omitempty"`
+	// Secrets mirrors warm.Config's field of the same name — name/value
+	// pairs injected into the runner's environment before @enter runs.
+	Secrets map[string]string `json:"secrets,omitempty"`
+	// PayloadIsBase64Bytes mirrors warm.Config's field of the same name
+	// (calque real --item-file PATH).
+	PayloadIsBase64Bytes bool                     `json:"payload_is_base64_bytes,omitempty"`
+	Items                []warm.Item              `json:"items"`
+	Bucket               string                   `json:"bucket"`
+	ResultPrefix         string                   `json:"result_prefix"`
+	SummaryKey           string                   `json:"summary_key"`
+	PythonBin            string                   `json:"python_bin"`              // interpreter in the image
+	RunnerPath           string                   `json:"runner_path"`             // path to runner.py in the image
+	Occupancy            string                   `json:"occupancy_path"`          // path to occupancy.py in the image
+	VolumeSync           []calexec.VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged (aws s3 sync) before @enter (§3/§15)
+	VolumeCommit         []calexec.VolumeSyncSpec `json:"volume_commit,omitempty"` // written back (mount -> S3) after @method drains (§E)
+	Concurrency          int                      `json:"concurrency,omitempty"`   // items in flight at once; 0/1 => serial (raises GPU occupancy)
+	BatchSize            int                      `json:"batch_size,omitempty"`    // items per micro-batch (one .generate(list) call); 0/1 => per-item
 }
 
 // Summary is what warmd writes back so the control plane's measure step can fold
@@ -332,7 +338,8 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 		Config: warm.Config{
 			EnterBody: man.EnterBody, MethodBody: man.MethodBody, MethodArg: man.MethodArg,
 			MethodArgs: man.MethodArgs, Starmap: man.Starmap, Extras: man.Extras, ExtraConsts: man.ExtraConsts,
-			ExtraImports: man.ExtraImports, ExtraClasses: man.ExtraClasses,
+			ExtraImports: man.ExtraImports, ExtraClasses: man.ExtraClasses, Secrets: man.Secrets,
+			PayloadIsBase64Bytes: man.PayloadIsBase64Bytes,
 		},
 		Concurrency: man.Concurrency,
 		BatchSize:   man.BatchSize,

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -224,5 +226,47 @@ func TestManifestBodyForUnit_ShipsLocalExtrasAndLeaks(t *testing.T) {
 	}
 	if !strings.Contains(rep.Leaks[0].Detail, "helper") {
 		t.Errorf("leak detail %q should name the shipped sibling function", rep.Leaks[0].Detail)
+	}
+}
+
+// TestItemFromFile_ReturnsOneItemWithExactBytes (calque real --item-file
+// PATH) proves itemFromFile reads a real file's RAW bytes verbatim into a
+// single Index-0 item — no encoding/interpretation on this side; base64
+// only happens implicitly via encoding/json's own []byte handling once the
+// manifest is marshaled (proven separately by
+// TestWorker_SecretsAndPayloadBase64BytesSurviveIntoConfig in
+// internal/pool, which round-trips through the real JSON path).
+func TestItemFromFile_ReturnsOneItemWithExactBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/bundle.bin"
+	want := []byte{0x00, 0x01, 0xff, 'h', 'i'} // deliberately includes non-UTF8 bytes
+	if err := os.WriteFile(path, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := itemFromFile(path)
+	if err != nil {
+		t.Fatalf("itemFromFile: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	if items[0].Index != 0 {
+		t.Errorf("Index = %d, want 0", items[0].Index)
+	}
+	got, ok := items[0].Payload.([]byte)
+	if !ok {
+		t.Fatalf("Payload type = %T, want []byte", items[0].Payload)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("Payload = %v, want %v", got, want)
+	}
+}
+
+// TestItemFromFile_MissingFileErrors proves a bad path fails loudly
+// instead of returning a silently-empty item.
+func TestItemFromFile_MissingFileErrors(t *testing.T) {
+	if _, err := itemFromFile("/nonexistent/path/does-not-exist.bin"); err == nil {
+		t.Error("itemFromFile on a nonexistent path returned nil error, want an error")
 	}
 }

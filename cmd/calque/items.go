@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
 
 	calexec "github.com/spore-host/calque/internal/exec"
@@ -11,6 +13,24 @@ import (
 	"github.com/spore-host/calque/internal/target"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
+
+// itemFromFile reads path's raw bytes and wraps them as the SINGLE item a
+// real-AWS run should drive (calque real --item-file PATH) — for a picked
+// unit whose real signature takes `bytes` (e.g. a netCDF/tarball bundle),
+// not a string/dict literal a script's own .map()/.starmap() call already
+// provides statically (realOrSyntheticItems' existing sources). encoding/
+// json auto-base64-encodes a []byte value, so Payload just holds the raw
+// bytes — no manual encoding needed on this side; the runner decodes the
+// resulting base64 STRING back to bytes before calling the shipped body
+// (see runner.py's item(), gated on Config.PayloadIsBase64Bytes so every
+// other invocation kind is untouched).
+func itemFromFile(path string) ([]warm.Item, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read --item-file %q: %w", path, err)
+	}
+	return []warm.Item{{Index: 0, Payload: data}}, nil
+}
 
 // realOrSyntheticItems returns the warm.Item batch for a run: n items built
 // from unit.method.Items (the real .map()/.starmap() iterable extracted at

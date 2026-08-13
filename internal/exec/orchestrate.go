@@ -41,17 +41,27 @@ type Manifest struct {
 	// — plain (non-@app.cls) module-level classes a picked unit's body
 	// bare-instantiates.
 	ExtraClasses []warm.ExtraClass `json:"extra_classes,omitempty"`
-	Items        []warm.Item       `json:"items"`
-	Bucket       string            `json:"bucket"`
-	ResultPrefix string            `json:"result_prefix"`
-	SummaryKey   string            `json:"summary_key"`
-	PythonBin    string            `json:"python_bin"`
-	RunnerPath   string            `json:"runner_path"`
-	Occupancy    string            `json:"occupancy_path"`
-	VolumeSync   []VolumeSyncSpec  `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
-	VolumeCommit []VolumeSyncSpec  `json:"volume_commit,omitempty"` // written back after @method drains (§E)
-	Concurrency  int               `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
-	BatchSize    int               `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
+	// Secrets mirrors warm.Config's field of the same name — name/value
+	// pairs injected into the runner's environment before @enter runs
+	// (calque real --secret NAME=VALUE), the generic counterpart to
+	// Modal's secrets=[...] injection.
+	Secrets map[string]string `json:"secrets,omitempty"`
+	// PayloadIsBase64Bytes mirrors warm.Config's field of the same name
+	// (calque real --item-file PATH) — every item's Payload has arrived
+	// as a base64 string (Go's own automatic []byte JSON encoding) and
+	// must be decoded back to real bytes before the shipped body sees it.
+	PayloadIsBase64Bytes bool             `json:"payload_is_base64_bytes,omitempty"`
+	Items                []warm.Item      `json:"items"`
+	Bucket               string           `json:"bucket"`
+	ResultPrefix         string           `json:"result_prefix"`
+	SummaryKey           string           `json:"summary_key"`
+	PythonBin            string           `json:"python_bin"`
+	RunnerPath           string           `json:"runner_path"`
+	Occupancy            string           `json:"occupancy_path"`
+	VolumeSync           []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
+	VolumeCommit         []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
+	Concurrency          int              `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
+	BatchSize            int              `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
 }
 
 // VolumeSyncSpec tells warmd to `aws s3 sync <URI> <MountPath>` before @enter, so
@@ -142,6 +152,10 @@ type ManifestBody struct {
 	ExtraConsts  []warm.ExtraConst
 	ExtraImports []warm.ExtraImport // calque#146: module-level imports the body bare-references
 	ExtraClasses []warm.ExtraClass  // calque#147: plain module-level classes the body bare-instantiates
+	Secrets      map[string]string  // calque real --secret NAME=VALUE, injected into the runner's environment before @enter
+	// PayloadIsBase64Bytes mirrors warm.Config's field of the same name
+	// (calque real --item-file PATH).
+	PayloadIsBase64Bytes bool
 }
 
 // WriteManifestBody is WriteManifestFull with a full ManifestBody instead of
@@ -155,8 +169,9 @@ func writeManifest(ctx context.Context, c *s3.Client, l RunLayout, body Manifest
 	man := Manifest{
 		EnterBody: body.EnterBody, MethodBody: body.MethodBody, MethodArg: body.MethodArg,
 		MethodArgs: body.MethodArgs, Starmap: body.Starmap, Extras: body.Extras, ExtraConsts: body.ExtraConsts,
-		ExtraImports: body.ExtraImports, ExtraClasses: body.ExtraClasses,
-		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
+		ExtraImports: body.ExtraImports, ExtraClasses: body.ExtraClasses, Secrets: body.Secrets,
+		PayloadIsBase64Bytes: body.PayloadIsBase64Bytes,
+		Items:                items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: "python3", RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
 		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency, BatchSize: l.BatchSize,
 	}

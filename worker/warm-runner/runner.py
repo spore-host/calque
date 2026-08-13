@@ -38,6 +38,7 @@ systemd daemon that owns the whole instance's lifecycle and runs warmd under it.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -69,6 +70,8 @@ class Runner:
         extra_consts: list[dict] | None = None,
         extra_imports: list[dict] | None = None,
         extra_classes: list[dict] | None = None,
+        secrets: dict[str, str] | None = None,
+        payload_is_base64_bytes: bool = False,
     ) -> None:
         self.enter_body = enter_body
         self.method_body = method_body
@@ -102,6 +105,24 @@ class Runner:
         # X: ...` statement execs into self.globals exactly like an
         # assignment does.
         self.extra_classes = extra_classes or []
+        # secrets (generic secrets injection): name/value pairs applied to
+        # os.environ BEFORE anything else runs in enter() — the generic
+        # counterpart to Modal's secrets=[...] injection, which calque's
+        # parser previously only recorded (leaked "recorded but NOT
+        # injected in the spike"). A script that reads
+        # os.environ["SERVICE_ACCOUNT_JSON"] sees exactly that name set,
+        # unchanged.
+        self.secrets = secrets or {}
+        # payload_is_base64_bytes (calque real --item-file PATH): every
+        # item's payload arrived as a base64-encoded STRING (Go's
+        # encoding/json's own automatic []byte encoding), not the native
+        # JSON shape the payload otherwise would be — decode it back to
+        # real `bytes` in item() before calling the shipped body, so a
+        # signature like `def f(input_bundle: bytes)` sees actual bytes,
+        # unchanged from what --item-file read off disk. False (the
+        # default) never touches the payload at all — every other
+        # invocation kind (map/starmap/spawn) is byte-for-byte unchanged.
+        self.payload_is_base64_bytes = payload_is_base64_bytes
         self.entered = False
         # The warm namespace: a stand-in for the @cls instance `self`. Bodies see
         # it as `self`; whatever @enter assigns (self.llm = ...) lives here and is
@@ -118,6 +139,12 @@ class Runner:
             # refuse rather than silently reload (which would destroy the economics).
             raise RuntimeError("enter called twice; model would reload (see spec §6)")
         t0 = time.perf_counter()
+        # Secrets apply FIRST, before anything else — a module-level
+        # constant/class's own RHS or an @enter body could read an env var
+        # a secret sets (e.g. GOOGLE_APPLICATION_CREDENTIALS derived from
+        # SERVICE_ACCOUNT_JSON), but nothing a secret provides depends on
+        # extras/imports/consts/classes being compiled first.
+        os.environ.update(self.secrets)
         # Extras/extra_consts/extra_imports/extra_classes go into
         # self.globals FIRST — before @enter itself runs — so an @enter body
         # that .local()-calls a sibling (calque#92) or bare-references a
@@ -141,6 +168,14 @@ class Runner:
         if not self.entered:
             raise RuntimeError("item before enter; warm state not loaded")
         t0 = time.perf_counter()
+        # calque real --item-file PATH: the payload arrived as a base64
+        # string (Go's own automatic []byte JSON encoding) rather than
+        # its real shape — decode it back to bytes so a signature like
+        # `def f(input_bundle: bytes)` sees the exact bytes --item-file
+        # read off disk, unchanged. Every other invocation kind leaves
+        # payload untouched (flag defaults False).
+        if self.payload_is_base64_bytes and isinstance(payload, str):
+            payload = base64.b64decode(payload)
         # Call the compiled @method function (built once in enter()). Under
         # concurrency (C>1) many threads call this at once — each call binds only
         # its own args and shares `self.state`, exactly as concurrent @method calls
@@ -421,6 +456,8 @@ def main(argv: list[str] | None = None) -> int:
                     extra_consts=msg.get("extra_consts") or [],
                     extra_imports=msg.get("extra_imports") or [],
                     extra_classes=msg.get("extra_classes") or [],
+                    secrets=msg.get("secrets") or {},
+                    payload_is_base64_bytes=bool(msg.get("payload_is_base64_bytes", False)),
                 )
                 # concurrency=C>1 => items run in a C-wide thread pool so inference
                 # overlaps (vLLM batches in-flight requests). Absent/1 => the serial

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spore-host/calque/internal/gate"
@@ -177,6 +178,25 @@ func realCmd(args []string) error {
 // checked by the caller) without launching anything — split out from realCmd
 // so flag wiring (in particular --spot/--spot-max-price, calque#94) is
 // unit-testable on its own.
+// secretsFlag implements flag.Value for a repeatable `--secret NAME=VALUE`
+// flag — Go's flag package has no built-in repeatable/map flag type, so
+// this is the standard "collect into a map, one flag.Var call per
+// occurrence" pattern.
+type secretsFlag map[string]string
+
+func (s secretsFlag) String() string {
+	return fmt.Sprintf("%d secret(s)", len(s))
+}
+
+func (s secretsFlag) Set(kv string) error {
+	name, value, ok := strings.Cut(kv, "=")
+	if !ok || name == "" {
+		return fmt.Errorf("--secret must be NAME=VALUE, got %q", kv)
+	}
+	s[name] = value
+	return nil
+}
+
 func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm bool, err error) {
 	fs := flag.NewFlagSet("real", flag.ExitOnError)
 	bucket := fs.String("bucket", "", "S3 bucket (required)")
@@ -194,17 +214,20 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 	spot := fs.Bool("spot", false, "acquire on the Spot market (different capacity pool than on-demand; interruptible; K is then a SPOT rate)")
 	spotMaxPrice := fs.String("spot-max-price", "", "spot bid cap in $/hr (empty => on-demand price)")
 	script := fs.String("script", "", "optional Modal script to parse for its REAL .map()/.starmap() iterable (calque#136); empty => today's synthesized-prompt items, unchanged")
+	secrets := secretsFlag{}
+	fs.Var(secrets, "secret", "NAME=VALUE, repeatable — injected into the runner's environment before @enter runs (generic counterpart to Modal's secrets=[...], which was previously only recorded, never injected)")
+	itemFile := fs.String("item-file", "", "path to a file whose raw bytes become the SINGLE real item driven through the picked unit's body (e.g. for a `def f(input_bundle: bytes)` signature) — mutually exclusive with --n's synthesized/literal items")
 	confirmFlag := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
 	if err := fs.Parse(args); err != nil {
 		return realOpts{}, 0, false, false, err
 	}
 	if *bucket == "" || *runID == "" {
-		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] --i-understand-this-spends-money")
+		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--secret NAME=VALUE] [--item-file PATH] --i-understand-this-spends-money")
 	}
 	opts = realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
 		model: *model, n: *n, ttl: *ttl, deadline: time.Duration(*deadlineMin) * time.Minute, ratesFP: *rates,
-		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script,
+		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script, secrets: secrets, itemFile: *itemFile,
 	}
 	return opts, *shardsFlag, *poolFlag, *confirmFlag, nil
 }

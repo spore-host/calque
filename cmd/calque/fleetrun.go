@@ -232,12 +232,16 @@ func fleetRun(o realOpts, shards int) (err error) {
 	// short-lived (one run), so the omission is proportionally bigger.
 	safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
 		"fleet-pool K under-reports acquire-wait cost: %d worker(s)' real acquisition time is not folded into any shard's AcquireWaitSeconds (reported as 0, calque#145) — a known simplification, revisit if K needs to be exact for a specific run", ceiling)
+	// calque#79's Volume plumbing (volumeSpecsForApp, realrun.go) — every
+	// shard shares the SAME resolved mounts, since they all drive the
+	// same picked unit's own body. Computed once, outside the loop.
+	shardVolumeSync, shardVolumeCommit := volumeSpecsForApp(app, o.bucket, rep)
 	var wg sync.WaitGroup
 	for i := range shs {
 		if err := calexec.WriteManifestBody(ctx, s3c, calexec.RunLayout{
 			Bucket: o.bucket, ArtifactPfx: sharedLayout.ArtifactPfx,
 			ManifestKey: shs[i].ManifestKey, ResultPrefix: shs[i].ResultPrefix, SummaryKey: shs[i].SummaryKey, LogKey: shs[i].LogKey,
-		}, shardBody, hostWorkerDir, shs[i].Items, nil, nil); err != nil {
+		}, shardBody, hostWorkerDir, shs[i].Items, shardVolumeSync, shardVolumeCommit); err != nil {
 			shardErrs[i] = fmt.Errorf("shard %d write manifest: %w", shs[i].ID, err)
 			continue
 		}
@@ -308,7 +312,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 		if werr := calexec.WriteManifestBody(ctx, s3c, calexec.RunLayout{
 			Bucket: o.bucket, ArtifactPfx: sharedLayout.ArtifactPfx,
 			ManifestKey: sub.ManifestKey, ResultPrefix: sub.ResultPrefix, SummaryKey: sub.SummaryKey, LogKey: sub.LogKey,
-		}, shardBody, hostWorkerDir, sub.Items, nil, nil); werr != nil {
+		}, shardBody, hostWorkerDir, sub.Items, shardVolumeSync, shardVolumeCommit); werr != nil {
 			shardErrs[i] = fmt.Errorf("shard %d item-redrive write manifest: %w", shs[i].ID, werr)
 			continue
 		}
@@ -358,7 +362,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 				fleetSleep(wait)
 			}
 			fmt.Fprintf(os.Stderr, "[fleet] shard %d failed (%v); re-driving once on a fresh instance\n", shs[i].ID, shardErrs[i])
-			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep)
+			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep, shardVolumeSync, shardVolumeCommit)
 			measurements[i], shardErrs[i] = m, serr
 			if serr != nil {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
@@ -503,12 +507,13 @@ const fleetWorkerIdleTimeout = 1 * time.Minute
 // called from concurrent goroutines (calque#134: a shared *target.Target
 // pointer across shards would race on that mutation).
 func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o realOpts,
-	sh calexec.Shard, places []plan.Placement, pricePerHr float64, baseTgt *target.Target, body calexec.ManifestBody, hostMode bool, rep *syncReport) (measure.Measurement, error) {
+	sh calexec.Shard, places []plan.Placement, pricePerHr float64, baseTgt *target.Target, body calexec.ManifestBody, hostMode bool, rep *syncReport,
+	volumeSync, volumeCommit []calexec.VolumeSyncSpec) (measure.Measurement, error) {
 	shardLayout := calexec.RunLayout{
 		Bucket: o.bucket, ArtifactPfx: "fleet/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
 	}
-	if err := calexec.WriteManifestBody(ctx, s3c, shardLayout, body, hostWorkerDir, sh.Items, nil, nil); err != nil {
+	if err := calexec.WriteManifestBody(ctx, s3c, shardLayout, body, hostWorkerDir, sh.Items, volumeSync, volumeCommit); err != nil {
 		return measure.Measurement{}, fmt.Errorf("shard %d write manifest: %w", sh.ID, err)
 	}
 	boot := calexec.BootstrapConfig{

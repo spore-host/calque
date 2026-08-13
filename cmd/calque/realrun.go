@@ -17,9 +17,11 @@ import (
 	"github.com/spore-host/calque/internal/cost"
 	calexec "github.com/spore-host/calque/internal/exec"
 	"github.com/spore-host/calque/internal/gpu"
+	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/measure"
 	"github.com/spore-host/calque/internal/plan"
+	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
 // realOpts controls a real GPU inference run — the headline-K vehicle.
@@ -41,6 +43,19 @@ type realOpts struct {
 	// today's synthesized-prompt behavior exactly, since realRun/fleetRun
 	// don't otherwise parse any script at all.
 	script string
+	// secrets are name/value pairs from repeatable --secret NAME=VALUE
+	// flags, injected into the runner's environment before @enter runs —
+	// the generic counterpart to Modal's secrets=[...], which calque's
+	// parser only ever recorded (leaked "recorded but NOT injected in the
+	// spike") until this. nil/empty (the default) reproduces prior
+	// behavior byte-for-byte: no env vars set beyond what the AMI/image
+	// already provides.
+	secrets map[string]string
+	// itemFile, when set, replaces realOrSyntheticItems entirely with a
+	// SINGLE item wrapping this file's raw bytes (calque real --item-file
+	// PATH) — for a picked unit whose real signature takes `bytes`.
+	// "" (the default) reproduces prior behavior byte-for-byte.
+	itemFile string
 }
 
 // The real warm-unit bodies: actual vLLM. @enter loads the model ONCE; the
@@ -108,9 +123,23 @@ func realRun(o realOpts) (err error) {
 	// --script unset) this is byte-identical to the pre-existing synthesized
 	// canned-sentence placeholder.
 	app, unit, _ := warmUnitForScript(ctx, o.script, rep)
-	items := realOrSyntheticItems(unit, o.n, func(i int) any {
-		return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
-	}, rep)
+	var items []warm.Item
+	if o.itemFile != "" {
+		// calque real --item-file PATH: a REAL file's raw bytes as the
+		// single item, for a picked unit whose signature takes `bytes`
+		// (e.g. a netCDF/tarball bundle) — skips realOrSyntheticItems'
+		// synthesized-placeholder path (and its calque#136 leak) entirely,
+		// since this IS real data, just sourced from disk instead of a
+		// script's own statically-literal .map() call.
+		items, err = itemFromFile(o.itemFile)
+		if err != nil {
+			return err
+		}
+	} else {
+		items = realOrSyntheticItems(unit, o.n, func(i int) any {
+			return fmt.Sprintf("In one sentence, summarize why fact #%d about scientific computing matters.", i)
+		}, rep)
+	}
 	// calque#79 Part 1: when --script picked a REAL warm unit, ship ITS OWN
 	// body (plus any .starmap()/.local() shape) instead of always driving the
 	// hardcoded vLLM reference constants regardless of what the script does.
@@ -134,7 +163,40 @@ func realRun(o realOpts) (err error) {
 		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
 			"real run driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
 	}
-	if err := calexec.WriteManifestBody(ctx, s3c, layout, body, hostWorkerDir, items, nil, nil); err != nil {
+	body.Secrets = o.secrets
+	body.PayloadIsBase64Bytes = o.itemFile != ""
+	// calque real --secret NAME=VALUE closes the gap the parser's own
+	// static leak ("secrets recorded but NOT injected in the spike",
+	// internal/parse/parse.go) flags — but only for the names the caller
+	// actually passed. Leak specifically which of the script's OWN
+	// declared secret names (unit.class.Config.Secrets) were never
+	// covered by a --secret flag, so a run that's still missing one fails
+	// loudly with a clear cause instead of the payload's own bare
+	// KeyError/NameError being the only signal.
+	if unit.class.Config.Secrets != nil {
+		var missing []string
+		for _, name := range unit.class.Config.Secrets {
+			if _, ok := o.secrets[name]; !ok {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"secret(s) %v declared but not covered by --secret; the payload will fail if it reads them", missing)
+		}
+	}
+	// calque#79's plumbing for staging/committing a script's REAL
+	// modal.Volume.from_name(...) mounts (plan.ResolveVolumes,
+	// internal/exec's VolumeSync/VolumeCommit + warmd's aws-s3-sync
+	// stage/commit) was complete but never called from any real writer —
+	// every one passed nil, nil here. No new flag: ResolveVolumes derives
+	// mount path + S3 prefix entirely from the picked unit's own
+	// volumes= kwarg, already in the IR. A script with no Volumes (the
+	// vast majority, and every corpus script driven through this path
+	// before calque#79) gets an empty slice both ways — byte-for-byte
+	// unchanged behavior.
+	volumeSync, volumeCommit := volumeSpecsForApp(app, o.bucket, rep)
+	if err := calexec.WriteManifestBody(ctx, s3c, layout, body, hostWorkerDir, items, volumeSync, volumeCommit); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
 	if hostMode {
@@ -278,6 +340,36 @@ func realRun(o realOpts) (err error) {
 	fmt.Println("\n--- leak report (§10) ---")
 	rep.Summary(os.Stdout)
 	return nil
+}
+
+// volumeSpecsForApp resolves app's REAL modal.Volume.from_name(...) mounts
+// (calque#79) into the sync-before-@enter and commit-after-@method-drains
+// spec lists a real-AWS run's manifest carries — plan.ResolveVolumes,
+// internal/exec's VolumeSync/VolumeCommit, and warmd's own aws-s3-sync
+// stage/commit plumbing were all already built and tested, just never
+// called from realRun/fleetRun before this. Factored out as a pure
+// function (no ctx/S3) so the var-name/Modal-name reversal below is
+// unit-testable without a real script/S3 client.
+//
+// CommittedVolumes is keyed by the module-level Volume VAR name (e.g.
+// "forecast_volume"), but VolumeMount.Name is the Modal volume NAME
+// (from_name's argument) — reverse app.Volumes (var -> Modal name) once to
+// check commit status per resolved mount. A script with no Volumes (the
+// vast majority) returns two nil slices — byte-for-byte the same as the
+// hardcoded nil, nil this replaces.
+func volumeSpecsForApp(app ir.App, bucket string, rep *leak.Report) (sync, commit []calexec.VolumeSyncSpec) {
+	varNameByModalName := make(map[string]string, len(app.Volumes))
+	for varName, modalName := range app.Volumes {
+		varNameByModalName[modalName] = varName
+	}
+	for _, m := range plan.ResolveVolumes(app, rep) {
+		spec := calexec.VolumeSyncSpec{URI: m.URI(bucket), MountPath: m.MountPath}
+		sync = append(sync, spec)
+		if app.CommittedVolumes[varNameByModalName[m.Name]] {
+			commit = append(commit, spec)
+		}
+	}
+	return sync, commit
 }
 
 func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.OccupancyRaw, acq plan.Acquired, priceHr float64) error {

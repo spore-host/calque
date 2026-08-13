@@ -380,6 +380,10 @@ func build(out pyOut, rep *leak.Report) ir.App {
 			// caller wires CommitCommands for this volume.
 			rep.Addf(leak.PrimVolume, leak.KindSemanticGap, script, vw.Lineno,
 				"volume %q .commit() — persisted as an END-OF-RUN write-back (§E); a mid-run commit visible to concurrent readers is not reproduced", vw.Target)
+			if app.CommittedVolumes == nil {
+				app.CommittedVolumes = map[string]bool{}
+			}
+			app.CommittedVolumes[vw.Target] = true
 		}
 	}
 	return app

@@ -91,6 +91,28 @@ type Config struct {
 	// ExtraImports (a class body could reference an imported name in a
 	// method or class-level attribute).
 	ExtraClasses []ExtraClass `json:"extra_classes,omitempty"`
+	// Secrets are name/value pairs injected into the runner process's
+	// environment BEFORE @enter runs (calque real --secret NAME=VALUE) —
+	// the generic counterpart to Modal's secrets=[...] injection, which
+	// calque's parser only ever RECORDED (leaked "recorded but NOT
+	// injected in the spike") until now. A script that reads
+	// os.environ["SERVICE_ACCOUNT_JSON"] (e.g. to write out a GCP service
+	// account key) sees exactly that name set, unchanged — no
+	// interpretation, same "ship it verbatim" trust model as everything
+	// else here. Applied first, before ExtraImports/Extras/ExtraConsts/
+	// ExtraClasses, since any of those could depend on a secret being
+	// present in the environment already (e.g. a module-level constant
+	// whose RHS reads an env var).
+	Secrets map[string]string `json:"secrets,omitempty"`
+	// PayloadIsBase64Bytes tells the runner every item's Payload has
+	// arrived as a base64-encoded STRING (Go's encoding/json's own
+	// automatic []byte encoding, from calque real --item-file PATH) and
+	// must be decoded back to real `bytes` before the shipped body sees
+	// it — e.g. a picked unit whose real signature is `def
+	// f(input_bundle: bytes)`. False (the default) is the existing
+	// behavior: payload passed through completely unchanged, whatever
+	// JSON-native shape it already is (str/int/dict/list/...).
+	PayloadIsBase64Bytes bool `json:"payload_is_base64_bytes,omitempty"`
 }
 
 // ExtraFunc is one .local()-referenced (calque#92) or bare-referenced
@@ -672,6 +694,7 @@ func (s *Supervisor) warmUp(rn *runner) error {
 		"method_args": s.Config.MethodArgs, "starmap": s.Config.Starmap,
 		"concurrency": conc, "extras": extras, "extra_consts": extraConsts,
 		"extra_imports": extraImports, "extra_classes": extraClasses,
+		"secrets": s.Config.Secrets, "payload_is_base64_bytes": s.Config.PayloadIsBase64Bytes,
 	}); err != nil {
 		return err
 	}

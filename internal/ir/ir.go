@@ -8,13 +8,21 @@ package ir
 
 // App is a whole Modal application, transcribed from its decorators.
 type App struct {
-	Name        string            // modal.App("name")
-	Image       Image             // resolved image for the app (see parse.resolveImage)
-	Volumes     map[string]string // module-level Volume var name -> Modal volume name (from_name)
-	Functions   []Function        // @app.function
-	Classes     []Class           // @app.cls
-	Entrypoints []Function        // @app.local_entrypoint (may be more than one)
-	Script      string            // source path, for leak attribution (§10)
+	Name    string            // modal.App("name")
+	Image   Image             // resolved image for the app (see parse.resolveImage)
+	Volumes map[string]string // module-level Volume var name -> Modal volume name (from_name)
+	// CommittedVolumes is the set of module-level Volume var names (keys of
+	// Volumes above) that the script calls .commit() on somewhere — a
+	// real-AWS run (calque real/fleetrun) syncs THESE volumes back to S3
+	// after @method drains (§E), mirroring Modal's own persistence
+	// semantics; a volume never .commit()'d stays download-only (synced
+	// before @enter, never written back — matches Modal, where an
+	// uncommitted local write is never visible to another container).
+	CommittedVolumes map[string]bool
+	Functions        []Function // @app.function
+	Classes          []Class    // @app.cls
+	Entrypoints      []Function // @app.local_entrypoint (may be more than one)
+	Script           string     // source path, for leak attribution (§10)
 	// EntrypointInvokes attributes invoke-kind evidence to the SPECIFIC
 	// @app.local_entrypoint() whose body contains the call site (calque#98):
 	// entrypoint name -> invoked callable's leaf name -> best InvokeKind seen

@@ -438,6 +438,66 @@ func TestWorker_ManifestExtrasStarmapImportsSurviveIntoConfig(t *testing.T) {
 	}
 }
 
+// TestWorker_SecretsAndPayloadBase64BytesSurviveIntoConfig is
+// TestWorker_ManifestExtrasStarmapImportsSurviveIntoConfig's sibling for
+// the two fields added alongside the plan to actually run real AI-Almanac
+// code (generic secrets injection + --item-file's base64-bytes payload):
+// Worker.runOne's warm.Config construction must carry Secrets and
+// PayloadIsBase64Bytes through to the resident runner exactly like every
+// other manifest field, not silently drop them the way this SAME line
+// already dropped MethodArgs/Starmap/Extras/ExtraConsts/ExtraImports
+// before calque#146 fixed it. EnterBody reads an env var a secret sets;
+// the item payload is a base64 string that must decode to real bytes
+// before the method body's `len(payload)` sees it.
+func TestWorker_SecretsAndPayloadBase64BytesSurviveIntoConfig(t *testing.T) {
+	q := newFakeQueue()
+	fetcher := &fakeFetcher{}
+	results := &fakeResults{}
+	sup := &warm.Supervisor{Python: python(t), Script: runnerScript(t)}
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+
+	man := calexec.Manifest{
+		EnterBody:            "import os\nself.prefix = os.environ[\"CALQUE_TEST_SECRET\"]",
+		MethodBody:           "return self.prefix + str(len(payload))",
+		MethodArg:            "payload",
+		Secrets:              map[string]string{"CALQUE_TEST_SECRET": "shh-"},
+		PayloadIsBase64Bytes: true,
+	}
+	man.Items = []warm.Item{{Index: 0, Payload: []byte("hello")}} // 5 bytes; JSON round-trip base64-encodes this
+	stageManifest(t, fetcher, "s3://b/claim1.json", man)
+	q.submit(ClaimRef{RunID: "run-1", Model: "resnet", ManifestURI: "s3://b/claim1.json"})
+
+	w := &Worker{
+		Queue: q, Fetcher: fetcher, Results: results, Supervisor: sup,
+		Config: WorkerConfig{Model: "resnet", IdleTimeout: time.Second},
+		now:    clk.now,
+	}
+
+	done := make(chan struct{})
+	var served int
+	var runErr error
+	go func() { served, runErr = w.Run(context.Background()); close(done) }()
+
+	if !drainClock(t, clk, done) {
+		t.Fatal("worker did not drain within 5s")
+	}
+	if runErr != nil {
+		t.Fatalf("Run error: %v", runErr)
+	}
+	if served != 1 {
+		t.Fatalf("claims served = %d, want 1", served)
+	}
+	got := results.sinks[0].Results()
+	r, ok := got[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	want := "shh-5" // os.environ["CALQUE_TEST_SECRET"] + len(b"hello") — only correct if BOTH Secrets and PayloadIsBase64Bytes reached Config
+	if s, ok := r.Result.(string); !ok || s != want {
+		t.Errorf("result = %v, want %q — proves Secrets AND PayloadIsBase64Bytes actually reached warm.Config through runOne, not silently dropped", r.Result, want)
+	}
+}
+
 // TestWorker_MismatchedModelClaimIsAckedNotRun: a claim whose Model doesn't
 // match this pool's configured model must be dropped (acked, not executed) —
 // per docs/pool-queue-contract.md decision 2, this should never happen under
