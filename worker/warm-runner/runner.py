@@ -359,8 +359,6 @@ class Runner:
 class _Namespace:
     """A permissive attribute bag standing in for the @cls `self`."""
 
-    pass
-
 
 class _LocalCallable:
     """Wraps a compiled .local()-referenced sibling function (calque#92) so a

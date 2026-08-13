@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shutil
 import signal
@@ -145,20 +146,23 @@ class Sampler:
         return tick
 
     def run(self) -> dict:
-        out_f = open(self.out_path, "w", encoding="utf-8") if self.out_path else None
-        while not self._stop:
-            # Stamp the tick's START before sampling: the sample describes the GPU
-            # from here forward (the collectors themselves take ~0.1-1s). The control
-            # plane windows on this to exclude the @enter load (#71).
-            ts = time.time()
-            tick = self._sample_once()
-            if out_f:
-                tick["ts"] = ts
-                out_f.write(json.dumps(tick) + "\n")
-                out_f.flush()
-            time.sleep(self.interval)
-        if out_f:
-            out_f.close()
+        with contextlib.ExitStack() as stack:
+            out_f = (
+                stack.enter_context(open(self.out_path, "w", encoding="utf-8"))
+                if self.out_path
+                else None
+            )
+            while not self._stop:
+                # Stamp the tick's START before sampling: the sample describes the GPU
+                # from here forward (the collectors themselves take ~0.1-1s). The control
+                # plane windows on this to exclude the @enter load (#71).
+                ts = time.time()
+                tick = self._sample_once()
+                if out_f:
+                    tick["ts"] = ts
+                    out_f.write(json.dumps(tick) + "\n")
+                    out_f.flush()
+                time.sleep(self.interval)
         return self.summary()
 
     def summary(self) -> dict:

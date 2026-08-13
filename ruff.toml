@@ -11,6 +11,18 @@
 extend-exclude = ["testdata", "examples"]
 
 [lint]
-# Default rule set (pyflakes "F" + a slice of pycodestyle "E"/"W") --
-# deliberately not opting into ruff's wider rule catalog on day one,
-# matching how golangci-lint was adopted with its own plain defaults.
+# Explicit narrow rule set (pyflakes "F" + a slice of pycodestyle "E") --
+# deliberately not opting into ruff's much wider default catalog (which
+# includes flake8-bandit/-bugbear/-simplify rules like S102 exec-detected
+# and BLE001 blind-except) on day one, matching how golangci-lint was
+# adopted with its own plain defaults. An EMPTY [lint] table does NOT mean
+# "ruff's narrow defaults" -- it falls through to ruff's own much broader
+# default selection, which is not what was intended here; `select` must be
+# explicit. S102/BLE001 in particular would be permanent false positives
+# against this project's actual design: worker/warm-runner/runner.py's
+# whole job is to compile+exec shipped Modal payload source verbatim
+# (calque's "ship the payload verbatim, never interpret it" architecture),
+# and its blind `except Exception` catches are deliberate --
+# fail-loudly-with-structure so spored can decide retry, not silent
+# swallowing.
+select = ["E4", "E7", "E9", "F"]

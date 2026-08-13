@@ -173,9 +173,7 @@ def _iterable_literal(node: ast.Call) -> dict[str, Any] | None:
     except (ValueError, SyntaxError):
         val = None
     else:
-        if isinstance(val, (list, tuple)):
-            values = list(val)
-        elif isinstance(val, str):
+        if isinstance(val, (list, tuple, str)):
             values = list(val)
         else:
             values = [val]
