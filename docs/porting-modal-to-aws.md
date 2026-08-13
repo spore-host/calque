@@ -49,7 +49,7 @@ matches calque's execution shape exactly with nothing to flag.
 | Your Modal code | On AWS through calque | Status | What you do |
 |---|---|---|---|
 | `gpu="H100"` | Swapped to the one supported card (`RTX PRO 6000`) via the `gpu[fn]: clean_swap` line. | ✅ | Nothing, for single-card B=1 workloads. `gpu=[...]` fallback-lists pick the first entry only (no live-availability probe). Multi-GPU (`"H100:8"`) and coupled/tensor-parallel bodies are refused outright (🛑 `flag_multi`/`flag_couple`) — out of single-node scope, not silently downgraded. |
-| `Secret.from_name(...)` in `secrets=[...]` | Recorded in the leak report (`secrets={"__unparsed__": "[api_key]"}`), never injected as an env var. | 🔧 | You provide the equivalent secret yourself — an AWS Secrets Manager entry, SSM parameter, or a plain env var baked into the image/launch config — and reference it from your script's body directly, since calque's worker won't inject it for you. |
+| `Secret.from_name(...)` in `secrets=[...]` | Recorded in the leak report (`secrets={"__unparsed__": "[api_key]"}`); the declared name isn't resolved from Modal's own secret store (calque has no live Modal control-plane connection). | 🔧 | Pass the same VALUE via `calque real --secret NAME=VALUE` (repeatable) — this injects it into the runner's environment before `@enter` runs, so your payload's own `os.environ["NAME"]` reads stay completely unchanged. `realrun.go` leaks which of the script's own declared secret names weren't covered by a `--secret` flag, so a run that's still missing one fails with a clear cause. See `docs/guide/cli-reference.md` for the full flag detail. |
 | `Volume.from_name(...)` + `volumes={mount: vol}` | Maps to a deterministic S3 prefix, delta-synced to the mount path before `@enter`, committed back after the run (`volume: "name" -> s3://.../ (mount ..., delta-sync => warm-cache reuse)`). | ✅ | Nothing for the common case — sync-before-run/commit-after-run matches Modal's snapshot-at-start semantics closely enough that repeated runs reuse cached weights automatically. Mid-run `.reload()`/`.commit()` (re-syncing WHILE a container runs) isn't reproduced — restructure to load once, at start. |
 | `Image.add_local_dir()`/`.add_local_file()`/`.add_local_python_source()` | A `COPY` line is rendered into the generated Dockerfile. | 🔧 | **You must stage the local path yourself** before the image builds — calque doesn't copy your local source tree into the build context automatically. Old pre-1.0 names (`copy_local_dir` etc.) aren't recognized at all; rename to the current API first. |
 | App-level `image=`/`secrets=`/`volumes=` defaults (set once on `modal.App(...)`, inherited by every function) | Recorded as a leak, never applied to any function that doesn't set its own. | ❌ | **Make every function's config explicit.** A function relying on the app-level default silently gets no image/secrets/volumes at all today — this is the sharpest gap in this table; don't assume inheritance works. |
@@ -74,7 +74,37 @@ on cross-app calls, or a `.local()`-chained pipeline of plain functions with no
 `.map()` anywhere), run `calque analyze` first — the leak report will tell you
 exactly which shape it fell into and why.
 
-## 4. Shapes it recognizes but refuses, or doesn't recognize at all
+## 4. Getting your script's REAL inputs onto a real run
+
+Once `calque analyze`/`calque run --dry-run` confirm your script's shape is
+runnable, `calque real --script your_app.py` drives that script's OWN
+parsed body on real AWS — not a stand-in. Depending on what your script's
+real entrypoint/signature/dependencies look like, you may need more than
+just `--script`:
+
+| Your situation | Flag | What it does |
+|---|---|---|
+| Script has 2+ `@app.local_entrypoint()`s | `--entrypoint NAME` | Selects which one, mimicking `modal run file.py::entrypoint`. |
+| The function you want to drive isn't reachable through ANY entrypoint (e.g. one entrypoint calls a different sibling function than the one you actually want) | `--function NAME` | Selects that specific `@app.function`/`@cls` method directly, by name — bypasses entrypoint-based selection entirely. Wins over `--entrypoint` when both are given. |
+| Your function's real signature takes a single `bytes` arg (e.g. `def f(input_bundle: bytes)`) | `--item-file PATH` | The file's raw bytes become the single real item driven through the picked unit's body. |
+| Your function's real signature mixes `bytes` with other typed args (e.g. `def f(job_id: str, config: dict, bundle: bytes)`) | `--arg-file IDX=PATH` + `--arg-json IDX=JSON` | Builds a real positional tuple: `--arg-file` for the bytes position(s), `--arg-json` for everything else. Every position must be covered by exactly one of the two. |
+| Your script's own `pip_install(...)` chain wasn't statically resolvable (e.g. built via a factory function) | `--pip PACKAGE` (repeatable) + `--python-version X.Y` | Installs the real dependency list via `uv` on the instance before running — accepts a plain PyPI name or a full spec, including a git URL for a package with no PyPI release. |
+| Your script's body shells out to a hardcoded absolute path its ORIGINAL Docker image would have placed something at (e.g. a generator script baked into a base image) | `--stage-file URL=PATH` | Downloads `URL` to that exact `PATH` on the instance before `warmd` runs. |
+
+Full flag-by-flag detail (defaults, mutual exclusions, exact semantics):
+[`docs/guide/cli-reference.md`](guide/cli-reference.md). Which command to
+reach for in the first place (`real` vs `ramp` vs `pool` vs `spawn-run` vs
+`session`): [`docs/guide/which-verb.md`](guide/which-verb.md).
+
+This exact path — real script, real data, real AWS hardware, result
+verified byte-for-byte against a local reference run — is how calque's own
+v0.3.0 milestone was proven: two functions from a real customer's Modal app
+(one needing `--item-file` alone, the other needing `--function`/`--pip`/
+`--stage-file` together) ran unmodified on real AWS and produced identical
+results to running them locally. `CHANGELOG.md`'s `[0.3.0]` entry has the
+full account.
+
+## 5. Shapes it recognizes but refuses, or doesn't recognize at all
 
 See `docs/modal-compatibility-matrix.md`'s legend (✅/🛑/🟨/❌/⬜) for the full
 construct-by-construct census — in particular the 🛑 rows (multi-GPU, `.starmap()`)
@@ -82,7 +112,7 @@ where refusing loudly is the *correct* behavior, not a gap. `docs/behind-the-sea
 lists every deliberate non-goal and its attach point, for anything you find missing
 that turns out to be intentional rather than unbuilt.
 
-## 5. Where to file a gap
+## 6. Where to file a gap
 
 If `calque analyze` on your real script surfaces something not covered above or in
 the compatibility matrix, check the matrix's own "Tracking" column first — it links
