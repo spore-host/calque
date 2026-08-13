@@ -245,12 +245,23 @@ func realRun(o realOpts) (err error) {
 	if err != nil {
 		return fmt.Errorf("spawn client: %w", err)
 	}
+	// calque#148: without a real IAM instance profile, the launched
+	// instance has NO credentials for the `aws s3 cp`/`aws s3 sync` calls
+	// its own bootstrap script makes — not even for uploading its OWN
+	// bootstrap log on failure, which is why a bootstrap failure on this
+	// path was previously totally silent (no log, no error, just a
+	// timeout at the deadline). Scoped to just this run's own bucket.
+	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket)
+	if err != nil {
+		return fmt.Errorf("set up IAM instance profile: %w", err)
+	}
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
 		Username: "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
 		IMDSv2HopLimit: 2,   // warmd runs INSIDE docker; needs IMDS creds one hop away
 		RootVolumeGiB:  200, // vLLM image + weights blow past spawn's 20 GiB default
 		Spot:           o.spot, SpotMaxPrice: o.spotMaxPrice,
+		IamInstanceProfile: iamProfile,
 	}.Build()
 	if o.spot {
 		// Honesty (§9/§10): a spot run measures K against a SPOT R_a, and the box

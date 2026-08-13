@@ -178,9 +178,17 @@ func runSpawnShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnC
 		Bucket: o.bucket, ArtifactPrefix: shardLayout.ArtifactPfx, ManifestKey: shardLayout.ManifestKey,
 		WorkerDir: hostWorkerDir, Region: o.region, LogKey: shardLayout.LogKey, HostMode: true,
 	}
+	// calque#148: see realrun.go's identical fix — without this, the
+	// spawned instance has no credentials for its own bootstrap's aws s3
+	// cp/sync calls, including its own failure log.
+	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket)
+	if err != nil {
+		return fmt.Errorf("shard %q set up IAM instance profile: %w", sh.Key, err)
+	}
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
 		Username: "ubuntu", AMI: o.ami,
+		IamInstanceProfile: iamProfile,
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
 	// calque#134: carry THIS callable's own requested card (parsed at #111's

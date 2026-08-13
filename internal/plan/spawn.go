@@ -58,6 +58,19 @@ type SpawnLauncher struct {
 	// means "on-demand price as the cap" (spawn's default) — so a fill failure is
 	// capacity, never "bid too low".
 	SpotMaxPrice string
+	// IamInstanceProfile is the IAM instance profile NAME (not ARN) attached
+	// to the launched instance (calque#148) — without this, spawn's own
+	// Launch never sets any instance profile at all (confirmed: it's a
+	// pure passthrough, zero implicit default), so the instance has NO
+	// credentials for the `aws s3 cp`/`aws s3 sync` calls its own bootstrap
+	// script makes. Every caller MUST resolve one via
+	// spawnaws.Client.CreateOrGetInstanceProfile before building this —
+	// mirroring internal/pool's existing WorkerPolicy/FleetWorkerPolicy
+	// pattern, the only place in this codebase that got this right before
+	// calque#148. Empty reproduces the PRE-#148 (broken) behavior — kept
+	// as a zero-value default only so existing tests that don't care about
+	// IAM don't need updating, never as an intentional caller choice.
+	IamInstanceProfile string
 }
 
 // Build translates SpawnLauncher's fields into a spawnaws.LaunchConfig for
@@ -83,7 +96,8 @@ func (s SpawnLauncher) Build() spawnaws.LaunchConfig {
 		IMDSv2HopLimit:    s.IMDSv2HopLimit, // 2 for containers: warmd runs INSIDE docker and
 		//                                     needs instance-role creds via IMDS, which is one
 		//                                     network hop away — the default hop limit of 1 blocks it.
-		Spot:         s.Spot,         // Spot market: different capacity pool than on-demand
-		SpotMaxPrice: s.SpotMaxPrice, // "" => spawn caps at on-demand price
+		Spot:               s.Spot,               // Spot market: different capacity pool than on-demand
+		SpotMaxPrice:       s.SpotMaxPrice,       // "" => spawn caps at on-demand price
+		IamInstanceProfile: s.IamInstanceProfile, // calque#148: empty => instance has NO S3/AWS credentials at all
 	}
 }

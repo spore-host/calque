@@ -132,10 +132,18 @@ func smoke(o smokeOpts) (err error) {
 	if err != nil {
 		return fmt.Errorf("spawn client: %w", err)
 	}
+	// calque#148: see realrun.go's identical fix — without this, the
+	// smoke-test instance has no credentials for its own bootstrap's
+	// aws s3 cp/sync calls, including its own failure log.
+	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket)
+	if err != nil {
+		return fmt.Errorf("set up IAM instance profile: %w", err)
+	}
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
 		Username: "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
+		IamInstanceProfile: iamProfile,
 	}.Build()
 	if o.spot {
 		// Honesty (§9/§10): a spot smoke test acquires against a SPOT R_a, and the

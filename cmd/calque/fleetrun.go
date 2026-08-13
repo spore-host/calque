@@ -521,11 +521,19 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 		ManifestKey: shardLayout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
 		LogKey: shardLayout.LogKey, HostMode: hostMode, ModelEnv: o.model,
 	}
+	// calque#148: see realrun.go's identical fix — without this, the
+	// dedicated fallback instance has no credentials for its own
+	// bootstrap's aws s3 cp/sync calls, including its own failure log.
+	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket)
+	if err != nil {
+		return measure.Measurement{}, fmt.Errorf("shard %d set up IAM instance profile: %w", sh.ID, err)
+	}
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
 		Username: "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
+		IamInstanceProfile: iamProfile,
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
 	tgt := *baseTgt // per-shard copy — Acquire mutates Region; avoid a cross-goroutine race

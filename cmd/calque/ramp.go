@@ -150,12 +150,20 @@ func runRamp(o rampOpts) (err error) {
 	// (calque#134/#136), only the executed body doesn't yet.
 	_, unit, _ := warmUnitForScript(ctx, o.script, "", rep)
 
+	// calque#148: see realrun.go's identical fix — without this, the held
+	// instance has no credentials for its own bootstrap's aws s3 cp/sync
+	// calls, including its own failure log.
+	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket)
+	if err != nil {
+		return fmt.Errorf("set up IAM instance profile: %w", err)
+	}
 	launchCfg := plan.SpawnLauncher{
 		RunCmd: prep.PrepCommand(artifactPfx), TTL: o.ttl,
 		OnComplete: "", // do NOT terminate on command completion — we hold the box
 		Username:   "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
+		IamInstanceProfile: iamProfile,
 	}.Build()
 	if o.spot {
 		// Honesty (§9/§10): a spot ramp measures K against a SPOT R_a, and the box
