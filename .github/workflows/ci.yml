@@ -112,6 +112,28 @@ jobs:
       - name: ruff check
         run: uvx ruff check .
 
+  # Markdown link validation (calque#170) -- checks every relative link
+  # across the repo's docs resolves to a real file. Added after a stale
+  # doc pass found several docs describing already-closed issues/shipped
+  # features as open gaps; broken relative links are the same class of
+  # drift in miniature and are mechanically checkable, unlike prose
+  # accuracy. Scoped to internal file links only (offline=true) --
+  # external URLs aren't checked here to avoid flaky CI from rate limits
+  # on hosts like GitHub itself.
+  markdown-links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: lychee (internal links only)
+        uses: lycheeverse/lychee-action@v2.9.0
+        with:
+          args: >-
+            --offline --no-progress
+            --include-fragments
+            '*.md' 'docs/**/*.md' 'examples/**/*.md'
+          fail: true
+
   # Python <-> Go parser contract. The parser tests skip when uv is absent (see
   # internal/parse/parse_test.go); CI installs uv so they actually run, then asserts
   # they were NOT skipped — a silent skip here would hide contract drift.
