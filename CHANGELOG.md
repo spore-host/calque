@@ -9,6 +9,90 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-12
+
+5 commits since v0.3.0: housekeeping release -- no CLI behavior changes.
+License-compliance cleanup of the real-world script corpus, a couple of
+docs additions/rewordings, a ruff-config correctness fix, and a routine
+dependency bump.
+
+### Fixed
+
+- **ruff.toml's `[lint]` table was silently empty, enabling ruff's full
+  default rule catalog instead of the intended narrow pyflakes+pycodestyle
+  slice**: an empty `[lint]` table does NOT mean "ruff's narrow defaults"
+  as the file's own comment claimed -- it falls through to ruff's much
+  broader default selection (flake8-bandit/-bugbear/-simplify rules like
+  S102 exec-detected and BLE001 blind-except), never actually intended to
+  be active against this project's own Python source. Added an explicit
+  `select = ["E4", "E7", "E9", "F"]` matching the comment's real intent,
+  and fixed the handful of real findings that surfaced under the correct
+  narrow set: missing executable bits on 3 files whose own shebang line
+  claimed standalone-runnable (`chmod +x`), a no-op `pass` in an
+  already-empty class body, and a couple of simplifications (a three-way
+  `isinstance` collapsed to one tuple check; a bare `open()`/`close()`
+  pair replaced with `contextlib.ExitStack` for guaranteed closure on an
+  early-return/exception path). `S102`/`BLE001` deliberately left
+  unaddressed -- both are load-bearing to this project's actual design
+  (`worker/warm-runner/runner.py`'s whole job is compiling+executing
+  shipped Modal payload source verbatim; its blind `except Exception`
+  catches are deliberate fail-loudly-with-structure, not silent
+  swallowing).
+
+### Changed
+
+- **Reworded "permanent non-goal" to "not currently supported"** for
+  cross-app `Function.from_name`/`Cls.from_name` invocation
+  (`docs/behind-the-seam-register.md`, `docs/modal-compatibility-matrix.md`,
+  `examples/README.md`): this is a real design gap (would need a
+  deployment-registry concept), not a feature calque has permanently ruled
+  out -- softer, more accurate framing, matching how everything else in
+  `behind-the-seam-register.md` already avoids "permanent" language.
+
+### Removed
+
+- **12 vendored third-party Modal scripts removed from
+  `testdata/real-world/`** (license compliance): these were verbatim
+  third-party scripts fetched from GitHub to pressure-test calque
+  (calque#79/#150). One (RomeroLab/alphafast) was CC-BY-NC-SA 4.0 --
+  non-commercial, share-alike, incompatible with redistributing inside
+  this Apache-2.0 repo. The other 11 carried no license grant at all,
+  just an "Origin:" attribution comment -- insufficient basis to vendor
+  someone else's code. Nothing in the Go build/test suite reads these
+  paths; they were driven interactively via `calque analyze`/`calque run
+  --dry-run` during research passes, never wired into a test. The triage
+  record (what was found, which issue each finding produced) survives in
+  `testdata/real-world/README.md` and `docs/modal-compatibility-matrix.md`
+  -- only the vendored code itself is removed. Re-running the corpus now
+  means fetching each script fresh from its cited origin URL, not from a
+  local copy.
+
+### Added
+
+- **README "Trademarks" section**: calque is not endorsed by, affiliated
+  with, or supported by AWS or Modal; both are trademarks of their
+  respective owners.
+- **`.github/ISSUE_TEMPLATE/`**: `bug_report.yml` (wrong/crashing/
+  silently-incorrect result) and `compatibility_gap.yml` (unsupported
+  construct doing worse than an honest leak), plus `config.yml` pointing
+  at the compatibility matrix and the `meta:question` label before
+  filing. Both templates note this repo doesn't vendor third-party
+  source -- link the origin instead of pasting the whole file.
+- **2 new example journeys**: Volume-cached reuse across runs
+  (`examples/volume_cache.py`, a plain `@app.function` populating a
+  `Volume` alongside a `@cls`+`@enter` reading from it) and cross-app
+  invocation as an honestly-leaked not-currently-supported case
+  (`examples/cross_app.py`, showing `Function.from_name`/`Cls.from_name`
+  leaked precisely while sibling `Volume.from_name`/`Secret.from_name` on
+  the same script are handled correctly and produce no leak).
+- **`CONTRIBUTING.md` "Never vendor third-party source"** section
+  codifying the corpus cleanup above as a durable rule rather than a
+  one-time fix.
+
+### Dependencies
+
+- Bumps `github.com/scttfrdmn/substrate` v0.94.0 -> v0.97.0.
+
 ## [0.3.0] - 2026-08-12
 
 9 commits since v0.2.0: end-to-end real-AWS validation of calque against the
