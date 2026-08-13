@@ -58,6 +58,17 @@ milestones**, not in local files. Don't add `TODO.md`/`STATUS.md`-style tracking
 files — file an issue instead. Runtime leak reports (`internal/leak`) are
 *reproduced*, not committed.
 
+## Never vendor third-party source
+
+Don't commit a real-world Modal script (or any other third-party file) into
+this repo verbatim, even for compatibility-testing purposes — this includes
+`testdata/`. License terms on scripts fetched from GitHub are frequently
+absent, ambiguous, or explicitly non-redistributable (e.g. CC-BY-NC-SA),
+and "we used it for testing" isn't a redistribution right. If a real script
+surfaces a gap worth tracking, cite its origin URL in the issue/doc and
+write a small synthetic fixture under `testdata/scripts/` that reproduces
+the same idiom under calque's own license — don't copy the file itself.
+
 ## Anything that spends money
 
 The commands that acquire billable AWS hardware (`smoke`, `real`, `ramp`,

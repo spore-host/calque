@@ -19,6 +19,8 @@ var copies = map[string]string{
 	"map_batch_inference.py": "../testdata/scripts/map_batch_inference.py",
 	"bedrock_eligible.py":    "../testdata/scripts/bedrock_eligible.py",
 	"multi_gpu_train.py":     "../testdata/scripts/multi_gpu_train.py",
+	"volume_cache.py":        "../testdata/scripts/volume_cache.py",
+	"cross_app.py":           "../testdata/scripts/cross_app.py",
 }
 
 func TestExamplesMatchCanonicalFixtures(t *testing.T) {

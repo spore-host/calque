@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Compatibility question ("does calque support my script?")
+    url: https://github.com/spore-host/calque/blob/main/docs/modal-compatibility-matrix.md
+    about: Check the construct-by-construct compatibility matrix before filing — most gaps are already tracked there.
+  - name: General question
+    url: https://github.com/spore-host/calque/issues/new?labels=meta%3Aquestion
+    about: Open a blank issue with the meta:question label (see CONTRIBUTING.md).

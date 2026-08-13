@@ -1,11 +1,13 @@
 # examples
 
-Five journeys that show calque's whole story. The first four cost **nothing** —
-no AWS instance is launched by anything through §4. The fifth is different and
-clearly marked: it's a **recorded transcript** of a real, billable AWS run,
-included because real execution is one of calque's strongest proof points and
-deserves showing, not just describing in a changelog. Each journey is a real
-command with its actual (abbreviated) output.
+Seven journeys that show calque's whole story: what it supports cleanly, what
+it deliberately refuses, and what real execution looks like. The first six
+cost **nothing** — no AWS instance is launched by anything through §6. The
+seventh is different and clearly marked: it's a **recorded transcript** of a
+real, billable AWS run, included because real execution is one of calque's
+strongest proof points and deserves showing, not just describing in a
+changelog. Each journey is a real command with its actual (abbreviated)
+output.
 
 > These `.py` files are byte-for-byte copies of the canonical fixtures in
 > `testdata/scripts/` (which the parser tests and the spike spec reference by
@@ -141,7 +143,78 @@ product: an omission you can see is a decision, not a bug.
 
 ---
 
-## 5. A real script, real AWS hardware, a real result — this one costs money
+## 5. A Volume-cached model, reused across runs — no AWS, no dry-run
+
+A second common shape alongside `.map()` batch inference: a plain
+`@app.function` that populates a `Volume` once, and a `@cls`+`@enter` that
+reads from it every run — the model weights persist across separate
+invocations instead of reloading from the image each time.
+
+```
+./calque analyze examples/volume_cache.py
+```
+
+```
+=== volume_cache.py (app "volume-cache") ===
+  functions=1 classes=1 entrypoints=1 image.base="debian_slim" pip=[torch==2.4.1 torchvision==0.19.1]
+  gpu[download_weights]: no_gpu requested="" (no gpu= declared)
+  gpu[Scorer]: clean_swap requested="L4" -> RTX PRO 6000 (single-card, no coupling signal; memory-bound B=1 substitution is legal)
+  volume: "weights" -> volumes/weights/ (mount /models, delta-sync => warm-cache reuse)
+...
+--- leak report (§10) ---
+LEAKS: 1 emitted across 1 primitives
+  volume (1):
+    - [semantic_gap] Scorer: model identity obscured (loaded from a path/mount, not a repo id); Bedrock identity check cannot run
+```
+
+What to notice: a plain `@app.function` (`download_weights`, no `@cls`) and a
+`@cls`+`@enter` (`Scorer`) coexist in the same script and are both
+recognized correctly; the `Volume` maps to a stable S3 prefix that's
+delta-synced before `@enter` runs, so a second run reuses the already-warm
+cache instead of rebuilding it.
+
+---
+
+## 6. Cross-app invocation — a real, permanent non-goal, honestly leaked
+
+Not everything gets ported. `Function.from_name(...)`/`Cls.from_name(...)`
+look up an **already-deployed separate Modal app** by name — calque has no
+notion of a separately-deployed app to call into, so this is a deliberate,
+permanent non-goal rather than a bug to eventually fix. The point of this
+journey is what calque does INSTEAD of silently ignoring it or crashing.
+
+```
+./calque analyze examples/cross_app.py
+```
+
+```
+=== cross_app.py (app "cross-app") ===
+  functions=1 classes=0 entrypoints=1 image.base="" pip=[]
+  gpu[caller]: no_gpu requested="" (no gpu= declared)
+  volume: "weights" -> volumes/weights/ (mount /weights, delta-sync => warm-cache reuse)
+...
+--- leak report (§10) ---
+LEAKS: 3 emitted across 2 primitives
+  entrypoint (1):
+    - [semantic_gap] caller: secrets={"__unparsed__": "[api_key]"} recorded but NOT injected in the spike; a payload needing them will fail
+  map (2):
+    - [semantic_gap] Function.from_name("other-app", "remote_worker"): cross-app invocation of an already-deployed separate app — calque has no notion of a separately-deployed app to call into; not reproduced
+    - [semantic_gap] Cls.from_name("other-app", "RemoteBatcher"): cross-app invocation of an already-deployed separate app — calque has no notion of a separately-deployed app to call into; not reproduced
+```
+
+What to notice: `Volume.from_name`/`Secret.from_name` on the same script are
+handled correctly and produce **no** leak — only the two genuinely
+unsupported `Function.from_name`/`Cls.from_name` calls do. Each leak names
+the exact call site and says precisely why it isn't reproduced, rather than
+lumping every `*.from_name(...)` call together or dropping the gap
+silently. See
+[`../docs/behind-the-seam-register.md`](../docs/behind-the-seam-register.md)
+for the full list of non-goals like this one, with the attach point a
+future build would touch.
+
+---
+
+## 7. A real script, real AWS hardware, a real result — this one costs money
 
 > **This journey is NOT zero-spend.** It's a recorded transcript of an
 > actual billable run (`calque real`, ~$0.10/hr `m6i.large`, a few

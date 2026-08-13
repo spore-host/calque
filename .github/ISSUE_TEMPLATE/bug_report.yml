@@ -1,0 +1,64 @@
+name: Bug report
+description: calque produces a wrong, crashing, or silently-incorrect result on a script it claims to support.
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: confirm this against the current `main` branch, not a
+        cached memory of past behavior — calque's compatibility surface
+        moves fast. If you can, reduce the failure to the smallest script
+        that still reproduces it; a minimal repro is far easier to act on
+        than a large real-world file.
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest Modal script (or snippet) that reproduces this, plus the exact calque command you ran.
+      placeholder: |
+        script.py:
+        ```python
+        ...
+        ```
+
+        Command:
+        ```
+        calque analyze script.py
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual
+      description: What did you expect calque to do (parse cleanly / leak / produce a matching result), and what did it actually do? Paste the real output, including any leak report (§10).
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: calque version / commit
+      description: Output of `git rev-parse HEAD` (or the tagged version) in the checkout you ran.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer failed?
+      options:
+        - "Static (analyze / parse) — wrong output, no execution involved"
+        - "Dry-run (run --dry-run) — local synthetic execution"
+        - "Real AWS (real / ramp / pool / spawn-run) — produced a wrong result on real hardware"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Origin of the script (if it's a real third-party Modal script, link to it rather than pasting the whole file — see CONTRIBUTING.md on why this repo doesn't vendor third-party source), AWS region/instance type if relevant, anything you already ruled out.

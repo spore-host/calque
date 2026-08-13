@@ -1,0 +1,52 @@
+name: Compatibility gap
+description: A real Modal idiom/construct that calque doesn't support yet — parses into a confusing error, silently drops semantics, or isn't recognized at all.
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        calque's stance on gaps: **recognize and leak, never silently
+        drop.** If a construct is already detected and cleanly leaked (see
+        the `--- leak report (§10) ---` output, or
+        [`docs/modal-compatibility-matrix.md`](../../docs/modal-compatibility-matrix.md)
+        for the full census), that's usually working as intended — this
+        template is for gaps where calque does something *worse* than an
+        honest leak: crashes, silently ignores the construct, or produces a
+        misleading result.
+
+  - type: input
+    id: construct
+    attributes:
+      label: Modal construct / idiom
+      description: The specific decorator, API call, or pattern (e.g. "modal.Dict.from_name(...) referenced bare from a warm unit's body", "@modal.experimental.clustered").
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest script that exercises this construct, and the calque command you ran against it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What calque actually does
+      description: Paste the real output — a crash, a misleading leak, a wrong §7 gpu= verdict, whatever it is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: real-world
+    attributes:
+      label: Is this from a real script?
+      description: If you hit this in a real Modal codebase, link to the origin file rather than pasting the whole thing (this repo doesn't vendor third-party source — see CONTRIBUTING.md). A link is enough context to reproduce against.
+
+  - type: input
+    id: version
+    attributes:
+      label: calque version / commit
+    validations:
+      required: true

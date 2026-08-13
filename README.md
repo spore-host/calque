@@ -68,8 +68,9 @@ LEAKS: 3 emitted across 3 primitives
 
 That's the whole idea in two commands: a mechanical `gpu=` swap, then every pipeline stage
 running end to end against the unchanged script — parse, gate, plan, warm-execute, collect.
-See [`examples/`](examples/) for four annotated journeys (analyze, dry-run, Bedrock
-route-away, and an unsupported-workload refusal), each with real output.
+See [`examples/`](examples/) for seven annotated journeys (analyze, dry-run, Bedrock
+route-away, an unsupported-workload refusal, Volume-cached reuse, a permanent
+non-goal honestly leaked, and a real billable AWS run), each with real output.
 
 **Ready to run something for real?** [`docs/guide/getting-started.md`](docs/guide/getting-started.md)
 picks up exactly where this section leaves off — smoke test, first real (billable) AWS
@@ -271,6 +272,13 @@ Projects / milestones), not in local files.
 go build ./...          # control plane
 cd tools/pyast && uv sync   # Python AST helper deps
 ```
+
+## Trademarks
+
+calque is an independent project. It is not endorsed by, affiliated with, or
+supported by Amazon Web Services, Inc. or Modal (the company behind
+modal.com). "AWS," "Modal," and any other product or company names
+mentioned in this repository are trademarks of their respective owners.
 
 ## License
 
