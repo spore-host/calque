@@ -9,6 +9,22 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+### Added
+
+- A `--script` real run whose picked unit's `.image` chain has steps
+  LAYERED on a pullable `from_registry`/`from_aws_ecr` base, or no
+  pullable base at all, now gets its Dockerfile built ON THE ACQUIRED
+  INSTANCE (calque#177) instead of falling back to a hand-typed
+  `--pip`/`--stage-file` substitute — no ECR round-trip, no ambient
+  Docker requirement on the caller's machine, no second/throwaway
+  instance.
+- `calque real`'s new `--allow-card-swap` flag (calque#178) opts into a
+  curated, real-hardware-verified table of GPU substitutions (e.g. for a
+  card AWS has no matching single-GPU instance for at all) — off by
+  default; the asked-for card is always what gets used unless explicitly
+  opted in AND a verified table entry exists. The table itself ships
+  empty pending the first real-hardware verification run.
+
 ## [0.5.1] - 2026-08-14
 
 ### Documentation

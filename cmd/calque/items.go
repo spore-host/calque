@@ -12,6 +12,7 @@ import (
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/parse"
+	"github.com/spore-host/calque/internal/plan"
 	"github.com/spore-host/calque/internal/target"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
@@ -275,11 +276,42 @@ func warmUnitForScriptFn(ctx context.Context, scriptPath, entrypoint, function s
 // requested. When no script was parsed, unit is the zero warmUnit{}, whose
 // method.GPU is "" exactly like ir.Function{} — Recommend's own DefaultCard
 // fallback applies identically either way, so no separate branch is needed
-// here. instance is always the caller's own pinned --instance — these
-// commands never call plan.FillTarget to derive it from the card, so
-// Instance is set here directly regardless of which card Recommend picked.
-func recommendedTarget(unit warmUnit, instance string) *target.Target {
+// here.
+//
+// instance is the caller's own EXPLICIT --instance ("" means the operator
+// didn't pass one). fallbackInstance is what instance defaults to when
+// unset AND no swap applied — the subcommand's own pre-#178 hardcoded
+// default (e.g. "g6.2xlarge" for real), preserved so the no-swap case (the
+// overwhelming majority) stays byte-for-byte unchanged. allowSwap threads
+// through --allow-card-swap (calque#178): when true and the asked-for card
+// has a verified target.CardSwapFor entry, the swapped card becomes
+// tgt.Card, and — ONLY when instance is also unset — a real instance for
+// that NEW card is resolved via plan.FillTarget instead of the old
+// hardcoded fallback, since the old fallback was sized for the OLD card. An
+// explicit --instance always wins over both the swap and FillTarget.
+func recommendedTarget(unit warmUnit, instance, fallbackInstance string, allowSwap bool, rep *leak.Report) *target.Target {
 	tgt := target.StubRecommender{}.Recommend(ir.App{}, unit.method)
-	tgt.Instance = instance
+	swapped := false
+	if allowSwap {
+		if to, ok := target.CardSwapFor(tgt.Card); ok {
+			tgt.Card = to
+			swapped = true
+		}
+	}
+	if instance != "" {
+		tgt.Instance = instance
+		return &tgt
+	}
+	if !swapped {
+		tgt.Instance = fallbackInstance
+		return &tgt
+	}
+	if err := plan.FillTarget(&tgt, plan.NewTruffleResolver(rep), rep); err != nil {
+		// Matches FillTarget's own no-silent-fallback contract
+		// (internal/plan/truffle.go) — surface the failure rather than
+		// guessing an instance for the swapped card.
+		rep.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, "real", 0,
+			"--allow-card-swap: could not resolve an instance for swapped card %q: %v", tgt.Card, err)
+	}
 	return &tgt
 }

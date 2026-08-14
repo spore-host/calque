@@ -101,7 +101,8 @@ func TestRealOrSyntheticItems_FallsBackWhenNil(t *testing.T) {
 // plan.FillTarget to derive Instance from Card).
 func TestRecommendedTarget_CarriesParsedUnitsCard(t *testing.T) {
 	unit := warmUnit{method: ir.Function{Name: "generate", GPU: "H100"}}
-	tgt := recommendedTarget(unit, "p5.48xlarge")
+	rep := &leak.Report{}
+	tgt := recommendedTarget(unit, "p5.48xlarge", "g6.2xlarge", false, rep)
 	if tgt.Card != "H100" {
 		t.Errorf("Card = %q, want %q", tgt.Card, "H100")
 	}
@@ -114,12 +115,45 @@ func TestRecommendedTarget_CarriesParsedUnitsCard(t *testing.T) {
 // (no --script parsed) must fall back to target.DefaultCard exactly as
 // before this change — regression guard for the common no-script case.
 func TestRecommendedTarget_FallsBackToDefaultCardForZeroUnit(t *testing.T) {
-	tgt := recommendedTarget(warmUnit{}, "g7e.2xlarge")
+	rep := &leak.Report{}
+	tgt := recommendedTarget(warmUnit{}, "g7e.2xlarge", "g6.2xlarge", false, rep)
 	if tgt.Card != target.DefaultCard {
 		t.Errorf("Card = %q, want %q (zero warmUnit must fall back to DefaultCard)", tgt.Card, target.DefaultCard)
 	}
 	if tgt.Instance != "g7e.2xlarge" {
 		t.Errorf("Instance = %q, want %q", tgt.Instance, "g7e.2xlarge")
+	}
+}
+
+// TestRecommendedTarget_EmptyInstanceFallsBackToDefaultWhenNoSwap (calque#178)
+// proves the new fallbackInstance param preserves EXACTLY the pre-#178
+// behavior when either allowSwap is false or no table entry exists for the
+// asked card: an empty explicit instance ("" — operator didn't pass
+// --instance) resolves to the caller's own hardcoded default, NOT a
+// truffle lookup.
+func TestRecommendedTarget_EmptyInstanceFallsBackToDefaultWhenNoSwap(t *testing.T) {
+	unit := warmUnit{method: ir.Function{Name: "generate", GPU: "H100"}}
+	rep := &leak.Report{}
+	tgt := recommendedTarget(unit, "", "g6.2xlarge", true, rep) // allowSwap=true, but no table entry for "H100"
+	if tgt.Instance != "g6.2xlarge" {
+		t.Errorf("Instance = %q, want %q (no swap applied — must use the fallback default, not a truffle lookup)", tgt.Instance, "g6.2xlarge")
+	}
+	if tgt.Card != "H100" {
+		t.Errorf("Card = %q, want %q (no swap applied — card must be unchanged)", tgt.Card, "H100")
+	}
+}
+
+// TestRecommendedTarget_ExplicitInstanceAlwaysWinsRegardlessOfAllowSwap
+// (calque#178) proves an operator-supplied --instance is used verbatim
+// even with --allow-card-swap set — recommendedTarget must return early on
+// a non-empty instance BEFORE ever consulting the swap table, so an
+// explicit pin always wins.
+func TestRecommendedTarget_ExplicitInstanceAlwaysWinsRegardlessOfAllowSwap(t *testing.T) {
+	unit := warmUnit{method: ir.Function{Name: "generate", GPU: "H100"}}
+	rep := &leak.Report{}
+	tgt := recommendedTarget(unit, "p5.48xlarge", "g6.2xlarge", true, rep)
+	if tgt.Instance != "p5.48xlarge" {
+		t.Errorf("Instance = %q, want %q (explicit --instance must win)", tgt.Instance, "p5.48xlarge")
 	}
 }
 

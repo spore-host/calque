@@ -196,7 +196,10 @@ func runRamp(o rampOpts) (err error) {
 			}
 		},
 	}
-	tgt := recommendedTarget(unit, o.instance)
+	// ramp has no --allow-card-swap (calque#178) — it doesn't drive a
+	// --script-picked unit's own body at all (see the calque#79 scope note
+	// above), so there's no CleanSwap disposition to ever consult here.
+	tgt := recommendedTarget(unit, o.instance, o.instance, false, rep)
 	var acquired plan.Acquired
 	if len(o.fallbackRegions) > 0 {
 		fmt.Printf("[acquire] sniping %s in %s, falling back to %v (patient — up to %s; $0 until it lands)...\n",

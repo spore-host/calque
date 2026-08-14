@@ -22,6 +22,7 @@ import (
 
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
+	"github.com/spore-host/calque/internal/target"
 )
 
 // Disposition is the outcome of evaluating one gpu= site.
@@ -152,7 +153,15 @@ func evaluate(raw, body string, clustered bool) (ir.GPUSpec, Disposition, string
 // (target.StubRecommender.Recommend) for clean swaps; the raw value is
 // preserved for cost's rate-asymmetry (R_m uses the card the script ASKED
 // for, §9). Flagged sites are left for the caller to refuse.
-func RewriteApp(app ir.App, rep *leak.Report) *Log {
+//
+// allowSwap threads through the operator's --allow-card-swap opt-in
+// (calque#178): when true and a CleanSwap site's card has a verified entry
+// in target.CardSwapFor, Substituted carries the SWAPPED card instead of
+// the asked-for one — spec §7 always intended this field to record "the
+// card we swapped to," previously always trivially equal to the asked-for
+// card because no real substitution existed yet. false (the default)
+// reproduces prior behavior exactly.
+func RewriteApp(app ir.App, rep *leak.Report, allowSwap bool) *Log {
 	log := &Log{}
 	eval := func(owner, raw, body string, line int, clustered bool) {
 		spec, disp, reason := evaluate(raw, body, clustered)
@@ -163,6 +172,13 @@ func RewriteApp(app ir.App, rep *leak.Report) *Log {
 		switch disp {
 		case CleanSwap:
 			sub.Substituted = spec.Card
+			if allowSwap {
+				if to, ok := target.CardSwapFor(spec.Card); ok {
+					sub.Substituted = to
+					rep.Addf(leak.PrimGPU, leak.KindSemanticGap, app.Script, line,
+						"%s: --allow-card-swap substituted %q for the requested %q (calque#178, verified swap)", owner, to, spec.Card)
+				}
+			}
 		case FlagMulti:
 			rep.Addf(leak.PrimGPU, leak.KindSemanticGap, app.Script, line,
 				"%s: %s — NOT substituted", owner, reason)

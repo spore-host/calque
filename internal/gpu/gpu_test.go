@@ -105,7 +105,7 @@ func TestRewriteApp_ClusteredPlainFunctionFlagsCoupleDespiteLiteralSingleGPU(t *
 		},
 	}
 	rep := &leak.Report{}
-	log := RewriteApp(app, rep)
+	log := RewriteApp(app, rep, false)
 	if len(log.Subs) != 1 {
 		t.Fatalf("Subs = %+v, want exactly 1", log.Subs)
 	}
@@ -115,6 +115,30 @@ func TestRewriteApp_ClusteredPlainFunctionFlagsCoupleDespiteLiteralSingleGPU(t *
 	}
 	if sub.Substituted != "" {
 		t.Errorf("Substituted = %q, want empty — a FlagCouple site must NOT be substituted", sub.Substituted)
+	}
+}
+
+// TestRewriteApp_AllowSwapWithNoTableEntryUnchanged (calque#178) proves
+// allowSwap=true is a no-op for any card with no target.CardSwapFor entry
+// (which today is EVERY card, since the table ships empty pending real-
+// hardware verification) — Substituted stays exactly what it always was
+// (the asked-for card itself), matching the pre-#178 CleanSwap contract.
+func TestRewriteApp_AllowSwapWithNoTableEntryUnchanged(t *testing.T) {
+	app := ir.App{
+		Script:    "forecasts_repro.py",
+		Functions: []ir.Function{{Name: "run_forecast_inference", GPU: "A100-80GB", Body: "return infer()"}},
+	}
+	rep := &leak.Report{}
+	log := RewriteApp(app, rep, true) // allowSwap=true
+	if len(log.Subs) != 1 {
+		t.Fatalf("Subs = %+v, want exactly 1", log.Subs)
+	}
+	sub := log.Subs[0]
+	if sub.Disposition != CleanSwap {
+		t.Fatalf("Disposition = %s, want %s", sub.Disposition, CleanSwap)
+	}
+	if sub.Substituted != "A100-80GB" {
+		t.Errorf("Substituted = %q, want %q (no verified table entry exists yet — must NOT guess a substitute)", sub.Substituted, "A100-80GB")
 	}
 }
 
@@ -135,7 +159,7 @@ func TestRewriteApp_ClusteredClsMethodFlagsWholeClass(t *testing.T) {
 		},
 	}
 	rep := &leak.Report{}
-	log := RewriteApp(app, rep)
+	log := RewriteApp(app, rep, false)
 	if len(log.Subs) != 1 || log.Subs[0].Disposition != FlagCouple {
 		t.Fatalf("Subs = %+v, want exactly 1 FlagCouple", log.Subs)
 	}

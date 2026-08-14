@@ -121,8 +121,10 @@ func run(o runOpts) error {
 		return nil
 	}
 
-	// 2. gpu guard (§7): the swap must be legal or we refuse.
-	glog := gpu.RewriteApp(app, rep)
+	// 2. gpu guard (§7): the swap must be legal or we refuse. false: --dry-run
+	// has no --allow-card-swap concept — card-swap is a real-launch-only
+	// opt-in (calque#178).
+	glog := gpu.RewriteApp(app, rep, false)
 	askedCard := gpu.ParseSpec(unit.class.GPU).Card
 	if !swapLegal(glog, unit.class.Name) {
 		return fmt.Errorf("gpu= swap for %q is FLAGGED (multi-GPU or coupled); out of single-node scope — see leak report", unit.class.Name)
