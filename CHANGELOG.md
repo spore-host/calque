@@ -9,6 +9,16 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-14
+
+### Documentation
+- Add `CITATION.cff` — calque's Zenodo GitHub integration is now enabled, and
+  this release mints its first DOI.
+- Brand graphics (hero, logo, open-graph, sticker).
+- Fix a stale README claim about the recommender always returning a constant.
+- Move install instructions to the top of the README; soften the "spike"
+  status line now that packaged installs exist.
+
 ## [0.5.0] - 2026-08-14
 
 5 commits since v0.4.0: a real per-function/class image-resolution bug is
