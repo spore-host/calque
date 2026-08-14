@@ -214,6 +214,9 @@ func realRun(o realOpts) (err error) {
 	// unset --script (the default) reproduces prior behavior byte-for-byte.
 	hostMode := false
 	registryRef := ""
+	buildDockerfile := false
+	buildTag := ""
+	var dockerfileText string
 	body := calexec.ManifestBody{EnterBody: realEnterBody, MethodBody: realMethodBody, MethodArg: "prompt"}
 	if scriptBody, ok := manifestBodyForUnit(app, unit, rep); ok {
 		if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
@@ -228,27 +231,51 @@ func realRun(o realOpts) (err error) {
 			return fmt.Errorf("gpu= swap for %q is FLAGGED (multi-GPU or coupled); out of single-node scope — see leak report", unit.class.Name)
 		}
 		body = scriptBody
-		// calque#176: if the picked unit's OWN resolved image is a real,
-		// pullable from_registry/from_aws_ecr ref, pull it instead of
-		// falling back to host-mode's "deps must already be on the AMI"
-		// posture — the script's own declared environment for THAT
-		// callable, not a hand-typed --pip/--stage-file substitute. Prefer
-		// the method's own image (a method-level image= override), falling
-		// back to the class's — mirrors resolveCallableImage's own
-		// App->class->method fallback chain (internal/parse/parse.go).
+		// calque#176/#177: prefer the method's own image (a method-level
+		// image= override), falling back to the class's — mirrors
+		// resolveCallableImage's own App->class->method fallback chain
+		// (internal/parse/parse.go).
 		img := unit.method.Image
-		if ref, ok := image.RegistryRef(img); ok {
-			registryRef = ref
-		} else if ref, ok := image.RegistryRef(unit.class.Image); ok {
-			registryRef = ref
+		if img.Unresolved || img.Base == "" {
+			img = unit.class.Image
 		}
-		if registryRef == "" {
-			hostMode = true // no pullable image resolved — a parsed script's own body is typically not a vLLM/docker workload
+		bareRef, pullable := image.RegistryRef(img)
+		switch {
+		case image.NeedsBuild(img):
+			// calque#177: the resolved chain has steps beyond a bare
+			// pullable ref (or no pullable base at all) — build it ON THIS
+			// INSTANCE from the script's OWN resolved .image chain instead
+			// of falling back to a hand-typed --pip/--stage-file
+			// substitute. internal/image.Render is the same, already
+			// unit-tested Dockerfile renderer --dry-run already uses.
+			df, rerr := image.Render(image.Spec{Image: img, WorkerDir: hostWorkerDir}, app.Script, rep)
+			if rerr != nil {
+				return fmt.Errorf("render Dockerfile for %s's resolved image: %w", unit.method.Name, rerr)
+			}
+			dockerfileText = df
+			buildDockerfile = true
+			buildTag = "calque-local:" + image.Digest(df)
+			if pullable {
+				// The Dockerfile's own FROM line may itself be a private
+				// registry ref (e.g. a from_registry base with layered
+				// .pip_install(...) on top) — docker build needs the same
+				// pull-auth decision a plain pull would (bootstrap.go's
+				// isECRHostname check), so still carry it through.
+				registryRef = bareRef
+			}
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"real run driving %s's OWN parsed body against a Dockerfile BUILT ON THE INSTANCE from its OWN resolved .image chain (calque#177) — any add_local_*/from_dockerfile step within that chain that calque can't stage is leaked separately (see internal/image)", unit.method.Name)
+		case pullable:
+			// calque#176: a bare pullable from_registry/from_aws_ecr ref
+			// with nothing layered on top — pull it directly, no build
+			// needed.
+			registryRef = bareRef
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"real run driving %s's OWN parsed body against its OWN resolved image %q (calque#176)", unit.method.Name, registryRef)
+		default:
+			hostMode = true // no resolved image at all — a parsed script's own body is typically not a vLLM/docker workload
 			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
 				"real run driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
-		} else {
-			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
-				"real run driving %s's OWN parsed body against its OWN resolved image %q (calque#176) — any dependency LAYERED on top of this base in the script's .image chain (pip_install/add_local_file/etc. called on the from_registry result) still isn't built; supply those via --pip/--stage-file same as before", unit.method.Name, registryRef)
 		}
 	}
 	if forceStarmap {
@@ -307,6 +334,14 @@ func realRun(o realOpts) (err error) {
 	if err := calexec.WriteManifestBody(ctx, s3c, layout, body, hostWorkerDir, items, volumeSync, volumeCommit); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
+	if buildDockerfile {
+		// calque#177: upload the rendered Dockerfile alongside warmd/runner.py —
+		// the instance's existing `aws s3 cp --recursive` artifact sync (every
+		// docker-mode run already does this) downloads it for free.
+		if err := calexec.UploadDockerfile(ctx, s3c, layout, dockerfileText); err != nil {
+			return fmt.Errorf("upload Dockerfile: %w", err)
+		}
+	}
 	if hostMode {
 		fmt.Printf("[3/8] wrote manifest (%d items, %s's own @enter+@method)\n", o.n, unit.method.Name)
 	} else {
@@ -324,6 +359,7 @@ func realRun(o realOpts) (err error) {
 		LogKey: layout.LogKey, HostMode: hostMode, ModelEnv: o.model,
 		PipPackages: o.pipPackages, PythonVersion: o.pythonVersion,
 		StageFiles: o.stageFiles, RegistryRef: registryRef,
+		BuildDockerfile: buildDockerfile, BuildTag: buildTag,
 	}
 
 	// Price once via truffle (also R_a).

@@ -183,6 +183,28 @@ func RegistryRef(img ir.Image) (ref string, ok bool) {
 	return "", false
 }
 
+// NeedsBuild reports whether img is a resolved chain that can NOT be
+// satisfied by a bare `docker pull` alone (calque#177) — either because it
+// has NO pullable base at all (e.g. a from-scratch debian_slim()/
+// micromamba() chain, which has no published image anywhere), or because
+// it names a pullable base (from_registry/from_aws_ecr) but has additional
+// steps LAYERED on top (e.g. .pip_install(...)/.add_local_file(...) called
+// on the from_registry result — app.py's real benchmark_image shape).
+// Pulling the named base alone would silently drop those layered steps;
+// a build reproduces them. Returns false for img.Unresolved (the caller's
+// existing host-mode fallback already handles that case) and for a bare
+// pullable ref with no layered steps (RegistryRef's own pull-only path
+// already handles that case, calque#176).
+func NeedsBuild(img ir.Image) bool {
+	if img.Unresolved || img.Base == "" {
+		return false
+	}
+	if _, pullable := RegistryRef(img); pullable {
+		return len(img.Steps) > 1
+	}
+	return true
+}
+
 func resolveBase(img ir.Image, script string, rep *leak.Report) (string, error) {
 	if img.Unresolved || img.Base == "" {
 		rep.Add(leak.PrimImage, leak.KindSemanticGap, script, 0,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -122,6 +123,24 @@ func UploadArtifacts(ctx context.Context, c *s3.Client, l RunLayout, warmdBin, r
 		if err != nil {
 			return fmt.Errorf("put %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// UploadDockerfile puts a rendered Dockerfile (internal/image.Render's
+// output) into the artifact prefix alongside warmd/runner.py/occupancy.py
+// (calque#177) — the existing `aws s3 cp --recursive` bootstrap.go already
+// runs pulls it down for free; no separate download step needed. Named
+// "Dockerfile" so `docker build -f Dockerfile .` on the instance needs no
+// extra flag beyond the filename convention.
+func UploadDockerfile(ctx context.Context, c *s3.Client, l RunLayout, dockerfile string) error {
+	_, err := c.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(l.Bucket),
+		Key:    aws.String(l.ArtifactPfx + "/Dockerfile"),
+		Body:   strings.NewReader(dockerfile),
+	})
+	if err != nil {
+		return fmt.Errorf("put Dockerfile: %w", err)
 	}
 	return nil
 }

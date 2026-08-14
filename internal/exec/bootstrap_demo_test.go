@@ -184,7 +184,62 @@ func TestBootstrapCommandDockerModeWithoutRegistryRefUnchanged(t *testing.T) {
 	}
 }
 
-// TestBootstrapCommandDockerModeWithNonECRRegistryRefNoLogin (calque#176)
+// TestBootstrapCommandDockerModeWithBuildDockerfileBuildsLocally (calque#177)
+// proves BuildDockerfile builds the caller-uploaded Dockerfile ON THE
+// INSTANCE (from the artifact prefix's own working dir, already downloaded
+// by the existing `aws s3 cp --recursive` line) instead of pulling ANY
+// image, and runs the resulting tag — not RegistryRef/BaseImage.
+func TestBootstrapCommandDockerModeWithBuildDockerfileBuildsLocally(t *testing.T) {
+	c := BootstrapConfig{
+		BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art",
+		ManifestKey: "runs/x/manifest.json", Region: "us-west-2", WorkerDir: "/opt/calque",
+		BuildDockerfile: true, BuildTag: "calque-local:abc123",
+	}
+	cmd := c.Command()
+	for _, w := range []string{
+		"sudo docker build -t calque-local:abc123 -f /opt/calque/Dockerfile /opt/calque",
+	} {
+		if !strings.Contains(cmd, w) {
+			t.Errorf("missing %q in:\n%s", w, cmd)
+		}
+	}
+	if strings.Contains(cmd, "docker pull") {
+		t.Errorf("BuildDockerfile should build, never pull; got:\n%s", cmd)
+	}
+	if !strings.Contains(cmd, "calque-local:abc123 run --manifest") {
+		t.Errorf("docker run should use the BUILT tag, not BaseImage; got:\n%s", cmd)
+	}
+	buildIdx := strings.Index(cmd, "docker build")
+	runIdx := strings.Index(cmd, "docker run")
+	if buildIdx == -1 || runIdx == -1 || buildIdx > runIdx {
+		t.Errorf("docker build must run BEFORE docker run; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandDockerModeWithBuildDockerfileAndECRRegistryRefLogsIn
+// (calque#177) proves a build whose Dockerfile's OWN FROM line is a
+// private ECR ref (RegistryRef carries that base ref through even when
+// BuildDockerfile is set) still authenticates before the build, same as a
+// plain pull would — docker build needs to pull that base itself.
+func TestBootstrapCommandDockerModeWithBuildDockerfileAndECRRegistryRefLogsIn(t *testing.T) {
+	c := BootstrapConfig{
+		Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json",
+		Region: "us-west-2", WorkerDir: "/opt/calque",
+		RegistryRef:     "123456789012.dkr.ecr.us-west-2.amazonaws.com/base:latest",
+		BuildDockerfile: true, BuildTag: "calque-local:abc123",
+	}
+	cmd := c.Command()
+	if !strings.Contains(cmd, "aws ecr get-login-password --region us-west-2") {
+		t.Errorf("missing ECR login before build; got:\n%s", cmd)
+	}
+	loginIdx := strings.Index(cmd, "docker login")
+	buildIdx := strings.Index(cmd, "docker build")
+	if loginIdx == -1 || buildIdx == -1 || loginIdx > buildIdx {
+		t.Errorf("docker login must run BEFORE docker build; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandDockerModeWithoutRegistryRefUnchanged (calque#176)
 // proves a RegistryRef pointing at a non-ECR registry (e.g. GCP Artifact
 // Registry, as app.py's own real ROMP_IMAGE_URI default does) is pulled
 // anonymously — same as today's BaseImage behavior — since calque has no
