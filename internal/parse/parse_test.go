@@ -438,6 +438,82 @@ func TestParseTrivialFactoryImageResolves(t *testing.T) {
 	}
 }
 
+// TestParseForLoopExpandedImagesResolve (calque#179) proves a module-level
+// `for k, v in D.items(): @app.function(...) def f(...): ...` loop —
+// mirroring AI-Almanac's forecasts_app.py's real per-env
+// run_forecast_inference/warm_model_weights pairing — expands into ONE
+// ir.Function per (registered name, resolved image) pair, not a single
+// mis-resolved entry. Asserts BOTH statements per loop iteration
+// (do_inference_*/do_warm_*) resolve, each with the correct per-env f-string
+// substitution folded into its image's run_commands step, and that gpu=
+// (an unrelated literal, unaffected by this whole change) still flows
+// through per-function.
+func TestParseForLoopExpandedImagesResolve(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/factory_image_loop.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	cases := []struct {
+		fnName     string
+		wantRunCmd string
+	}{
+		{"do_inference_alpha", "uv pip install 'examplepkg[a1,a2]'"},
+		{"do_warm_alpha", "uv pip install 'examplepkg[a1,a2]'"},
+		{"do_inference_beta", "uv pip install 'examplepkg[b1]'"},
+		{"do_warm_beta", "uv pip install 'examplepkg[b1]'"},
+	}
+	for _, c := range cases {
+		fn, ok := app.FindFunction(c.fnName)
+		if !ok {
+			t.Errorf("function %q not found", c.fnName)
+			continue
+		}
+		if fn.GPU != "A100-80GB" {
+			t.Errorf("%s.GPU = %q, want %q (unrelated literal, must pass through unaffected)", c.fnName, fn.GPU, "A100-80GB")
+		}
+		if fn.Image.Base != "debian_slim" {
+			t.Errorf("%s.Image.Base = %q, want debian_slim", c.fnName, fn.Image.Base)
+		}
+		found := false
+		for _, s := range fn.Image.Steps {
+			if s.Method == "run_commands" {
+				for _, a := range s.Args {
+					if a == c.wantRunCmd {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%s's image run_commands should contain %q (per-env f-string substitution); steps=%+v", c.fnName, c.wantRunCmd, fn.Image.Steps)
+		}
+	}
+	// do_inference_alpha and do_inference_beta must NOT share the same image
+	// (each env's f-string-substituted spec differs) — a regression here
+	// would mean the loop expansion picked one image for every iteration.
+	alpha, _ := app.FindFunction("do_inference_alpha")
+	beta, _ := app.FindFunction("do_inference_beta")
+	if len(alpha.Image.Steps) > 0 && len(beta.Image.Steps) > 0 {
+		lastAlpha := alpha.Image.Steps[len(alpha.Image.Steps)-1]
+		lastBeta := beta.Image.Steps[len(beta.Image.Steps)-1]
+		if len(lastAlpha.Args) > 0 && len(lastBeta.Args) > 0 && lastAlpha.Args[0] == lastBeta.Args[0] {
+			t.Errorf("alpha and beta resolved to the SAME image content — per-iteration substitution did not happen")
+		}
+	}
+	for _, l := range rep.Leaks {
+		for _, name := range []string{"do_inference_alpha", "do_warm_alpha", "do_inference_beta", "do_warm_beta"} {
+			if strings.Contains(l.Detail, name) && strings.Contains(l.Detail, "did not resolve") {
+				t.Errorf("%s's for-loop-expanded image must resolve with NO leak; got: %s", name, l.Detail)
+			}
+		}
+	}
+}
+
 // TestParseServeEntryKind (F1): serve decorators are detected and carried onto the
 // IR as EntryServe, so the run path can gate/leak them instead of crashing.
 func TestParseServeEntryKind(t *testing.T) {

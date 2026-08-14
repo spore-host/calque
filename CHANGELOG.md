@@ -24,6 +24,14 @@ per [semver.org](https://semver.org/#spec-item-4).
   default; the asked-for card is always what gets used unless explicitly
   opted in AND a verified table entry exists. The table itself ships
   empty pending the first real-hardware verification run.
+- A specific `image=<var>` shape now resolves correctly (calque#179): a
+  parameterized factory function called from a dict comprehension, then
+  consumed by a module-level `for k, v in D.items(): @app.function(...)
+  def f(...): ...` loop — the idiom AI-Almanac's `forecasts_app.py` uses
+  for its per-environment earth2studio images. Expands into one real
+  function per (key, value) pair with the factory's own f-string
+  substitution folded correctly per iteration, instead of every function
+  silently falling back to the app-wide default image.
 
 ## [0.5.1] - 2026-08-14
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 import ast
 import json
 import sys
-from typing import Any
+from typing import Any, Callable
 
 
 def _const_str(node: ast.AST) -> str | None:
@@ -695,7 +695,7 @@ _IMAGE_STEPS = frozenset(
 )
 
 
-def _walk_image_chain(node: ast.AST) -> dict[str, Any] | None:
+def _walk_image_chain(node: ast.AST, literal_fn: Callable[[ast.AST], Any] = _literal) -> dict[str, Any] | None:
     """Flatten a `modal.Image.debian_slim().pip_install(...).uv_pip_install(...)` chain.
 
     Returns {base, steps:[{method, args}], base_unresolved: bool, root_name: str|None}
@@ -715,6 +715,15 @@ def _walk_image_chain(node: ast.AST) -> dict[str, Any] | None:
     reassignment (a natural pattern for progressively/conditionally built
     images across multiple statements) silently overwrote and discarded
     whatever base+steps the earlier statement(s) had already resolved.
+
+    literal_fn (calque#179, for-loop/dict-comp image resolution): defaults to
+    the module-level _literal, so every EXISTING caller (including
+    _walk_factory_return's zero-arg path) is byte-for-byte unaffected. A
+    caller resolving a PARAMETERIZED factory's body (_walk_bound_factory_return)
+    passes a locals-aware resolver instead, so e.g. an f-string interpolating
+    a factory's own (now-bound) argument can fold to a real string instead of
+    the usual {"__unparsed__": ...} marker — scoped to that one walk, never
+    changing what an ordinary, unrelated image chain's args resolve to.
     """
     steps: list[dict[str, Any]] = []
     cur = node
@@ -725,10 +734,10 @@ def _walk_image_chain(node: ast.AST) -> dict[str, Any] | None:
         args: list[Any] = []
         for a in cur.args:
             if isinstance(a, (ast.List, ast.Tuple)):
-                args.extend(_literal(e) for e in a.elts)
+                args.extend(literal_fn(e) for e in a.elts)
             else:
                 # pip_install("torch", "vllm") — varargs of package strings
-                args.append(_literal(a))
+                args.append(literal_fn(a))
         if method in _IMAGE_BASES:
             base = method
             saw_image_verb = True
@@ -801,12 +810,249 @@ def _walk_factory_return(func_node: ast.AST, module_funcs: dict[str, ast.AST]) -
     return _walk_image_chain(body[-1].value)
 
 
+# Sentinel distinct from None (a legitimate resolved value, e.g. a literal
+# `None` binding) — _eval_bound_expr/_literal_bound both need to distinguish
+# "resolved to None" from "could not resolve at all."
+_UNRESOLVED = object()
+
+
+def _eval_bound_expr(node: ast.AST, locals_: dict[str, Any]) -> Any:
+    """A tiny, explicit whitelist evaluator for a parameterized factory's
+    local Assign statements (calque#179) — deliberately NOT `eval()` or a
+    general `ast.literal_eval`. Resolves exactly the shapes AI-Almanac's real
+    `spec = ",".join(extras)` idiom needs and nothing more:
+      - a bare Name already bound in `locals_`
+      - a Constant (its own value)
+      - `<string-constant>.join(<expr>)` where <expr> resolves to a list/
+        tuple of strings
+
+    Anything else returns _UNRESOLVED. This is an explicit, narrow non-goal
+    boundary: a bound factory needing more than this (arithmetic, f-strings,
+    comprehensions, arbitrary calls) is NOT modeled — the caller bails to
+    today's behavior rather than guessing.
+    """
+    if isinstance(node, ast.Name):
+        return locals_.get(node.id, _UNRESOLVED)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        items = _eval_bound_expr(node.args[0], locals_)
+        if items is _UNRESOLVED or not isinstance(items, (list, tuple)):
+            return _UNRESOLVED
+        if not all(isinstance(i, str) for i in items):
+            return _UNRESOLVED
+        return node.func.value.value.join(items)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        out = []
+        for e in node.elts:
+            v = _eval_bound_expr(e, locals_)
+            if v is _UNRESOLVED:
+                return _UNRESOLVED
+            out.append(v)
+        return out
+    return _UNRESOLVED
+
+
+def _literal_bound(node: ast.AST, locals_: dict[str, Any]) -> Any:
+    """_literal, extended with a NARROWLY SCOPED ability to fold an f-string
+    (ast.JoinedStr) when every one of its interpolated values resolves
+    against `locals_` via _eval_bound_expr (calque#179). Used ONLY as the
+    literal_fn passed to _walk_image_chain from _walk_bound_factory_return —
+    NEVER a replacement for the module-level _literal, which every ordinary
+    decorator-kwarg/image-chain-arg extraction still uses unchanged.
+
+    An f-string referencing anything outside `locals_`, or using any
+    conversion/format-spec beyond plain str(), degrades to EXACTLY the same
+    {"__unparsed__": ...} marker _literal already produces — conservative by
+    construction, never a silently-wrong substitution.
+    """
+    if not isinstance(node, ast.JoinedStr):
+        return _literal(node)
+    parts: list[str] = []
+    for piece in node.values:
+        if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+            parts.append(piece.value)
+        elif isinstance(piece, ast.FormattedValue):
+            if piece.format_spec is not None or piece.conversion not in (-1, 115):
+                return _literal(node)  # unmodeled formatting: conservative fallback
+            val = _eval_bound_expr(piece.value, locals_)
+            if val is _UNRESOLVED:
+                return _literal(node)  # conservative fallback
+            parts.append(str(val))
+        else:
+            return _literal(node)
+    return "".join(parts)
+
+
+def _walk_bound_factory_return(
+    func_node: ast.AST, bindings: dict[str, Any], module_funcs: dict[str, ast.AST]
+) -> dict[str, Any] | None:
+    """Like _walk_factory_return, but for a factory taking exactly the
+    positional args named in `bindings` (name -> already-resolved value —
+    e.g. a list of strings) — used ONLY from the for-loop/dict-comprehension
+    image resolution path (calque#179), where the caller supplies concrete
+    bound values per (key, value) source-dict pair. `_walk_factory_return`
+    itself stays untouched: this is a SIBLING for the parameterized case,
+    never reachable from a plain `img = factory()` call site.
+
+    module_funcs is accepted for signature parity with the call site and
+    potential future recursion (a factory calling another factory) — not
+    used today; local Assigns are resolved via _eval_bound_expr's own
+    narrow whitelist instead.
+    """
+    del module_funcs  # not used yet — see docstring
+    if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    if func_node.decorator_list:
+        return None
+    a = func_node.args
+    param_names = {p.arg for p in (a.posonlyargs + a.args)}
+    if a.vararg or a.kwonlyargs or a.kwarg:
+        return None  # only plain positional params supported
+    if param_names != set(bindings):
+        return None  # bindings must supply EXACTLY the factory's own params
+    body = func_node.body
+    if not body or not isinstance(body[-1], ast.Return) or body[-1].value is None:
+        return None
+    for stmt in body[:-1]:
+        if isinstance(stmt, _FACTORY_DISALLOWED_STMTS):
+            return None
+    if sum(1 for n in ast.walk(func_node) if isinstance(n, ast.Return)) != 1:
+        return None
+    locals_ = dict(bindings)
+    for stmt in body[:-1]:
+        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            return None  # anything other than a single-name Assign bails
+        val = _eval_bound_expr(stmt.value, locals_)
+        if val is _UNRESOLVED:
+            return None
+        locals_[stmt.targets[0].id] = val
+    return _walk_image_chain(body[-1].value, literal_fn=lambda n: _literal_bound(n, locals_))
+
+
+def _literal_dict_const(name: str, module_const_nodes: dict[str, ast.Assign]) -> Any:
+    """Resolve a module-level simple-assign's RHS to an actual Python value
+    via ast.literal_eval, when it's a plain literal (calque#179) — e.g.
+    `_INFERENCE_EXTRAS = {"base": [...], "aifs2": [...]}`. Returns
+    _UNRESOLVED for a missing name or a non-literal RHS (a call, a
+    comprehension, a reference to another name, etc.) — this is
+    DELIBERATELY narrow: only the exact "dict/list/etc of literals" shape
+    _INFERENCE_EXTRAS-style source dicts actually need.
+    """
+    node = module_const_nodes.get(name)
+    if node is None:
+        return _UNRESOLVED
+    try:
+        return ast.literal_eval(node.value)
+    except (ValueError, SyntaxError):
+        return _UNRESOLVED
+
+
+def _resolve_image_dictcomp(
+    node: ast.DictComp, module_funcs: dict[str, ast.AST], module_const_nodes: dict[str, ast.Assign]
+) -> dict[Any, dict[str, Any]] | None:
+    """Resolve `{k: some_factory(v) for k, v in SOME_DICT.items()}` to a real
+    `{k: resolved-image-chain}` dict (calque#179) — e.g. AI-Almanac's
+    forecasts_app.py's `INFERENCE_IMAGES = {env: _inference_image(extras) for
+    env, extras in _INFERENCE_EXTRAS.items()}`. Returns None (never a partial
+    dict) the moment any part of this narrow, specific shape doesn't match:
+    a filtered comprehension, a non-dict-literal source, a value expression
+    that isn't a single-arg call to a MODULE-LEVEL function, or any one
+    (key, value) pair that fails to resolve via _walk_bound_factory_return.
+    """
+    if len(node.generators) != 1:
+        return None
+    gen = node.generators[0]
+    if gen.ifs:
+        return None
+    target_names = _comp_target_names(gen.target)
+    if len(target_names) != 2:
+        return None
+    key_name, value_name = target_names
+
+    if (
+        not isinstance(gen.iter, ast.Call)
+        or gen.iter.args
+        or gen.iter.keywords
+        or not isinstance(gen.iter.func, ast.Attribute)
+        or gen.iter.func.attr != "items"
+        or not isinstance(gen.iter.func.value, ast.Name)
+    ):
+        return None
+    source_dict = _literal_dict_const(gen.iter.func.value.id, module_const_nodes)
+    if source_dict is _UNRESOLVED or not isinstance(source_dict, dict):
+        return None
+
+    if not isinstance(node.key, ast.Name) or node.key.id != key_name:
+        return None
+
+    if (
+        not isinstance(node.value, ast.Call)
+        or not isinstance(node.value.func, ast.Name)
+        or node.value.func.id not in module_funcs
+        or len(node.value.args) != 1
+        or node.value.keywords
+        or not isinstance(node.value.args[0], ast.Name)
+        or node.value.args[0].id != value_name
+    ):
+        return None
+    factory_node = module_funcs[node.value.func.id]
+
+    resolved: dict[Any, dict[str, Any]] = {}
+    for k, v in source_dict.items():
+        chain = _walk_bound_factory_return(factory_node, {value_name: v}, module_funcs)
+        if chain is None:
+            return None  # any single pair failing bails the WHOLE dict
+        resolved[k] = chain
+    return resolved
+
+
+def _render_loop_name(node: ast.AST, bindings: dict[str, Any]) -> str | None:
+    """Render a for-loop's decorator `name=` value (a plain string or an
+    f-string) by substituting the loop's own target names against
+    `bindings` (calque#179) — e.g. `f"run_forecast_inference_{_env}"` with
+    `bindings={"_env": "base", "_image": {...}}` renders to
+    "run_forecast_inference_base". Returns None if `node` needs more than
+    str()-of-a-bound-name substitution (falls back to today's behavior,
+    conservative by construction — see _literal_bound's own doc for the
+    same posture applied to image-chain args).
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    parts: list[str] = []
+    for piece in node.values:
+        if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+            parts.append(piece.value)
+        elif (
+            isinstance(piece, ast.FormattedValue)
+            and piece.format_spec is None
+            and piece.conversion in (-1, 115)
+            and isinstance(piece.value, ast.Name)
+            and piece.value.id in bindings
+        ):
+            parts.append(str(bindings[piece.value.id]))
+        else:
+            return None
+    return "".join(parts)
+
+
 class Collector(ast.NodeVisitor):
     def __init__(
         self,
         src: str,
         module_names: frozenset[str] = frozenset(),
         module_funcs: dict[str, ast.AST] | None = None,
+        module_const_nodes: dict[str, ast.Assign] | None = None,
     ) -> None:
         self.src = src
         # calque#175: module-level function bindings (name -> FunctionDef),
@@ -816,10 +1062,23 @@ class Collector(ast.NodeVisitor):
         # analyze() before Collector starts walking; threaded through here
         # rather than recomputed.
         self._module_funcs = module_funcs or {}
+        # calque#179: RAW module-level simple-assign AST nodes (name ->
+        # ast.Assign), NOT the already-stringified module_consts dict analyze()
+        # ships on the wire — needed so a for-loop's iterable
+        # (`_INFERENCE_EXTRAS.items()`) can be resolved to an actual literal
+        # dict via ast.literal_eval on its RHS node, which the stringified
+        # shape can't provide.
+        self._module_const_nodes = module_const_nodes or {}
         # calque#139: names of every module-level def/simple-assign in the
         # script — the resolution universe _free_refs is allowed to match
         # against when walking each function/method body (see _describe_fn).
         self._module_names = module_names
+        # calque#179: varname -> {key: resolved-image-chain-dict}, populated by
+        # visit_Assign when a module-level dict-comprehension's values are all
+        # resolvable image chains (see _resolve_image_dictcomp) — consulted by
+        # visit_For to expand a `for k, v in THIS_NAME.items(): @app.function(...)`
+        # loop into one function+image pair per (key, value).
+        self._dict_of_images: dict[str, dict[Any, dict[str, Any]]] = {}
         self.app_name: str | None = None
         # app_kwargs holds App(...)'s own volumes=/secrets= (calque#168) — a
         # function/class that declares neither inherits from here (the same
@@ -933,6 +1192,18 @@ class Collector(ast.NodeVisitor):
                             "steps": chain["steps"],
                             "base_unresolved": chain["base_unresolved"],
                         }
+        # calque#179: NAME = {k: some_factory(v) for k, v in SOME_DICT.items()} —
+        # a dict of per-key images, e.g. AI-Almanac's forecasts_app.py's
+        # INFERENCE_IMAGES. _walk_image_chain/visit_Assign's own ast.Call
+        # branches above never match a DictComp RHS at all — this is a wholly
+        # separate resolution path, feeding _dict_of_images (consulted by
+        # visit_For) rather than self.images (one variable, one image).
+        if isinstance(val, ast.DictComp):
+            resolved = _resolve_image_dictcomp(val, self._module_funcs, self._module_const_nodes)
+            if resolved is not None:
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        self._dict_of_images[t.id] = resolved
         # vol = modal.Volume.from_name("weights")
         if isinstance(val, ast.Call) and _attr_chain(val.func)[-2:] == ["Volume", "from_name"]:
             name = _const_str(val.args[0]) if val.args else None
@@ -950,6 +1221,134 @@ class Collector(ast.NodeVisitor):
                     {"where": construct, "detail": f"{construct}.from_name(...) recognized but not modeled (calque#91)", "lineno": node.lineno}
                 )
         self.generic_visit(node)
+
+    # ---- calque#179: module-level `for k, v in D.items(): @app.function(...) def f(...): ...` ----
+    def visit_For(self, node: ast.For) -> None:
+        if not self._try_expand_decorated_loop(node):
+            self.generic_visit(node)  # unrecognized shape: today's behavior, unchanged
+
+    visit_AsyncFor = visit_For
+
+    def _try_expand_decorated_loop(self, node: ast.For) -> bool:
+        """Expand a module-level for-loop whose body is one or more
+        `@app.function(...)`-decorated defs, iterating a known dict of
+        resolved images, into N per-(key,value) function+image descriptors
+        (calque#179) — see pyast.py's module docstring/plan for the full
+        real-world motivation (AI-Almanac's forecasts_app.py). Returns False
+        (no partial expansion) the moment ANY gate fails, so the caller falls
+        back to exactly today's behavior — generic_visit still walks the
+        original AST node once, producing the same single mis-resolved entry
+        + leak as before this feature existed.
+        """
+        stmts = node.body
+        if not stmts:
+            return False
+        # A loop with NO @app.function-decorated def anywhere in its body is
+        # an ordinary, unrelated for-loop (e.g. `for i in range(10): ...`) —
+        # excluded silently, no leak (matches every other statement type in
+        # a real script that this file doesn't model). A loop with AT LEAST
+        # ONE such def, but not EVERY statement matching (e.g. the real
+        # script's `SEASON_BUNDLE_FNS[_env] = run_season_forecast_bundle`
+        # trailing statement, calque#179's own v1 scope boundary), gets a
+        # diagnostic leak below — it genuinely looks like the idiom this
+        # function exists to expand, so silence would be a worse signal than
+        # an honest "didn't expand, here's why."
+        any_function_deco = any(
+            isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(_decorator_name(d).rsplit(".", 1)[-1] == "function" for d in stmt.decorator_list)
+            for stmt in stmts
+        )
+        # Per statement: the FunctionDef, the index of its @app.function
+        # decorator within decorator_list (so we can later patch the SAME
+        # position in _describe_fn's own decorators list — _describe_fn
+        # recomputes kwargs fresh via its own _decorator_kwargs call, so a
+        # dict-identity match against `kw` below would never hit), and that
+        # decorator's own name= AST node (to re-render per iteration).
+        plan: list[tuple[ast.FunctionDef, int, ast.AST]] = []
+        for stmt in stmts:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any_function_deco:
+                    self._leak_loop_expansion_failed(node, f"loop body contains a non-function statement ({type(stmt).__name__}) alongside decorated def(s)")
+                return False
+            deco_idx = next(
+                (i for i, d in enumerate(stmt.decorator_list) if _decorator_name(d).rsplit(".", 1)[-1] == "function"),
+                None,
+            )
+            if deco_idx is None:
+                if any_function_deco:
+                    self._leak_loop_expansion_failed(node, f"{stmt.name!r} in the loop body has no @app.function decorator")
+                return False
+            deco = stmt.decorator_list[deco_idx]
+            name_kwarg_node = next((kw.value for kw in deco.keywords if kw.arg == "name"), None) if isinstance(deco, ast.Call) else None  # type: ignore[union-attr]
+            if name_kwarg_node is None:
+                return False
+            plan.append((stmt, deco_idx, name_kwarg_node))
+
+        target_names = _comp_target_names(node.target)
+        if len(target_names) != 2:
+            self._leak_loop_expansion_failed(node, "for-loop target is not a 2-tuple (key, value)")
+            return False
+        key_name, value_name = target_names
+
+        source_dict = self._resolve_for_loop_dict(node.iter)
+        if source_dict is None:
+            self._leak_loop_expansion_failed(node, "iterable did not resolve to a known dict of images")
+            return False
+
+        # Render every statement's name= per (key, value) pair BEFORE
+        # mutating any shared state — if ANY iteration/statement fails to
+        # render, bail the WHOLE loop (atomic, no partial expansion).
+        # rendered[i] is the list of (stmt, deco_idx, rendered_name,
+        # image_key) tuples for source_dict's i-th (key, value) pair.
+        rendered: list[list[tuple[ast.FunctionDef, int, str, str]]] = []
+        for key in source_dict:
+            image_chain = source_dict[key]
+            per_pair: list[tuple[ast.FunctionDef, int, str, str]] = []
+            for stmt, deco_idx, name_kwarg_node in plan:
+                rendered_name = _render_loop_name(name_kwarg_node, {key_name: key, value_name: image_chain})
+                if rendered_name is None:
+                    self._leak_loop_expansion_failed(node, f"name= for {stmt.name!r} needs more than str(key)/str(value) substitution")
+                    return False
+                image_key = f"__forloop_L{node.lineno}_{key}"
+                per_pair.append((stmt, deco_idx, rendered_name, image_key))
+            rendered.append(per_pair)
+
+        # Every statement/pair rendered successfully — commit.
+        for key, per_pair in zip(source_dict, rendered):
+            image_chain = source_dict[key]
+            for stmt, deco_idx, rendered_name, image_key in per_pair:
+                self.images[image_key] = image_chain
+                desc = _describe_fn(self.src, stmt, self.leaks, self._module_names)
+                desc["name"] = rendered_name
+                desc["decorators"][deco_idx]["kwargs"]["name"] = rendered_name
+                desc["decorators"][deco_idx]["kwargs"]["image"] = {"__ref__": image_key}
+                self.functions.append(desc)
+        return True
+
+    def _resolve_for_loop_dict(self, iter_node: ast.AST) -> dict[Any, dict[str, Any]] | None:
+        """Resolve a for-loop's `X.items()` iterable to a known dict of
+        resolved images (calque#179) — X must already be in _dict_of_images
+        (populated by visit_Assign's DictComp branch, which runs BEFORE this
+        loop is visited since it appears earlier in the module's source)."""
+        if (
+            isinstance(iter_node, ast.Call)
+            and not iter_node.args
+            and not iter_node.keywords
+            and isinstance(iter_node.func, ast.Attribute)
+            and iter_node.func.attr == "items"
+            and isinstance(iter_node.func.value, ast.Name)
+        ):
+            return self._dict_of_images.get(iter_node.func.value.id)
+        return None
+
+    def _leak_loop_expansion_failed(self, node: ast.For, reason: str) -> None:
+        self.leaks.append(
+            {
+                "where": "for-loop image expansion",
+                "detail": f"module-level for-loop over dict.items() with decorated def(s): {reason} — falling back to today's per-statement resolution",
+                "lineno": node.lineno,
+            }
+        )
 
     # ---- record invocation idioms (spec §13 map; §C starmap/for_each/remote;
     # async spawn/.map.aio recognized so the census stays honest, leaked as
@@ -1250,7 +1649,7 @@ def analyze(path: str) -> dict[str, Any]:
         for name, node in module_class_nodes.items()
     }
 
-    c = Collector(src, module_names, module_func_nodes)
+    c = Collector(src, module_names, module_func_nodes, module_const_nodes)
     c.visit(tree)
     return {
         "script": path,
