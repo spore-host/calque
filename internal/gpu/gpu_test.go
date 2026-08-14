@@ -1,6 +1,7 @@
 package gpu
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/spore-host/calque/internal/ir"
@@ -119,11 +120,36 @@ func TestRewriteApp_ClusteredPlainFunctionFlagsCoupleDespiteLiteralSingleGPU(t *
 }
 
 // TestRewriteApp_AllowSwapWithNoTableEntryUnchanged (calque#178) proves
-// allowSwap=true is a no-op for any card with no target.CardSwapFor entry
-// (which today is EVERY card, since the table ships empty pending real-
-// hardware verification) — Substituted stays exactly what it always was
-// (the asked-for card itself), matching the pre-#178 CleanSwap contract.
+// allowSwap=true is a no-op for any card with NO target.CardSwapFor entry
+// — Substituted stays exactly what it always was (the asked-for card
+// itself), matching the pre-#178 CleanSwap contract. Uses a card that will
+// never have a real table entry (not a real GPU name), so this test can't
+// go stale the way it would if it hardcoded a real card that later gets
+// verified.
 func TestRewriteApp_AllowSwapWithNoTableEntryUnchanged(t *testing.T) {
+	app := ir.App{
+		Script:    "no_swap_repro.py",
+		Functions: []ir.Function{{Name: "worker", GPU: "test-card-with-no-swap-entry", Body: "return infer()"}},
+	}
+	rep := &leak.Report{}
+	log := RewriteApp(app, rep, true) // allowSwap=true
+	if len(log.Subs) != 1 {
+		t.Fatalf("Subs = %+v, want exactly 1", log.Subs)
+	}
+	sub := log.Subs[0]
+	if sub.Disposition != CleanSwap {
+		t.Fatalf("Disposition = %s, want %s", sub.Disposition, CleanSwap)
+	}
+	if sub.Substituted != "test-card-with-no-swap-entry" {
+		t.Errorf("Substituted = %q, want %q (no verified table entry exists for this card — must NOT guess a substitute)", sub.Substituted, "test-card-with-no-swap-entry")
+	}
+}
+
+// TestRewriteApp_AllowSwapAppliesVerifiedEntry (calque#178) proves
+// allowSwap=true DOES apply a real, verified table entry — the
+// A100-80GB -> RTX PRO 6000 swap, confirmed on real g7e hardware running
+// earth2studio's AIFS model end-to-end (see internal/target/swaps.go).
+func TestRewriteApp_AllowSwapAppliesVerifiedEntry(t *testing.T) {
 	app := ir.App{
 		Script:    "forecasts_repro.py",
 		Functions: []ir.Function{{Name: "run_forecast_inference", GPU: "A100-80GB", Body: "return infer()"}},
@@ -137,8 +163,37 @@ func TestRewriteApp_AllowSwapWithNoTableEntryUnchanged(t *testing.T) {
 	if sub.Disposition != CleanSwap {
 		t.Fatalf("Disposition = %s, want %s", sub.Disposition, CleanSwap)
 	}
-	if sub.Substituted != "A100-80GB" {
-		t.Errorf("Substituted = %q, want %q (no verified table entry exists yet — must NOT guess a substitute)", sub.Substituted, "A100-80GB")
+	if sub.Substituted != "RTX PRO 6000" {
+		t.Errorf("Substituted = %q, want %q (verified table entry should apply when allowSwap is set)", sub.Substituted, "RTX PRO 6000")
+	}
+	foundLeak := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "--allow-card-swap substituted") {
+			foundLeak = true
+		}
+	}
+	if !foundLeak {
+		t.Error("expected a leak noting the applied substitution")
+	}
+}
+
+// TestRewriteApp_AllowSwapFalseNeverAppliesEvenWithVerifiedEntry (calque#178)
+// proves the opt-in gate itself: the SAME A100-80GB site, with allowSwap
+// left false (the default), must carry the asked-for card through
+// unchanged — a verified table entry existing is not enough on its own;
+// the operator must also pass --allow-card-swap.
+func TestRewriteApp_AllowSwapFalseNeverAppliesEvenWithVerifiedEntry(t *testing.T) {
+	app := ir.App{
+		Script:    "forecasts_repro.py",
+		Functions: []ir.Function{{Name: "run_forecast_inference", GPU: "A100-80GB", Body: "return infer()"}},
+	}
+	rep := &leak.Report{}
+	log := RewriteApp(app, rep, false) // allowSwap=false (the default)
+	if len(log.Subs) != 1 {
+		t.Fatalf("Subs = %+v, want exactly 1", log.Subs)
+	}
+	if log.Subs[0].Substituted != "A100-80GB" {
+		t.Errorf("Substituted = %q, want %q (allowSwap=false must never apply a swap, even with a verified entry)", log.Subs[0].Substituted, "A100-80GB")
 	}
 }
 

@@ -17,15 +17,24 @@ package target
 // pass-through (spec §4); callers consult this table separately (see
 // cmd/calque/items.go's recommendedTarget) only when the operator has
 // explicitly asked for it.
-//
-// DELIBERATELY EMPTY for now (calque#178): the motivating case
-// (A100-80GB -> RTX PRO 6000, for AI-Almanac's forecasts_app.py) has NOT
-// yet been verified against a real earth2studio inference run on real
-// (spot) g7e hardware. Do not add an entry here from static analysis
-// alone — add it only once that run has happened and produced a real,
-// checked result (not just "didn't crash"), and fill VerifiedAgainst/
-// VerifiedDate with what was actually run.
-var cardSwaps = map[string]cardSwap{}
+var cardSwaps = map[string]cardSwap{
+	// calque#178: verified on a real g7e.2xlarge spot instance (RTX PRO
+	// 6000 Blackwell, 97887MiB) — built the exact Dockerfile calque itself
+	// resolves for AI-Almanac's forecasts_app.py's run_forecast_inference_base
+	// (nvcr.io/nvidia/pytorch:25.12-py3 base, the real git-pinned
+	// earth2studio[aifs,aifsens,data,fuxi,gencast,graphcast] install), then
+	// ran earth2studio's AIFS model end-to-end inside that container: real
+	// model weight load, real live GFS data fetch (NOAA's public S3
+	// bucket), real inference rollout via earth2studio.run.deterministic —
+	// reported SUCCESS, completed in ~9s. A100-80GB has no AWS single-GPU
+	// equivalent at all (p4de.24xlarge is an 8-GPU box); this substitution
+	// runs the same B=1 workload on a real, cheaper single-GPU card.
+	"A100-80GB": {
+		To:              "RTX PRO 6000",
+		VerifiedAgainst: "earth2studio AIFS deterministic inference (real GFS data), calque#178",
+		VerifiedDate:    "2026-08-14",
+	},
+}
 
 // cardSwap is one curated substitution: the card CardSwapFor's caller
 // carried forward `To`, verified against a real workload (`VerifiedAgainst`)

@@ -3,16 +3,30 @@ package target
 import "testing"
 
 // TestCardSwapForMissEntryReturnsFalse (calque#178) proves CardSwapFor never
-// guesses: a card with no table entry (which today is EVERY card, since
-// cardSwaps ships empty pending real-hardware verification) returns
-// ("", false), not a fabricated substitute.
+// guesses: a card with no table entry returns ("", false), not a fabricated
+// substitute.
 func TestCardSwapForMissEntryReturnsFalse(t *testing.T) {
-	to, ok := CardSwapFor("A100-80GB")
+	to, ok := CardSwapFor("H100")
 	if ok {
-		t.Errorf("CardSwapFor(%q) = (%q, true), want (_, false) — no entry has been added yet (pending real-hardware verification, calque#178)", "A100-80GB", to)
+		t.Errorf("CardSwapFor(%q) = (%q, true), want (_, false) — no entry has been verified for this card", "H100", to)
 	}
 	if to != "" {
 		t.Errorf("CardSwapFor on a miss should return empty string, got %q", to)
+	}
+}
+
+// TestCardSwapForA100_80GBReturnsRTXPro6000 (calque#178) proves the
+// verified table entry: A100-80GB -> RTX PRO 6000, confirmed against a real
+// g7e.2xlarge spot instance running earth2studio's AIFS model end-to-end
+// (real weight load, real live GFS data, real inference rollout) — see
+// swaps.go's own doc comment for the exact verification run.
+func TestCardSwapForA100_80GBReturnsRTXPro6000(t *testing.T) {
+	to, ok := CardSwapFor("A100-80GB")
+	if !ok {
+		t.Fatal("CardSwapFor(\"A100-80GB\") = (_, false), want a verified hit")
+	}
+	if to != "RTX PRO 6000" {
+		t.Errorf("CardSwapFor(\"A100-80GB\") = %q, want %q", to, "RTX PRO 6000")
 	}
 }
 
@@ -34,14 +48,16 @@ func TestCardSwapForHitReturnsConfiguredCard(t *testing.T) {
 	}
 }
 
-// TestCardSwapsEmptyPendingRealHardwareVerification (calque#178) is a
-// deliberate guard: it FAILS the moment any entry is added to cardSwaps,
-// forcing whoever adds one to also update/remove this test — a forcing
-// function to make sure the addition is a conscious act, not an accident,
-// and that whoever removes this test has actually read the "real hardware
-// required" bar in swaps.go's own doc comment.
-func TestCardSwapsEmptyPendingRealHardwareVerification(t *testing.T) {
-	if len(cardSwaps) != 0 {
-		t.Errorf("cardSwaps has %d entr(y/ies); if you just added one, confirm it was verified against real hardware (not just static analysis) per swaps.go's doc comment, then delete/update this guard test", len(cardSwaps))
+// TestCardSwapsOnlyContainsVerifiedEntries (calque#178) is a deliberate
+// guard: it FAILS the moment an entry is added WITHOUT a VerifiedAgainst/
+// VerifiedDate — forcing whoever adds a new entry to fill in real
+// verification provenance, not just a card pair. Every entry currently
+// present was verified on real hardware (see swaps.go's own doc comments
+// per entry).
+func TestCardSwapsOnlyContainsVerifiedEntries(t *testing.T) {
+	for card, sw := range cardSwaps {
+		if sw.VerifiedAgainst == "" || sw.VerifiedDate == "" {
+			t.Errorf("cardSwaps[%q] has no VerifiedAgainst/VerifiedDate — every entry must record what real workload confirmed it, not just the card pair", card)
+		}
 	}
 }

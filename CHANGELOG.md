@@ -22,8 +22,11 @@ per [semver.org](https://semver.org/#spec-item-4).
   curated, real-hardware-verified table of GPU substitutions (e.g. for a
   card AWS has no matching single-GPU instance for at all) — off by
   default; the asked-for card is always what gets used unless explicitly
-  opted in AND a verified table entry exists. The table itself ships
-  empty pending the first real-hardware verification run.
+  opted in AND a verified table entry exists. First entry:
+  `A100-80GB` → `RTX PRO 6000`, verified on a real g7e.2xlarge spot
+  instance running earth2studio's AIFS model end-to-end (real weight
+  load, real live GFS data, real inference rollout) for AI-Almanac's
+  `forecasts_app.py`.
 - A specific `image=<var>` shape now resolves correctly (calque#179): a
   parameterized factory function called from a dict comprehension, then
   consumed by a module-level `for k, v in D.items(): @app.function(...)
