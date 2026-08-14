@@ -1,15 +1,16 @@
 # Modal compatibility matrix
 
-**Status:** Authoritative current behavior. Verified through: v0.4.0.
+**Status:** Authoritative current behavior. Verified through: v0.5.0.
 calque's goal is broad enough Modal-idiom mimicry that real Modal code
 ports to AWS **unchanged**. This document is the single most direct
 answer to "does calque support my script."
 
 **Provenance:**
-- Verified against calque v0.3.1 (2026-08-13) — re-checked #97/#98/#168's
-  tracking-column status against current issue state during a repo-wide
-  stale-doc-phrase sweep; content otherwise last verified at commit
-  `19b4a1a` (2026-08-12).
+- Verified against calque v0.5.0 (2026-08-14) — updated the App-level
+  defaults row for calque#174 (image= per-function resolution fix).
+  Content otherwise last verified at commit `19b4a1a` (2026-08-12); the
+  tracking-column re-check for #97/#98/#168 happened at v0.4.0
+  (2026-08-13).
 - Modal API doc survey last refreshed: 2026-08-07.
 - Real-world corpus survey last refreshed: 2026-08-13 (calque#150 pass —
   see `testdata/real-world/README.md`'s "pass 2" section for the 5 scripts

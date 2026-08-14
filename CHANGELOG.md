@@ -9,6 +9,84 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-14
+
+5 commits since v0.4.0: a real per-function/class image-resolution bug is
+fixed (calque#174 — worse than the App-level default gap #168 already
+closed, since it could silently override an EXPLICIT per-function choice),
+two stale claims in the porting guide are corrected, and calque gets its
+first packaged install path — GoReleaser-built Homebrew/Scoop
+distributions, alongside a new `calque version` verb. Minor bump: a real
+correctness fix plus a new user-facing capability (packaged installs) are
+more than housekeeping.
+
+### Added
+
+- **GoReleaser config + release workflow for Homebrew/Scoop installs**
+  (a2a20ab, 75ed3d3): calque previously had no packaged install path at
+  all — source clone + `go build` was the only way in, unlike sibling
+  spore-host CLIs (`spawn`/`truffle`/`lagotto`). New `.goreleaser.yaml`
+  builds `calque` for linux/darwin/windows × amd64/arm64; every
+  archive/package bundles `tools/pyast/{pyast.py,pyproject.toml,uv.lock}`
+  alongside the binary (calque is not self-contained at runtime —
+  `analyze`/`run`/`real`/etc. shell out to `pyast.py` via `uv run
+  --project tools/pyast`), and both package-manager formulas point
+  `CALQUE_PYAST_DIR` at wherever they placed those files — the same
+  escape hatch README already documented for "a copied/`go install`'ed
+  binary out of tree," now actually exercised by the packaging path.
+  `brew install spore-host/tap/calque` / `scoop install calque` both
+  declare `uv` as a runtime dependency. New `.github/workflows/
+  release.yaml` (tag-triggered) re-runs the full local verification gate,
+  runs GoReleaser, attests SLSA build provenance; also gained a
+  `workflow_dispatch` dry-run mode (`--snapshot --skip=sign,publish` —
+  builds/archives/checksums only, never touches the public
+  homebrew-tap/scoop-bucket repos or creates a GitHub Release),
+  live-verified in real CI before the first real tag.
+- **New `calque version` verb** (a2a20ab): required by both package
+  managers' install `test` block (`system "#{bin}/calque", "version"`),
+  which calque had no verb to satisfy before this. `-ldflags`-injected
+  `Version`/`GitCommit`/`BuildDate`, with `"dev"`/`"unknown"` defaults for
+  a plain `go build` outside the release pipeline.
+
+### Fixed
+
+- **Real per-function/class image resolution** (calque#174; 96c8335):
+  split out from calque#168 (which fixed App-level `secrets=`/`volumes=`
+  inheritance but deferred `image=` as a separate, deeper problem).
+  `resolveImage` previously picked exactly ONE image variable for the
+  WHOLE script (preferring one literally named `image`, else the
+  lexicographically first) and assigned it to `ir.App.Image`, regardless
+  of which function's decorator actually referenced it — confirmed via
+  live repro: a function with its OWN explicit `image=special_image`
+  could silently get a DIFFERENT function's image instead, despite
+  declaring its own choice. This is worse than #168's gap: not "the
+  default doesn't inherit" but "an explicit per-function choice can be
+  silently overridden by an unrelated function's image." `ir.Function`
+  and `ir.Class` now both carry their own `Image` field; each callable
+  resolves its own `image=` against the script's known image chains,
+  falling back to the App-level default only when it declares none of its
+  own — the same App→class→method fallback chain calque#168 used for
+  `secrets=`/`volumes=`. The now-inaccurate "multiple image definitions …
+  ambiguity" leak is removed — per-callable resolution means different
+  functions legitimately using different images is the normal, correct
+  case, not ambiguity to flag.
+- **Two stale claims in `docs/porting-modal-to-aws.md` that survived
+  v0.4.0** (calque#173; bceda8e): the App-level defaults row still said
+  `secrets=`/`volumes=` were "recorded as a leak, never applied" — false
+  since calque#168 shipped real inheritance;
+  `docs/modal-compatibility-matrix.md` already had the corrected wording
+  but this doc's row was never updated in the same pass. Cross-app
+  `Function.from_name(...).remote(...)` was still called a "permanent,
+  decided non-goal" — the "not currently supported" wording (a real design
+  gap, not a promise never to build it) was applied to
+  `docs/behind-the-seam-register.md` in v0.3.1 but missed this doc. Both
+  survived link-checking and the doc's own "Verified through: v0.4.0"
+  banner, since neither tool checks prose against a specific shipped fix
+  — `CONTRIBUTING.md`'s release checklist now names the concrete method
+  this gap motivated: for every CHANGELOG Fixed/Changed entry, grep
+  authoritative docs for the OLD claim it just made false, not just
+  confirm links resolve.
+
 ## [0.4.0] - 2026-08-13
 
 7 commits since v0.3.1: every calque-launched EC2 instance is now tagged
