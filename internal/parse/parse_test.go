@@ -405,6 +405,39 @@ func TestParseFactoryBuiltImageIsFlagged(t *testing.T) {
 	}
 }
 
+// TestParseTrivialFactoryImageResolves (calque#175, extending calque#76):
+// a factory function with no control flow and a single unconditional
+// return — the real shape AI-Almanac's blending_app.py uses — must resolve
+// its image chain directly, with ZERO leak. Contrast with
+// TestParseFactoryBuiltImageIsFlagged's gpu_work, whose factory branches
+// and must still leak.
+func TestParseTrivialFactoryImageResolves(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/factory_image_trivial.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	worker, ok := app.FindFunction("worker")
+	if !ok {
+		t.Fatal("worker not found")
+	}
+	if worker.Image.Base != "debian_slim" {
+		t.Errorf("worker.Image.Base = %q, want debian_slim (inlined from the _image() factory)", worker.Image.Base)
+	}
+	if len(worker.Image.Pip) == 0 || worker.Image.Pip[0] != "uv" {
+		t.Errorf("worker.Image.Pip = %v, want [uv google-cloud-storage] (inlined chain's real pip_install steps)", worker.Image.Pip)
+	}
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "worker") && strings.Contains(l.Detail, "did not resolve") {
+			t.Errorf("worker's trivial factory-built image must resolve with NO leak; got: %s", l.Detail)
+		}
+	}
+}
+
 // TestParseServeEntryKind (F1): serve decorators are detected and carried onto the
 // IR as EntryServe, so the run path can gate/leak them instead of crashing.
 func TestParseServeEntryKind(t *testing.T) {

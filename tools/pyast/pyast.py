@@ -747,9 +747,75 @@ def _walk_image_chain(node: ast.AST) -> dict[str, Any] | None:
     return {"base": base, "steps": steps, "base_unresolved": base is None, "root_name": root_name}
 
 
+# Statement types that make a factory function's body too complex to safely
+# inline (calque#175, extending calque#76's leak-only fix). Deliberately NOT
+# "single Return, nothing else" — a real-world factory like AI-Almanac's
+# blending_app.py's `_image()` reads a couple of env vars into locals before
+# its return:
+#
+#   def _image():
+#       repo_url = os.environ.get("ALMANAC_BLENDING_REPO_URL", DEFAULT_REPO_URL)
+#       repo_ref = os.environ.get("ALMANAC_BLENDING_REPO_REF", DEFAULT_REPO_REF)
+#       return modal.Image.debian_slim()...
+#
+# A stricter "only one statement" check would reject exactly the real case
+# this exists to fix. What actually makes inlining unsafe is CONTROL FLOW —
+# a branch or loop means "which image chain we'd walk" depends on runtime
+# values calque never evaluates.
+_FACTORY_DISALLOWED_STMTS = (
+    ast.If, ast.For, ast.While, ast.Try, ast.With, ast.AsyncFor, ast.AsyncWith
+)
+
+
+def _walk_factory_return(func_node: ast.AST, module_funcs: dict[str, ast.AST]) -> dict[str, Any] | None:
+    """Resolve `img = _some_factory()` by looking inside `_some_factory`'s own
+    body for a single, unconditional `return <image-chain-expression>`
+    (calque#175). Returns the same shape `_walk_image_chain` returns, or None
+    if the factory isn't a safely-inlinable shape (or isn't a factory at
+    all) — the caller falls back to today's behavior (base_unresolved leak).
+
+    Scoped deliberately narrow: module-level, undecorated, zero-argument
+    functions only, with no control flow in the body (see
+    _FACTORY_DISALLOWED_STMTS) and exactly one Return as the last statement.
+    A factory that takes arguments, is decorated, or branches is NOT
+    handled — this is chain resolution for a fixed, unconditional
+    expression, not interprocedural dataflow analysis.
+    """
+    if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    if func_node.args.args or func_node.args.vararg or func_node.args.kwonlyargs or func_node.args.kwarg:
+        return None  # a zero-arg call site can't be supplying anything a param needs
+    if func_node.decorator_list:
+        return None  # a decorated factory may not just return what it appears to
+    body = func_node.body
+    if not body or not isinstance(body[-1], ast.Return) or body[-1].value is None:
+        return None
+    for stmt in body[:-1]:
+        if isinstance(stmt, _FACTORY_DISALLOWED_STMTS):
+            return None
+    # Guard against a nested def containing its own branching/return that
+    # LOOKS flat at this level (e.g. a closure defined and never called) —
+    # ast.walk includes the top-level Return itself, so a lone match is fine.
+    if sum(1 for n in ast.walk(func_node) if isinstance(n, ast.Return)) != 1:
+        return None
+    return _walk_image_chain(body[-1].value)
+
+
 class Collector(ast.NodeVisitor):
-    def __init__(self, src: str, module_names: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        src: str,
+        module_names: frozenset[str] = frozenset(),
+        module_funcs: dict[str, ast.AST] | None = None,
+    ) -> None:
         self.src = src
+        # calque#175: module-level function bindings (name -> FunctionDef),
+        # so visit_Assign can look inside a zero-arg factory's body when its
+        # call result is assigned to an image variable — see
+        # _walk_factory_return. Same dict _module_bindings already builds in
+        # analyze() before Collector starts walking; threaded through here
+        # rather than recomputed.
+        self._module_funcs = module_funcs or {}
         # calque#139: names of every module-level def/simple-assign in the
         # script — the resolution universe _free_refs is allowed to match
         # against when walking each function/method body (see _describe_fn).
@@ -813,6 +879,20 @@ class Collector(ast.NodeVisitor):
                 self.app_kwargs["secrets"] = kw["secrets"]
         # image = modal.Image.debian_slim().pip_install(...)
         chain = _walk_image_chain(val) if isinstance(val, ast.Call) else None
+        # calque#175: image = _factory() — _walk_image_chain above never
+        # matches (val.func is a Name, not an Attribute, so its own
+        # attribute-chain loop never starts). Try inlining the factory's
+        # single unconditional return before giving up to today's
+        # base_unresolved leak path.
+        if (
+            chain is None
+            and isinstance(val, ast.Call)
+            and isinstance(val.func, ast.Name)
+            and not val.args
+            and not val.keywords
+            and val.func.id in self._module_funcs
+        ):
+            chain = _walk_factory_return(self._module_funcs[val.func.id], self._module_funcs)
         if chain is not None:
             for t in node.targets:
                 if isinstance(t, ast.Name):
@@ -1170,7 +1250,7 @@ def analyze(path: str) -> dict[str, Any]:
         for name, node in module_class_nodes.items()
     }
 
-    c = Collector(src, module_names)
+    c = Collector(src, module_names, module_func_nodes)
     c.visit(tree)
     return {
         "script": path,
