@@ -25,7 +25,10 @@ matrix below for exactly where that frontier is today.
 - **Prove:** the plumbing carries Modal's semantics onto AWS — a real Modal script's decorators,
   execution shape, and payload code run unchanged against real AWS hardware.
 - **Fake behind the seam:** all card-selection / cost-optimization intelligence. The recommender
-  returns a constant (`RTX PRO 6000`) behind an interface. See `internal/target`.
+  is a plumbing pass-through, not a decision — it carries the script's own requested card through
+  unchanged, falling back to one constant (`RTX PRO 6000`) only when the script declares no `gpu=`
+  at all. No real phase-detection, right-sizing, or cost/latency optimization exists behind the
+  interface (calque#134). See `internal/target`.
 
 ## Quick start (zero spend)
 
