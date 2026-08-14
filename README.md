@@ -1,5 +1,7 @@
 # calque
 
+![calque: run Modal-shaped code at AWS scale, unchanged](assets/hero.png)
+
 **Run Modal-shaped code at AWS scale, unchanged.**
 
 Modal is where inference/batch code is *prototyped* — great inner loop, pay-nothing-when-idle.
