@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: build/archive/checksum only via --snapshot --skip=sign,publish -- never creates a GitHub Release or pushes to homebrew-tap/scoop-bucket'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -52,7 +58,12 @@ jobs:
       - name: ruff check
         run: uvx ruff check .
 
-      - name: Run GoReleaser
+      # Real release ONLY on a `v*` tag push where dry_run wasn't explicitly
+      # requested. A workflow_dispatch run defaults dry_run=true and this
+      # condition is false for it either way (github.event_name != 'push'),
+      # so a manual dispatch can never accidentally publish for real.
+      - name: Run GoReleaser (release)
+        if: github.event_name == 'push' && inputs.dry_run != true
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
@@ -63,12 +74,44 @@ jobs:
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
           SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
 
-      # SLSA build provenance for the release archives. Complements the
-      # cosign signature: cosign authenticates the publisher, attestation
-      # records how/where the artifacts were built. Attests checksums.txt
-      # (covers every artifact by hash) so one attestation vouches for the
-      # whole release.
+      # Dry run (workflow_dispatch, or a manual re-run with dry_run=true):
+      # build + archive + checksum only. --snapshot skips every git-tag
+      # validation (so it runs on any commit, not just a real tag) and
+      # --skip=sign,publish means NO cosign signing, NO GitHub Release, and
+      # NO push to homebrew-tap/scoop-bucket -- confirms the build/archive
+      # stages succeed in real CI without any public, hard-to-undo side
+      # effect.
+      - name: Run GoReleaser (dry run)
+        if: github.event_name != 'push' || inputs.dry_run == true
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean --skip=sign,publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # SLSA build provenance for the release archives -- real releases
+      # only; a dry run's snapshot artifacts are throwaway and not worth
+      # attesting. Complements the cosign signature: cosign authenticates
+      # the publisher, attestation records how/where the artifacts were
+      # built. Attests checksums.txt (covers every artifact by hash) so one
+      # attestation vouches for the whole release.
       - name: Attest build provenance
+        if: github.event_name == 'push' && inputs.dry_run != true
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: 'dist/checksums.txt'
+
+      # Surface the dry run's actual archive contents in the job log --
+      # without this, a passing dry run only proves "goreleaser exited 0",
+      # not "the archive layout is what we intended" (e.g. pyast/ actually
+      # bundled correctly).
+      - name: Show dry-run artifacts
+        if: github.event_name != 'push' || inputs.dry_run == true
+        run: |
+          echo "### dist/ contents"
+          find dist -maxdepth 1 -type f -o -maxdepth 1 -type d | sort
+          echo
+          echo "### one archive's contents (darwin/arm64)"
+          tar -tzf dist/calque_*_darwin_arm64.tar.gz
