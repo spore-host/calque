@@ -480,7 +480,12 @@ func analyze(scripts []string) error {
 		corpus.NoGPU += c.NoGPU
 
 		fmt.Printf("=== %s (app %q) ===\n", filepath.Base(s), app.Name)
-		fmt.Printf("  functions=%d classes=%d entrypoints=%d image.base=%q pip=%v\n",
+		// calque#174: this is the app-wide DEFAULT image (the fallback a
+		// callable with no image= of its own inherits) — not necessarily
+		// what every function/class actually builds with. A function/class
+		// with its OWN image= kwarg resolves independently; see each
+		// gpu[fn] line's owner if you need to check a specific callable.
+		fmt.Printf("  functions=%d classes=%d entrypoints=%d image.default.base=%q pip=%v\n",
 			len(app.Functions), len(app.Classes), len(app.Entrypoints), app.Image.Base, app.Image.Pip)
 		for _, sub := range log.Subs {
 			// Every clean swap resolves its instance via the seam, never inlined.

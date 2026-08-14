@@ -346,8 +346,12 @@ func build(out pyOut, rep *leak.Report) ir.App {
 		}
 	}
 
-	// Resolve the app image. Modal scripts commonly define exactly one image var;
-	// if there are several we take the first deterministically and leak the ambiguity.
+	// Resolve the app-wide DEFAULT image — the fallback any callable with no
+	// image= of its own inherits. Modal scripts commonly define exactly one
+	// image var; if there are several, resolveImage takes the first
+	// deterministically. calque#174: this is no longer what every callable
+	// actually RUNS with — see resolveCallableImage below, applied per
+	// function/class.
 	app.Image = resolveImage(out, script, rep)
 
 	// calque#76: a function/class's image=<var> kwarg may reference a name the AST
@@ -377,15 +381,16 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	for _, f := range out.Functions {
 		fn := buildFn(f, script, rep, invokes, items)
 		applyAppDefaults(&fn.Volumes, &fn.Config.Secrets, app.DefaultVolumes, app.DefaultSecrets)
+		fn.Image = resolveCallableImage(f.Decorators, out, app.Image, script, rep)
 		app.Functions = append(app.Functions, fn)
 	}
 	for _, c := range out.Classes {
-		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items, app.DefaultVolumes, app.DefaultSecrets))
+		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items, app.DefaultVolumes, app.DefaultSecrets, out, app.Image))
 	}
 	for _, ep := range out.Entrypoints {
 		// @app.local_entrypoint() runs LOCALLY, not in a container — App-level
-		// volumes=/secrets= inheritance doesn't apply here (nothing to mount
-		// or inject into).
+		// volumes=/secrets=/image= inheritance doesn't apply here (nothing to
+		// mount/inject/build for).
 		app.Entrypoints = append(app.Entrypoints, buildFn(ep, script, rep, invokes, items))
 	}
 
@@ -671,9 +676,10 @@ func applyAppDefaults(volumes *map[string]string, secrets *[]string, defaultVolu
 
 // flagUnresolvedImageRefs walks every function/class-level decorator's image=
 // kwarg and leaks loudly when it names a variable that never resolved to an
-// Image chain in out.Images (calque#76). Without this, resolveImage()'s pick
-// (whatever chain DID resolve, possibly for a wholly different function) is
-// silently substituted with no signal that the reference was dangling.
+// Image chain in out.Images (calque#76). Without this, resolveCallableImage's
+// fallback to the app-wide default (calque#174) — the best available
+// substitute when a callable's OWN image= is unresolvable — would apply with
+// no signal that the reference was dangling in the first place.
 func flagUnresolvedImageRefs(out pyOut, script string, rep *leak.Report) {
 	check := func(owner string, decos []pyDecorator) {
 		for _, d := range decos {
@@ -687,7 +693,7 @@ func flagUnresolvedImageRefs(out pyOut, script string, rep *leak.Report) {
 			}
 			if _, resolved := out.Images[ref]; !resolved {
 				rep.Addf(leak.PrimImage, leak.KindSemanticGap, script, d.Lineno,
-					"%s: image=%s did not resolve to a known Image chain (built via a factory function, or another pattern the AST walker doesn't see through); the app image picked above may NOT be %s's real image", owner, ref, owner)
+					"%s: image=%s did not resolve to a known Image chain (built via a factory function, or another pattern the AST walker doesn't see through); %s falls back to the app-wide default image, which may NOT be %s's real image", owner, ref, owner, owner)
 			}
 		}
 	}
@@ -718,7 +724,11 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 		return ir.Image{}
 	}
 	// Deterministic pick: prefer a var literally named "image", else the
-	// lexicographically first, and leak if we had to choose among several.
+	// lexicographically first. This is App.Image — the fallback a callable
+	// with no image= of its own inherits (see resolveCallableImage); it is
+	// NOT leaked as ambiguous here anymore (calque#174) — per-callable
+	// resolution below means multiple DIFFERENT images across DIFFERENT
+	// functions is the normal, correct case, not ambiguity to flag.
 	var chosenName string
 	if _, ok := out.Images["image"]; ok {
 		chosenName = "image"
@@ -729,12 +739,14 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 			}
 		}
 	}
-	if len(out.Images) > 1 {
-		rep.Addf(leak.PrimImage, leak.KindUnhandledCase, script, 0,
-			"multiple image definitions (%d); spike uses %q. Per-function image selection is deferred.",
-			len(out.Images), chosenName)
-	}
-	pi := out.Images[chosenName]
+	return buildIRImage(out.Images[chosenName], script, rep)
+}
+
+// buildIRImage translates one resolved pyImage chain into ir.Image —
+// factored out of resolveImage (calque#174) so resolveCallableImage below
+// can build an ir.Image for a SPECIFIC callable's own image=<var>, not just
+// the one app-wide pick.
+func buildIRImage(pi pyImage, script string, rep *leak.Report) ir.Image {
 	img := ir.Image{Base: pi.Base, Unresolved: pi.BaseUnresolved}
 	if pi.BaseUnresolved {
 		rep.Add(leak.PrimImage, leak.KindSemanticGap, script, 0,
@@ -748,6 +760,41 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 		}
 	}
 	return img
+}
+
+// resolveCallableImage resolves ONE callable's own image=<var> kwarg against
+// out.Images directly (calque#174) — the fix for resolveImage's pre-#174
+// behavior of picking ONE image for the whole script regardless of who
+// referenced it, which could silently hand a function a DIFFERENT
+// function's image even when it declared its own explicit image=.
+//
+// decos is the callable's own decorator list (a function's Decorators, or
+// classDecorators(c) for a class/method's cls_kwargs). Falls back to
+// appImage (App.Image, or App.Image inherited via a class) when the
+// callable declares no image= of its own —
+// mirroring applyAppDefaults' fallback-if-own-is-empty shape for
+// volumes=/secrets=. flagUnresolvedImageRefs (calque#76) already leaks
+// loudly when a callable's own image=<var> never resolved to a chain in
+// out.Images (e.g. built via a factory function) — this function silently
+// falls back to appImage in that case too, matching the pre-#174 posture
+// for an unresolvable reference (better to inherit SOMETHING than nothing,
+// with the existing #76 leak already naming the problem).
+func resolveCallableImage(decos []pyDecorator, out pyOut, appImage ir.Image, script string, rep *leak.Report) ir.Image {
+	for _, d := range decos {
+		raw, ok := d.Kwargs["image"]
+		if !ok {
+			continue
+		}
+		ref, ok := decodeImageRef(raw)
+		if !ok {
+			continue // inline chain or non-literal; not resolvable by name
+		}
+		if pi, resolved := out.Images[ref]; resolved {
+			return buildIRImage(pi, script, rep)
+		}
+		break // dangling ref; #76's flagUnresolvedImageRefs already leaks this
+	}
+	return appImage
 }
 
 func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any) ir.Function {
@@ -787,13 +834,16 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 	return fn
 }
 
-func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any, defaultVolumes map[string]string, defaultSecrets []string) ir.Class {
+func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any, defaultVolumes map[string]string, defaultSecrets []string, out pyOut, appImage ir.Image) ir.Class {
 	cls := ir.Class{Name: c.Name, Line: c.Lineno}
 	gpu, vols, timeout, cfg := readConfigKwargs(c.ClsKwargs, leak.PrimGPU, c.Name, script, c.Lineno, rep)
 	cls.GPU, cls.Volumes, cls.Timeout, cls.Config = gpu, vols, timeout, cfg
 	// calque#168: App-level volumes=/secrets= inherited if the CLASS itself
 	// declares none — before a method's own class->method fallback below.
 	applyAppDefaults(&cls.Volumes, &cls.Config.Secrets, defaultVolumes, defaultSecrets)
+	// calque#174: the class's own image=<var> kwarg (cls_kwargs), falling
+	// back to the App-wide default when the class declares none of its own.
+	cls.Image = resolveCallableImage(classDecorators(c), out, appImage, script, rep)
 	if c.Enter != nil {
 		cls.EnterBody = c.Enter.Body
 		for _, lc := range c.Enter.LocalCalls {
@@ -827,9 +877,13 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 	}
 	for _, m := range c.Methods {
 		method := buildFn(m, script, rep, invokes, items)
-		// A class method inherits the class's gpu/volumes/secrets if it
-		// declares none (calque#168 extends this existing pattern one level
-		// up: the class itself may have already inherited from the App).
+		// A class method inherits the class's gpu/volumes/secrets/image if it
+		// declares none of its own (calque#168/#174 extend this existing
+		// pattern one level up: the class itself may have already inherited
+		// from the App). A method's own image= kwarg (rare — @modal.method
+		// doesn't accept image= on real Modal, but resolveCallableImage
+		// handles the "declares none" case identically either way) resolves
+		// against the class's Image, so App->class->method chains correctly.
 		if method.GPU == "" {
 			method.GPU = cls.GPU
 		}
@@ -839,6 +893,7 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 		if len(method.Config.Secrets) == 0 {
 			method.Config.Secrets = cls.Config.Secrets
 		}
+		method.Image = resolveCallableImage(m.Decorators, out, cls.Image, script, rep)
 		cls.Methods = append(cls.Methods, method)
 	}
 	return cls

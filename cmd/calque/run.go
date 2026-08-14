@@ -150,7 +150,10 @@ func run(o runOpts) error {
 	}
 
 	// 4b. image: .image DSL -> Dockerfile -> digest (build/push deferred to real run).
-	df, err := image.Render(image.Spec{Image: app.Image, WorkerDir: "/opt/calque"}, app.Script, rep)
+	// calque#174: the PICKED UNIT's own resolved image, not app.Image (the
+	// whole-script default) — a function/class with its own image= kwarg
+	// must build with that image, not whatever else the app-wide pick chose.
+	df, err := image.Render(image.Spec{Image: unit.class.Image, WorkerDir: "/opt/calque"}, app.Script, rep)
 	if err != nil {
 		return fmt.Errorf("image: %w", err)
 	}
@@ -374,7 +377,7 @@ func pickWarmUnitByName(app ir.App, name string) (warmUnit, bool) {
 // so the rest of run.go (which reads unit.class.* throughout) doesn't need a
 // separate code path for the plain-function case.
 func syntheticClass(f ir.Function) ir.Class {
-	return ir.Class{Name: f.Name, GPU: f.GPU, Config: f.Config, Line: f.Line}
+	return ir.Class{Name: f.Name, Image: f.Image, GPU: f.GPU, Config: f.Config, Line: f.Line}
 }
 
 // collectLocalExtras resolves the transitive closure of sibling functions AND

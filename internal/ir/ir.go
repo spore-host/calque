@@ -189,7 +189,15 @@ type Config struct {
 
 // Function is an @app.function (or, when embedded in a Class, an @method).
 type Function struct {
-	Name      string
+	Name string
+	// Image is THIS callable's own resolved image (calque#174) — its own
+	// image=<var> kwarg resolved against the script's known image chains,
+	// falling back to App.Image only when this callable declares no
+	// image= of its own. Before #174, every callable in a script shared
+	// ONE globally-picked image (App.Image) regardless of which image=
+	// var it actually referenced — a function with its OWN explicit
+	// image= could silently get a DIFFERENT function's image.
+	Image     Image
 	GPU       string            // raw from source, e.g. "H100" or "A100:8" — guarded/rewritten in §7
 	Volumes   map[string]string // mount path -> Modal volume name (from_name)
 	Timeout   int               // seconds; 0 if unset
@@ -259,7 +267,11 @@ const (
 // Class is an @app.cls: a warm, stateful unit whose @enter body runs once per
 // container and whose @method bodies process items against the loaded state.
 type Class struct {
-	Name      string
+	Name string
+	// Image is THIS class's own resolved image (calque#174) — see
+	// Function.Image's doc comment; the same App->class->method
+	// resolution chain gpu=/volumes= already used is extended to image=.
+	Image     Image
 	GPU       string
 	Volumes   map[string]string
 	Timeout   int

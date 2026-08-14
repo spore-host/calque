@@ -100,6 +100,69 @@ func TestParseVolumeCacheHasFunctionAndClass(t *testing.T) {
 	}
 }
 
+// TestParsePerFunctionImageResolution (calque#174) proves each callable
+// resolves its OWN image=<var> against the script's known image chains,
+// instead of resolveImage's pre-#174 behavior of picking ONE image variable
+// for the WHOLE script regardless of who referenced it. special_fn/SpecialCls
+// explicitly declare image=special_image and must get numpy (NOT torch, the
+// App-level default) even though torch happens to be the lexicographically
+// later name (a case resolveImage's old "prefer literal 'image', else
+// lexicographically first" pick could have silently gotten wrong). plain_fn/
+// PlainCls declare no image= of their own and must inherit the App-level
+// default (calque#168's mechanism, extended to image= by #174) — including
+// through the class -> method chain for PlainCls's own method.
+func TestParsePerFunctionImageResolution(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/per_function_image.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	specialFn, ok := app.FindFunction("special_fn")
+	if !ok {
+		t.Fatal("special_fn not found")
+	}
+	if got := specialFn.Image.Pip; len(got) != 1 || got[0] != "numpy" {
+		t.Errorf("special_fn.Image.Pip = %v, want [numpy] (its OWN image=special_image)", got)
+	}
+
+	plainFn, ok := app.FindFunction("plain_fn")
+	if !ok {
+		t.Fatal("plain_fn not found")
+	}
+	if got := plainFn.Image.Pip; len(got) != 1 || got[0] != "torch" {
+		t.Errorf("plain_fn.Image.Pip = %v, want [torch] (inherited App-level default)", got)
+	}
+
+	var specialCls, plainCls *ir.Class
+	for i := range app.Classes {
+		switch app.Classes[i].Name {
+		case "SpecialCls":
+			specialCls = &app.Classes[i]
+		case "PlainCls":
+			plainCls = &app.Classes[i]
+		}
+	}
+	if specialCls == nil || plainCls == nil {
+		t.Fatalf("classes = %+v, want SpecialCls and PlainCls", app.Classes)
+	}
+	if got := specialCls.Image.Pip; len(got) != 1 || got[0] != "numpy" {
+		t.Errorf("SpecialCls.Image.Pip = %v, want [numpy] (its OWN image=special_image)", got)
+	}
+	if got := plainCls.Image.Pip; len(got) != 1 || got[0] != "torch" {
+		t.Errorf("PlainCls.Image.Pip = %v, want [torch] (inherited App-level default)", got)
+	}
+	if len(plainCls.Methods) != 1 {
+		t.Fatalf("PlainCls.Methods = %+v, want exactly one (run)", plainCls.Methods)
+	}
+	if got := plainCls.Methods[0].Image.Pip; len(got) != 1 || got[0] != "torch" {
+		t.Errorf("PlainCls.run.Image.Pip = %v, want [torch] (App -> class -> method chain)", got)
+	}
+}
+
 // TestParseAppLevelDefaultsInherited (calque#168) proves App(volumes=...,
 // secrets=...) actually reaches a Function/Class declaring neither — before
 // this fix, both were silently dropped with NO leak at all. Also proves a
