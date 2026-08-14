@@ -84,6 +84,8 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "version":
+		printVersion()
 	default:
 		usage()
 		os.Exit(2)
@@ -408,6 +410,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque pool create --model M --instance-type T --manifest-bucket B --results-bucket B --runner-path P [--workers N] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque spawn-run --bucket B --run-id ID --ami AMI [--instance m7i.large] <script.py> --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque session <checkout|checkin|status|list> ... (institutional MIG/MPS slice check-out/check-in, docs/tenancy-vs-session.md)")
+	fmt.Fprintln(os.Stderr, "  calque version")
 }
 
 // pyastDir locates the helper relative to the repo. We resolve it from this

@@ -1,0 +1,187 @@
+# GoReleaser configuration for spore-host/calque
+version: 2
+
+builds:
+  - id: calque
+    main: ./cmd/calque
+    binary: calque
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.GitCommit={{.Commit}}
+      - -X main.BuildDate={{.Date}}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+# calque is not a self-contained Go binary at runtime: analyze/run/real/etc.
+# shell out to tools/pyast/pyast.py via `uv run --project tools/pyast ...`
+# (internal/parse.DefaultRunner). Every archive below bundles tools/pyast/
+# alongside the binary (uv.lock included, so `uv run` resolves the SAME
+# pinned deps a source checkout would, not whatever's on the installing
+# machine) so an installed binary is immediately runnable, not just
+# downloaded — the Homebrew/Scoop formulas below point CALQUE_PYAST_DIR at
+# wherever THEY place these files inside the Cellar/bucket, but the plain
+# tarball/zip path (no package manager) needs the files bundled too, since
+# CALQUE_PYAST_DIR has no correct default outside a source checkout.
+archives:
+  - id: calque-archive
+    ids:
+      - calque
+    name_template: 'calque_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - LICENSE*
+      - src: tools/pyast/pyast.py
+        dst: pyast/pyast.py
+      - src: tools/pyast/pyproject.toml
+        dst: pyast/pyproject.toml
+      - src: tools/pyast/uv.lock
+        dst: pyast/uv.lock
+
+checksum:
+  name_template: 'checksums.txt'
+
+# Publisher-authenticate the release with keyless cosign (Sigstore), matching
+# spawn/truffle/lagotto's own convention — see those repos' .goreleaser.yaml
+# for the full rationale. Requires `id-token: write` + cosign on PATH in the
+# release workflow.
+signs:
+  - cmd: cosign
+    signature: '${artifact}.bundle'
+    args:
+      - sign-blob
+      - '--bundle=${signature}'
+      - '${artifact}'
+      - '--yes'
+    artifacts: checksum
+    output: true
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'typo'
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+
+nfpms:
+  - package_name: calque
+    ids:
+      - calque
+    vendor: spore.host
+    homepage: https://github.com/spore-host/calque
+    maintainer: "spore.host <hello@spore.host>"
+    description: "Run Modal-shaped code on AWS, unchanged"
+    license: Apache-2.0
+    formats:
+      - deb
+      - rpm
+    file_name_template: "{{ .PackageName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/calque/copyright
+        type: doc
+      - src: tools/pyast/pyast.py
+        dst: /usr/share/calque/pyast/pyast.py
+      - src: tools/pyast/pyproject.toml
+        dst: /usr/share/calque/pyast/pyproject.toml
+      - src: tools/pyast/uv.lock
+        dst: /usr/share/calque/pyast/uv.lock
+    rpm:
+      summary: "Run Modal-shaped code on AWS, unchanged"
+
+# calque requires `uv` (github.com/astral-sh/uv) on PATH at runtime to drive
+# tools/pyast — it is NOT vendored/statically linked, matching how spawn's
+# brew formula declares truffle as a runtime dependency for its own
+# cross-tool call.
+brews:
+  - name: calque
+    ids:
+      - calque-archive
+    repository:
+      owner: spore-host
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/spore-host/calque
+    description: "Run Modal-shaped code on AWS, unchanged"
+    license: Apache-2.0
+    dependencies:
+      - name: uv
+        type: runtime
+    # Installs the bundled pyast/ tree into the formula's own libexec (never
+    # the user's PATH/Cellar-shared space) and wraps the calque binary in a
+    # small shell script that sets CALQUE_PYAST_DIR before exec'ing the real
+    # binary -- the same escape hatch README.md documents for "a copied/
+    # go install'ed binary out of tree".
+    install: |
+      libexec.install "pyast"
+      (bin/"calque").write <<~SH
+        #!/bin/bash
+        export CALQUE_PYAST_DIR="#{libexec}/pyast"
+        exec "#{libexec}/calque-bin" "$@"
+      SH
+      chmod 0755, bin/"calque"
+      libexec.install "calque" => "calque-bin"
+    test: |
+      system "#{bin}/calque", "version"
+
+scoops:
+  - name: calque
+    ids:
+      - calque-archive
+    repository:
+      owner: spore-host
+      name: scoop-bucket
+      branch: main
+      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+    directory: bucket
+    homepage: https://github.com/spore-host/calque
+    description: "Run Modal-shaped code on AWS, unchanged"
+    license: Apache-2.0
+    depends:
+      - uv
+    # Scoop has no formula-script wrapper mechanism like Homebrew's
+    # bin.write; persist keeps the bundled pyast/ tree in the app's
+    # persistent directory across upgrades, and post_install sets
+    # CALQUE_PYAST_DIR as a durable user environment variable (Scoop's
+    # documented pattern for env vars a shimmed binary needs — see Scoop's
+    # own manifest "env_set" convention, expressed here via post_install
+    # since GoReleaser's Scoop struct has no dedicated env_set field) so
+    # `calque` (the unwrapped binary from the archive) finds pyast/ without
+    # a wrapper script.
+    persist:
+      - pyast
+    post_install:
+      - '[System.Environment]::SetEnvironmentVariable(''CALQUE_PYAST_DIR'', "$dir\pyast", ''User'')'
+
+release:
+  github:
+    owner: spore-host
+    name: calque
+  draft: false
+  prerelease: auto
+  mode: replace
+  name_template: "v{{.Version}}"

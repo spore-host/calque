@@ -3,6 +3,9 @@
 *.test
 *.out
 
+# goreleaser local build output
+/dist/
+
 # Python helper (uv)
 tools/pyast/.venv/
 __pycache__/

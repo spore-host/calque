@@ -273,6 +273,27 @@ go build ./...          # control plane
 cd tools/pyast && uv sync   # Python AST helper deps
 ```
 
+## Install a release
+
+Prebuilt binaries (bundling `tools/pyast/`, so no separate clone/`uv sync`
+step is needed) are published for every tagged release. Both require
+[`uv`](https://docs.astral.sh/uv/) on `PATH` and set `CALQUE_PYAST_DIR`
+automatically.
+
+**macOS / Linux (Homebrew)**
+```bash
+brew install spore-host/tap/calque
+```
+
+**Windows (Scoop)**
+```powershell
+scoop bucket add spore-host https://github.com/spore-host/scoop-bucket
+scoop install calque
+```
+
+See [`.goreleaser.yaml`](.goreleaser.yaml) for the exact archive layout if
+you're installing from a plain tarball/zip instead.
+
 ## Trademarks
 
 calque is an independent project. It is not endorsed by, affiliated with, or
