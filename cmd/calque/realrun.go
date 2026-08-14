@@ -17,6 +17,7 @@ import (
 	"github.com/spore-host/calque/internal/cost"
 	calexec "github.com/spore-host/calque/internal/exec"
 	"github.com/spore-host/calque/internal/gpu"
+	"github.com/spore-host/calque/internal/image"
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/measure"
@@ -212,6 +213,7 @@ func realRun(o realOpts) (err error) {
 	// hardcoded vLLM reference constants regardless of what the script does.
 	// unset --script (the default) reproduces prior behavior byte-for-byte.
 	hostMode := false
+	registryRef := ""
 	body := calexec.ManifestBody{EnterBody: realEnterBody, MethodBody: realMethodBody, MethodArg: "prompt"}
 	if scriptBody, ok := manifestBodyForUnit(app, unit, rep); ok {
 		if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
@@ -226,9 +228,28 @@ func realRun(o realOpts) (err error) {
 			return fmt.Errorf("gpu= swap for %q is FLAGGED (multi-GPU or coupled); out of single-node scope — see leak report", unit.class.Name)
 		}
 		body = scriptBody
-		hostMode = true // a parsed script's own body is typically not a vLLM/docker workload
-		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
-			"real run driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
+		// calque#176: if the picked unit's OWN resolved image is a real,
+		// pullable from_registry/from_aws_ecr ref, pull it instead of
+		// falling back to host-mode's "deps must already be on the AMI"
+		// posture — the script's own declared environment for THAT
+		// callable, not a hand-typed --pip/--stage-file substitute. Prefer
+		// the method's own image (a method-level image= override), falling
+		// back to the class's — mirrors resolveCallableImage's own
+		// App->class->method fallback chain (internal/parse/parse.go).
+		img := unit.method.Image
+		if ref, ok := image.RegistryRef(img); ok {
+			registryRef = ref
+		} else if ref, ok := image.RegistryRef(unit.class.Image); ok {
+			registryRef = ref
+		}
+		if registryRef == "" {
+			hostMode = true // no pullable image resolved — a parsed script's own body is typically not a vLLM/docker workload
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"real run driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
+		} else {
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"real run driving %s's OWN parsed body against its OWN resolved image %q (calque#176) — any dependency LAYERED on top of this base in the script's .image chain (pip_install/add_local_file/etc. called on the from_registry result) still isn't built; supply those via --pip/--stage-file same as before", unit.method.Name, registryRef)
+		}
 	}
 	if forceStarmap {
 		// --arg-file/--arg-json: the picked unit's real signature is a
@@ -302,7 +323,7 @@ func realRun(o realOpts) (err error) {
 		ManifestKey: layout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
 		LogKey: layout.LogKey, HostMode: hostMode, ModelEnv: o.model,
 		PipPackages: o.pipPackages, PythonVersion: o.pythonVersion,
-		StageFiles: o.stageFiles,
+		StageFiles: o.stageFiles, RegistryRef: registryRef,
 	}
 
 	// Price once via truffle (also R_a).

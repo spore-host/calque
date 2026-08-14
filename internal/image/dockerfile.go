@@ -162,6 +162,27 @@ func Render(spec Spec, script string, rep *leak.Report) (string, error) {
 	return b.String(), nil
 }
 
+// RegistryRef extracts a pullable image reference from a resolved
+// from_registry(...)/from_aws_ecr(...) chain (calque#176) — the same
+// steps-scan resolveBase below already does to pick a Dockerfile FROM
+// line, factored out and exported so cmd/calque/realrun.go can decide
+// whether a --script real run's picked unit has an image calque can
+// actually `docker pull` (as opposed to building/resolving a Dockerfile
+// for the dry-run print path, which is resolveBase's own job). Returns
+// ("", false) for every other base (debian_slim, from_dockerfile,
+// micromamba, or unresolved) — none of those name a pullable ref at all.
+func RegistryRef(img ir.Image) (ref string, ok bool) {
+	if img.Unresolved {
+		return "", false
+	}
+	for _, s := range img.Steps {
+		if (s.Method == "from_registry" || s.Method == "from_aws_ecr") && len(s.Args) > 0 {
+			return s.Args[0], true
+		}
+	}
+	return "", false
+}
+
 func resolveBase(img ir.Image, script string, rep *leak.Report) (string, error) {
 	if img.Unresolved || img.Base == "" {
 		rep.Add(leak.PrimImage, leak.KindSemanticGap, script, 0,

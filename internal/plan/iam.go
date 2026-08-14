@@ -17,12 +17,29 @@ import (
 // run's artifacts/manifest/results/summary/bootstrap-log, all under one
 // bucket. Read is needed for the artifact/manifest sync; write for
 // results, the summary, and the bootstrap log upload.
+//
+// calque#176: also grants ECR pull permissions, needed when a --script
+// real run's picked unit resolves to a from_registry/from_aws_ecr image
+// and the instance authenticates via `aws ecr get-login-password` before
+// `docker pull` (internal/exec.BootstrapConfig.Command). Granted
+// unconditionally (not just when the current run's image needs it) —
+// mirrors how the S3 statements above are granted regardless of whether
+// THIS run's script writes results, since the role is reused across
+// every future run against this bucket (calque#167), not recreated per
+// run. ecr:GetAuthorizationToken is NOT resource-scopable (AWS requires
+// Resource: "*" for this action, per AWS's own ECR IAM reference); the
+// actual image-layer read actions are scoped to account+region, not to
+// one specific repo, since the resolved registry ref varies per script
+// and isn't known when the role is created.
 func RealRunPolicy(account, region, bucket string) string {
 	obj := fmt.Sprintf("arn:aws:s3:::%s/*", bucket)
 	bkt := fmt.Sprintf("arn:aws:s3:::%s", bucket)
+	ecrRepos := fmt.Sprintf("arn:aws:ecr:%s:%s:repository/*", region, account)
 	stmts := []string{
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":[%q]}`, obj),
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, bkt),
+		`{"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":["*"]}`,
+		fmt.Sprintf(`{"Effect":"Allow","Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],"Resource":[%q]}`, ecrRepos),
 	}
 	return `{"Version":"2012-10-17","Statement":[` + strings.Join(stmts, ",") + `]}`
 }

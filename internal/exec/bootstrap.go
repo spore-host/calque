@@ -3,6 +3,7 @@ package exec
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -57,6 +58,43 @@ type BootstrapConfig struct {
 	// SAME path without needing to build/pull that whole image. Directories
 	// are created as needed; nil/empty is a no-op.
 	StageFiles map[string]string
+	// RegistryRef overrides BaseImage's pull target with a --script real
+	// run's OWN resolved image (calque#176) — set only when the picked
+	// unit's ir.Image resolved to a real "from_registry"/"from_aws_ecr" ref
+	// (internal/parse.resolveCallableImage), instead of always pulling the
+	// hardcoded vLLM reference image. Empty (the default) reproduces prior
+	// behavior exactly: BaseImage stays what it was. When RegistryRef looks
+	// like an ECR hostname (isECRHostname), Command() authenticates via
+	// `aws ecr get-login-password` before the pull; a public registry (or
+	// any other private registry calque has no credential-sourcing
+	// mechanism for, e.g. GCP Artifact Registry) is pulled anonymously,
+	// matching today's behavior for BaseImage.
+	RegistryRef string
+}
+
+// ecrHostname matches an ECR registry hostname, e.g.
+// "123456789012.dkr.ecr.us-east-1.amazonaws.com" — the account id + region
+// are embedded in the hostname itself, which is what `aws ecr
+// get-login-password --region <region>` needs to know to fetch a token
+// scoped to the right account/region.
+var ecrHostname = regexp.MustCompile(`^(\d{12})\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com`)
+
+// isECRHostname reports whether ref's registry host is an ECR endpoint, and
+// if so, the region embedded in that hostname (calque#176). A ref with no
+// registry host at all (e.g. "vllm/vllm-openai:latest", Docker Hub's
+// implicit default) or a non-ECR host (Docker Hub, GCP Artifact Registry,
+// etc.) is never treated as ECR — those either need no auth (public) or an
+// auth mechanism calque doesn't have (leaked separately by the caller).
+func isECRHostname(ref string) (region string, ok bool) {
+	host := ref
+	if i := strings.Index(host, "/"); i >= 0 {
+		host = host[:i]
+	}
+	m := ecrHostname.FindStringSubmatch(host)
+	if m == nil {
+		return "", false
+	}
+	return m[2], true
 }
 
 // Command builds the shell command the instance runs (via spawn JobArrayCommand /
@@ -194,6 +232,26 @@ func (b BootstrapConfig) Command() string {
 		return strings.Join(lines, "\n")
 	}
 
+	// calque#176: a --script real run whose picked unit resolved to a real
+	// from_registry/from_aws_ecr image pulls THAT image instead of the
+	// hardcoded vLLM reference (b.BaseImage stays the vLLM default when
+	// RegistryRef is unset — every existing corpus run's docker-mode
+	// behavior is unchanged).
+	pullImage := b.BaseImage
+	if b.RegistryRef != "" {
+		pullImage = b.RegistryRef
+	}
+	if region, ok := isECRHostname(pullImage); ok {
+		// Authenticate before the pull — docker itself has no notion of IAM
+		// instance-role credentials; `aws ecr get-login-password` exchanges
+		// them for a short-lived ECR token via ecr:GetAuthorizationToken
+		// (internal/plan.RealRunPolicy grants this), piped straight into
+		// `docker login` without ever touching disk.
+		lines = append(lines,
+			fmt.Sprintf("aws ecr get-login-password --region %s | sudo docker login --username AWS --password-stdin %s",
+				region, strings.SplitN(pullImage, "/", 2)[0]),
+		)
+	}
 	// docker needs root on the DL AMI (the login user isn't in the docker group —
 	// "permission denied ... docker.sock" otherwise). Run docker under sudo.
 	dockerRun := []string{
@@ -209,12 +267,12 @@ func (b BootstrapConfig) Command() string {
 	}
 	dockerRun = append(dockerRun,
 		"--entrypoint "+wd+"/warmd",
-		b.BaseImage,
+		pullImage,
 		"run --manifest "+manifest,
 	)
 	lines = append(lines,
 		// Pull the base inference image (fast from within AWS). sudo: see above.
-		fmt.Sprintf("sudo docker pull %s", b.BaseImage),
+		fmt.Sprintf("sudo docker pull %s", pullImage),
 		// Run the worker: GPU on, artifacts mounted, AWS creds via instance role
 		// (passed through by the metadata service — no keys on the command line).
 		strings.Join(dockerRun, " "),

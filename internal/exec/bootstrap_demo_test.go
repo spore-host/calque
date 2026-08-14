@@ -137,3 +137,69 @@ func TestBootstrapCommandHostModeWithPipDefaultsPythonVersion(t *testing.T) {
 		t.Errorf("expected a pinned uv python install even with PythonVersion unset; got:\n%s", cmd)
 	}
 }
+
+// TestBootstrapCommandDockerModeWithECRRegistryRefLogsIn (calque#176) proves
+// a docker-mode run whose RegistryRef resolved to an ECR hostname
+// authenticates via `aws ecr get-login-password` (scoped to the region
+// embedded in the hostname) BEFORE the docker pull, and pulls/runs THAT
+// ref — not the hardcoded BaseImage default.
+func TestBootstrapCommandDockerModeWithECRRegistryRefLogsIn(t *testing.T) {
+	c := BootstrapConfig{
+		BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art",
+		ManifestKey: "runs/x/manifest.json", Region: "us-west-2",
+		RegistryRef: "123456789012.dkr.ecr.us-west-2.amazonaws.com/myrepo:latest",
+	}
+	cmd := c.Command()
+	for _, w := range []string{
+		"aws ecr get-login-password --region us-west-2",
+		"sudo docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-west-2.amazonaws.com",
+		"sudo docker pull 123456789012.dkr.ecr.us-west-2.amazonaws.com/myrepo:latest",
+	} {
+		if !strings.Contains(cmd, w) {
+			t.Errorf("missing %q in:\n%s", w, cmd)
+		}
+	}
+	if strings.Contains(cmd, "vllm/vllm-openai") {
+		t.Errorf("RegistryRef should override BaseImage entirely, not just add to it; got:\n%s", cmd)
+	}
+	loginIdx := strings.Index(cmd, "docker login")
+	pullIdx := strings.Index(cmd, "docker pull")
+	if loginIdx == -1 || pullIdx == -1 || loginIdx > pullIdx {
+		t.Errorf("docker login must run BEFORE docker pull; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandDockerModeWithoutRegistryRefUnchanged (calque#176)
+// proves the default (empty RegistryRef) path is byte-for-byte the same
+// as before this feature existed: no docker login line at all, and the
+// existing hardcoded BaseImage is still what gets pulled/run.
+func TestBootstrapCommandDockerModeWithoutRegistryRefUnchanged(t *testing.T) {
+	c := BootstrapConfig{BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json", Region: "us-west-2"}
+	cmd := c.Command()
+	if strings.Contains(cmd, "docker login") {
+		t.Errorf("no RegistryRef set — must not emit a docker login step; got:\n%s", cmd)
+	}
+	if !strings.Contains(cmd, "docker pull vllm/vllm-openai:latest") {
+		t.Errorf("empty RegistryRef must fall back to BaseImage unchanged; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandDockerModeWithNonECRRegistryRefNoLogin (calque#176)
+// proves a RegistryRef pointing at a non-ECR registry (e.g. GCP Artifact
+// Registry, as app.py's own real ROMP_IMAGE_URI default does) is pulled
+// anonymously — same as today's BaseImage behavior — since calque has no
+// credential-sourcing mechanism for it.
+func TestBootstrapCommandDockerModeWithNonECRRegistryRefNoLogin(t *testing.T) {
+	c := BootstrapConfig{
+		BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art",
+		ManifestKey: "runs/x/manifest.json", Region: "us-west-2",
+		RegistryRef: "us-central1-docker.pkg.dev/ai-almanac/almanac/romp:latest",
+	}
+	cmd := c.Command()
+	if strings.Contains(cmd, "docker login") {
+		t.Errorf("non-ECR RegistryRef must not attempt a docker login (no credential mechanism); got:\n%s", cmd)
+	}
+	if !strings.Contains(cmd, "sudo docker pull us-central1-docker.pkg.dev/ai-almanac/almanac/romp:latest") {
+		t.Errorf("non-ECR RegistryRef should still be pulled (anonymously); got:\n%s", cmd)
+	}
+}

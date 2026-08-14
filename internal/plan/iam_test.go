@@ -40,6 +40,54 @@ func TestRealRunPolicy_DoesNotCollideWithPoolOrFleetPolicy(t *testing.T) {
 	}
 }
 
+// TestRealRunPolicy_GrantsECRPull (calque#176) proves the instance can
+// authenticate to ECR and pull image layers — needed once a --script real
+// run's picked unit resolves to a from_registry/from_aws_ecr image and the
+// bootstrap does `aws ecr get-login-password` before `docker pull`.
+// ecr:GetAuthorizationToken must be Resource:"*" (AWS requires this for
+// that specific action, it isn't resource-scopable); the layer-read
+// actions are scoped to this account+region's own repos.
+func TestRealRunPolicy_GrantsECRPull(t *testing.T) {
+	policy := RealRunPolicy("111122223333", "us-east-1", "calque-runs-bucket")
+
+	var doc struct {
+		Statement []struct {
+			Effect   string   `json:"Effect"`
+			Action   []string `json:"Action"`
+			Resource []string `json:"Resource"`
+		} `json:"Statement"`
+	}
+	if err := json.Unmarshal([]byte(policy), &doc); err != nil {
+		t.Fatalf("RealRunPolicy did not produce valid JSON: %v\n%s", err, policy)
+	}
+
+	var sawAuthToken, sawLayerRead bool
+	for _, s := range doc.Statement {
+		for _, a := range s.Action {
+			if a == "ecr:GetAuthorizationToken" {
+				sawAuthToken = true
+				if len(s.Resource) != 1 || s.Resource[0] != "*" {
+					t.Errorf("ecr:GetAuthorizationToken must be Resource:[\"*\"] (AWS requires this, it isn't resource-scopable); got %v", s.Resource)
+				}
+			}
+			if a == "ecr:BatchGetImage" || a == "ecr:GetDownloadUrlForLayer" {
+				sawLayerRead = true
+				for _, r := range s.Resource {
+					if !strings.Contains(r, "111122223333") || !strings.Contains(r, "us-east-1") {
+						t.Errorf("ECR layer-read action %q should be scoped to this account/region; got resource %q", a, r)
+					}
+				}
+			}
+		}
+	}
+	if !sawAuthToken {
+		t.Errorf("RealRunPolicy missing ecr:GetAuthorizationToken; got %s", policy)
+	}
+	if !sawLayerRead {
+		t.Errorf("RealRunPolicy missing ecr:BatchGetImage/GetDownloadUrlForLayer; got %s", policy)
+	}
+}
+
 // TestRoleNameForBucket_DifferentBucketsGetDifferentRoles (calque#167) proves
 // the actual fix: two real runs against different buckets no longer share
 // one mutable role whose inline policy PutRolePolicy replaces wholesale on

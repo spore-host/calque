@@ -132,6 +132,59 @@ func TestNewlyHandledVerbs(t *testing.T) {
 
 // TestFromAwsEcrBase (A2): from_aws_ecr resolves to the named ECR image as the
 // FROM base and notes the pull-permission requirement.
+// TestRegistryRef (calque#176) proves the extraction cmd/calque/realrun.go
+// needs to decide whether a --script real run can pull the picked unit's
+// OWN resolved image, instead of resolveBase's Dockerfile-FROM-line logic
+// (which additionally leaks/falls back — not what a pull decision needs).
+func TestRegistryRef(t *testing.T) {
+	cases := []struct {
+		name    string
+		img     ir.Image
+		wantRef string
+		wantOK  bool
+	}{
+		{
+			name: "from_registry resolves",
+			img: ir.Image{
+				Base:  "from_registry",
+				Steps: []ir.ImageStep{{Method: "from_registry", Args: []string{"us-central1-docker.pkg.dev/ai-almanac/almanac/romp:latest"}}},
+			},
+			wantRef: "us-central1-docker.pkg.dev/ai-almanac/almanac/romp:latest",
+			wantOK:  true,
+		},
+		{
+			name: "from_aws_ecr resolves",
+			img: ir.Image{
+				Base:  "from_aws_ecr",
+				Steps: []ir.ImageStep{{Method: "from_aws_ecr", Args: []string{"123456789012.dkr.ecr.us-west-2.amazonaws.com/myrepo:latest"}}},
+			},
+			wantRef: "123456789012.dkr.ecr.us-west-2.amazonaws.com/myrepo:latest",
+			wantOK:  true,
+		},
+		{
+			name:   "debian_slim has no pullable ref",
+			img:    ir.Image{Base: "debian_slim", Steps: []ir.ImageStep{{Method: "debian_slim"}}},
+			wantOK: false,
+		},
+		{
+			name:   "unresolved never returns a ref",
+			img:    ir.Image{Unresolved: true},
+			wantOK: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ref, ok := RegistryRef(c.img)
+			if ok != c.wantOK {
+				t.Errorf("RegistryRef() ok = %v, want %v", ok, c.wantOK)
+			}
+			if ref != c.wantRef {
+				t.Errorf("RegistryRef() ref = %q, want %q", ref, c.wantRef)
+			}
+		})
+	}
+}
+
 func TestFromAwsEcrBase(t *testing.T) {
 	rep := &leak.Report{}
 	ref := "123456789012.dkr.ecr.us-west-2.amazonaws.com/myrepo:latest"
