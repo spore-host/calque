@@ -1189,20 +1189,67 @@ func decodeStringMap(raw json.RawMessage) (map[string]string, bool) {
 	return nil, false
 }
 
+// unresolvedArgPlaceholder fills an unresolved arg's POSITION in the output
+// for a positionalArgMethods method (rather than omitting it), so
+// localCopyArgs's (src, dst) positional read never misreads a LATER arg
+// (e.g. the real destination path) as an earlier one (the source) just
+// because an earlier one silently vanished (calque#180). Deliberately an
+// obviously-invalid path fragment: if something downstream ever DOES render
+// it verbatim (it shouldn't — every caller of stringifyArgs already leaks on
+// this same non-literal arg via the __unparsed__/non-string branches below),
+// a real `docker build` fails loudly on a nonsense path instead of silently
+// copying the wrong file to the wrong place.
+const unresolvedArgPlaceholder = "<<unresolved>>"
+
+// positionalArgMethods are image-step verbs whose args have PAIRED positional
+// meaning — add_local_*/copy_local_*'s (src, dst) — as opposed to
+// pip_install/apt_install/run_commands/etc., whose args are each independent
+// (dropping one unresolved package/command from an otherwise-fine list is
+// harmless; there's no "position 2" that means something different once
+// position 1 vanishes). Scoped narrowly to preserve every OTHER method's
+// existing, already-tested "drop the unresolved one, keep the rest" behavior
+// unchanged (calque#180) — only these methods get position-preserving
+// placeholders instead.
+var positionalArgMethods = map[string]bool{
+	"add_local_dir": true, "add_local_file": true, "add_local_python_source": true,
+	"copy_local_dir": true, "copy_local_file": true,
+}
+
 // stringifyArgs coerces image-step args to strings, leaking any non-string arg
-// (e.g. an __unparsed__ marker dict) so it isn't silently dropped from the build.
+// (e.g. an __unparsed__ marker dict) so it isn't silently dropped from the
+// build. For a positionalArgMethods verb, every arg keeps its ORIGINAL
+// POSITION in the output — an unresolved arg becomes unresolvedArgPlaceholder
+// rather than being omitted, since omitting one shifts every later arg's
+// index (calque#180: add_local_file's non-literal SOURCE arg being dropped
+// entirely made its literal DESTINATION arg look like the source to
+// localCopyArgs's positional (src, dst) read). Every other method keeps
+// today's drop-on-unresolved behavior unchanged.
 func stringifyArgs(args []any, method, script string, rep *leak.Report) []string {
+	positional := positionalArgMethods[method]
 	out := make([]string, 0, len(args))
-	for _, a := range args {
+	if positional {
+		out = make([]string, len(args))
+	}
+	for i, a := range args {
 		switch v := a.(type) {
 		case string:
-			out = append(out, v)
+			if positional {
+				out[i] = v
+			} else {
+				out = append(out, v)
+			}
 		case map[string]any:
+			if positional {
+				out[i] = unresolvedArgPlaceholder
+			}
 			if u, ok := v["__unparsed__"]; ok {
 				rep.Addf(leak.PrimImage, leak.KindUnsupportedArg, script, 0,
 					"image step .%s(...) has a non-literal arg: %v", method, u)
 			}
 		default:
+			if positional {
+				out[i] = unresolvedArgPlaceholder
+			}
 			rep.Addf(leak.PrimImage, leak.KindUnsupportedArg, script, 0,
 				"image step .%s(...) has a non-string arg: %v", method, v)
 		}

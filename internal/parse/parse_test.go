@@ -1267,3 +1267,48 @@ func TestParseProgressiveImageMergesAcrossStatements(t *testing.T) {
 		}
 	}
 }
+
+// TestStringifyArgsPreservesPositionForLocalCopyMethods (calque#180) proves
+// an unresolved add_local_file() SOURCE arg becomes a placeholder in its
+// ORIGINAL position rather than being dropped — dropping it would shift the
+// real destination path into position 0, where internal/image.localCopyArgs
+// reads it as the SOURCE, producing a mangled COPY line (found live against
+// AI-Almanac's forecasts_app.py, whose add_local_file(FORECAST_MODELS_YAML,
+// "/almanac/forecast_models.yaml") has a non-literal Path-object source).
+func TestStringifyArgsPreservesPositionForLocalCopyMethods(t *testing.T) {
+	rep := &leak.Report{}
+	args := []any{
+		map[string]any{"__unparsed__": "str(workflow_file_path)"},
+		"/root/workflow.json",
+	}
+	got := stringifyArgs(args, "add_local_file", "s.py", rep)
+	want := []string{unresolvedArgPlaceholder, "/root/workflow.json"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("stringifyArgs(add_local_file) = %#v, want %#v (unresolved source must NOT be dropped — that would shift the real destination into position 0)", got, want)
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "non-literal arg") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a non-literal-arg leak for the unresolved source")
+	}
+}
+
+// TestStringifyArgsStillDropsUnresolvedForIndependentArgMethods (calque#180)
+// proves the fix is scoped narrowly: pip_install/apt_install/run_commands
+// etc. — whose args are each independent, not a paired (src, dst) — keep
+// their EXISTING drop-on-unresolved behavior unchanged. A regression here
+// would mean an unrelated method started emitting <<unresolved>> into a
+// real shell command list.
+func TestStringifyArgsStillDropsUnresolvedForIndependentArgMethods(t *testing.T) {
+	rep := &leak.Report{}
+	args := []any{"torch", map[string]any{"__unparsed__": "some_var"}, "vllm"}
+	got := stringifyArgs(args, "pip_install", "s.py", rep)
+	want := []string{"torch", "vllm"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("stringifyArgs(pip_install) = %#v, want %#v (unrelated methods must keep dropping unresolved args, unchanged)", got, want)
+	}
+}
