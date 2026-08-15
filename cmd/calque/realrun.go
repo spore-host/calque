@@ -17,6 +17,7 @@ import (
 	"github.com/spore-host/calque/internal/cost"
 	calexec "github.com/spore-host/calque/internal/exec"
 	"github.com/spore-host/calque/internal/gpu"
+	"github.com/spore-host/calque/internal/image"
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/measure"
@@ -102,7 +103,25 @@ type realOpts struct {
 	// have placed there. nil/empty (the default) reproduces prior
 	// behavior byte-for-byte.
 	stageFiles map[string]string
+	// allowCardSwap opts into target.CardSwapFor's curated substitution
+	// table (calque real/ramp/fleetrun --allow-card-swap, calque#178) — a
+	// CleanSwap gpu= site whose asked-for card has a VERIFIED entry gets
+	// carried through as the swapped card instead, and instance selection
+	// (recommendedTarget) resolves a real instance for that NEW card via
+	// truffle instead of blindly keeping --instance's old hardcoded
+	// default. false (the default) reproduces prior behavior byte-for-byte
+	// — the asked-for card is always what gets used, exactly like today.
+	allowCardSwap bool
 }
+
+// defaultRealInstance is calque real's pre-#178 hardcoded --instance
+// default. main.go's flag default changed from this literal to "" (calque
+// real/#178) so recommendedTarget can distinguish "operator didn't pass
+// --instance at all" (may resolve via a swap) from "operator explicitly
+// asked for this" (always wins). Applied here, AFTER swap resolution, so
+// the no-swap case (the overwhelming majority of runs) stays exactly what
+// it always was.
+const defaultRealInstance = "g6.2xlarge"
 
 // The real warm-unit bodies: actual vLLM. @enter loads the model ONCE; the
 // method generates for one prompt. These mirror what map_batch_inference.py's
@@ -133,7 +152,11 @@ return [o.outputs[0].text for o in outs]`
 func realRun(o realOpts) (err error) {
 	ctx := context.Background()
 	rep := &leak.Report{}
-	fmt.Printf("=== calque REAL GPU run (model=%s N=%d region=%s instance=%s) ===\n", o.model, o.n, o.region, o.instance)
+	instLabel := o.instance
+	if instLabel == "" {
+		instLabel = "(auto)" // resolved later — possibly via --allow-card-swap (calque#178)
+	}
+	fmt.Printf("=== calque REAL GPU run (model=%s N=%d region=%s instance=%s) ===\n", o.model, o.n, o.region, instLabel)
 
 	// Route-away gate (§11, G3): refuse to rent a GPU for a model that's already an
 	// exact Bedrock API call. Enforces the "--model must NOT be on Bedrock" contract
@@ -212,6 +235,10 @@ func realRun(o realOpts) (err error) {
 	// hardcoded vLLM reference constants regardless of what the script does.
 	// unset --script (the default) reproduces prior behavior byte-for-byte.
 	hostMode := false
+	registryRef := ""
+	buildDockerfile := false
+	buildTag := ""
+	var dockerfileText string
 	body := calexec.ManifestBody{EnterBody: realEnterBody, MethodBody: realMethodBody, MethodArg: "prompt"}
 	if scriptBody, ok := manifestBodyForUnit(app, unit, rep); ok {
 		if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
@@ -221,14 +248,57 @@ func realRun(o realOpts) (err error) {
 		// a real launch must refuse the same flagged multi-GPU/coupled swaps
 		// --dry-run does, rather than silently launching on a wrong-shaped
 		// instance — this path had no GPU guard at all before calque#79.
-		glog := gpu.RewriteApp(app, rep)
+		glog := gpu.RewriteApp(app, rep, o.allowCardSwap)
 		if !swapLegal(glog, unit.class.Name) {
 			return fmt.Errorf("gpu= swap for %q is FLAGGED (multi-GPU or coupled); out of single-node scope — see leak report", unit.class.Name)
 		}
 		body = scriptBody
-		hostMode = true // a parsed script's own body is typically not a vLLM/docker workload
-		rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
-			"real run driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
+		// calque#176/#177: prefer the method's own image (a method-level
+		// image= override), falling back to the class's — mirrors
+		// resolveCallableImage's own App->class->method fallback chain
+		// (internal/parse/parse.go).
+		img := unit.method.Image
+		if img.Unresolved || img.Base == "" {
+			img = unit.class.Image
+		}
+		bareRef, pullable := image.RegistryRef(img)
+		switch {
+		case image.NeedsBuild(img):
+			// calque#177: the resolved chain has steps beyond a bare
+			// pullable ref (or no pullable base at all) — build it ON THIS
+			// INSTANCE from the script's OWN resolved .image chain instead
+			// of falling back to a hand-typed --pip/--stage-file
+			// substitute. internal/image.Render is the same, already
+			// unit-tested Dockerfile renderer --dry-run already uses.
+			df, rerr := image.Render(image.Spec{Image: img, WorkerDir: hostWorkerDir}, app.Script, rep)
+			if rerr != nil {
+				return fmt.Errorf("render Dockerfile for %s's resolved image: %w", unit.method.Name, rerr)
+			}
+			dockerfileText = df
+			buildDockerfile = true
+			buildTag = "calque-local:" + image.Digest(df)
+			if pullable {
+				// The Dockerfile's own FROM line may itself be a private
+				// registry ref (e.g. a from_registry base with layered
+				// .pip_install(...) on top) — docker build needs the same
+				// pull-auth decision a plain pull would (bootstrap.go's
+				// isECRHostname check), so still carry it through.
+				registryRef = bareRef
+			}
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"real run driving %s's OWN parsed body against a Dockerfile BUILT ON THE INSTANCE from its OWN resolved .image chain (calque#177) — any add_local_*/from_dockerfile step within that chain that calque can't stage is leaked separately (see internal/image)", unit.method.Name)
+		case pullable:
+			// calque#176: a bare pullable from_registry/from_aws_ecr ref
+			// with nothing layered on top — pull it directly, no build
+			// needed.
+			registryRef = bareRef
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"real run driving %s's OWN parsed body against its OWN resolved image %q (calque#176)", unit.method.Name, registryRef)
+		default:
+			hostMode = true // no resolved image at all — a parsed script's own body is typically not a vLLM/docker workload
+			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+				"real run driving %s's OWN parsed body (calque#79), host-mode (no docker/vLLM image pull) — if the script needs non-stdlib dependencies, they must already be on the AMI", unit.method.Name)
+		}
 	}
 	if forceStarmap {
 		// --arg-file/--arg-json: the picked unit's real signature is a
@@ -286,6 +356,14 @@ func realRun(o realOpts) (err error) {
 	if err := calexec.WriteManifestBody(ctx, s3c, layout, body, hostWorkerDir, items, volumeSync, volumeCommit); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
+	if buildDockerfile {
+		// calque#177: upload the rendered Dockerfile alongside warmd/runner.py —
+		// the instance's existing `aws s3 cp --recursive` artifact sync (every
+		// docker-mode run already does this) downloads it for free.
+		if err := calexec.UploadDockerfile(ctx, s3c, layout, dockerfileText); err != nil {
+			return fmt.Errorf("upload Dockerfile: %w", err)
+		}
+	}
 	if hostMode {
 		fmt.Printf("[3/8] wrote manifest (%d items, %s's own @enter+@method)\n", o.n, unit.method.Name)
 	} else {
@@ -302,21 +380,33 @@ func realRun(o realOpts) (err error) {
 		ManifestKey: layout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
 		LogKey: layout.LogKey, HostMode: hostMode, ModelEnv: o.model,
 		PipPackages: o.pipPackages, PythonVersion: o.pythonVersion,
-		StageFiles: o.stageFiles,
+		StageFiles: o.stageFiles, RegistryRef: registryRef,
+		BuildDockerfile: buildDockerfile, BuildTag: buildTag,
 	}
+
+	// calque#134/#178: when --script named a real parsed unit, carry its
+	// actual requested card through Recommend instead of hardcoding
+	// DefaultCard; when --allow-card-swap applied a verified substitution
+	// (and the operator didn't pin --instance explicitly), resolve a real
+	// instance for the NEW card via truffle instead of the old
+	// hardcoded-default fallback sized for the OLD card. Computed here
+	// (before pricing/AZ-sweep/acquire) so every one of those steps below
+	// uses the SAME possibly-swapped instance, not the stale o.instance.
+	tgt := recommendedTarget(unit, o.instance, defaultRealInstance, o.allowCardSwap, rep)
+	inst := tgt.Instance
 
 	// Price once via truffle (also R_a).
 	var pricePerHr float64
 	if pricer, perr := plan.NewTrufflePricer(ctx); perr == nil {
-		if rate, rerr := pricer.OnDemandPrice(ctx, o.instance, o.region); rerr == nil {
+		if rate, rerr := pricer.OnDemandPrice(ctx, inst, o.region); rerr == nil {
 			pricePerHr = rate
-			fmt.Printf("      priced %s @ %s = $%.4f/hr (truffle)\n", o.instance, o.region, rate)
+			fmt.Printf("      priced %s @ %s = $%.4f/hr (truffle)\n", inst, o.region, rate)
 		}
 	}
 
 	// AZ sweep (offered AZs w/ default subnet).
 	var places []plan.Placement
-	if found, aerr := calexec.AZsForInstance(ctx, ec2.NewFromConfig(cfg), o.instance); aerr == nil {
+	if found, aerr := calexec.AZsForInstance(ctx, ec2.NewFromConfig(cfg), inst); aerr == nil {
 		for _, f := range found {
 			places = append(places, plan.Placement{AZ: f.AZ, Subnet: f.Subnet})
 		}
@@ -343,6 +433,7 @@ func realRun(o realOpts) (err error) {
 		RootVolumeGiB:  200, // vLLM image + weights blow past spawn's 20 GiB default
 		Spot:           o.spot, SpotMaxPrice: o.spotMaxPrice,
 		IamInstanceProfile: iamProfile,
+		RunID:              o.runID, Command: "real",
 	}.Build()
 	if o.spot {
 		// Honesty (§9/§10): a spot run measures K against a SPOT R_a, and the box
@@ -363,12 +454,7 @@ func realRun(o realOpts) (err error) {
 			fmt.Printf("      ...swept %d attempt(s), no capacity (%s, %s)\n", attempt, code, waited.Round(time.Second))
 		},
 	}
-	// calque#134: when --script named a real parsed unit, carry its actual
-	// requested card through Recommend instead of hardcoding DefaultCard;
-	// --instance already pins the concrete instance type here regardless (this
-	// path never calls plan.FillTarget), so only Card changes.
-	tgt := recommendedTarget(unit, o.instance)
-	fmt.Printf("[4/8] acquiring %s in %s (block-and-wait, AZ-sweep)...\n", o.instance, o.region)
+	fmt.Printf("[4/8] acquiring %s in %s (block-and-wait, AZ-sweep)...\n", inst, o.region)
 	acquired, err := acq.Acquire(ctx, tgt, o.region)
 	if err != nil {
 		return fmt.Errorf("acquire: %w", err)
@@ -433,7 +519,7 @@ func realRun(o realOpts) (err error) {
 	}
 
 	// Fold measured ground truth into the cost model and emit K.
-	if err := emitK(o, summary.PerItemSecs, summary.EnterSeconds, summary.Occupancy, acquired, pricePerHr); err != nil {
+	if err := emitK(o, inst, summary.PerItemSecs, summary.EnterSeconds, summary.Occupancy, acquired, pricePerHr); err != nil {
 		return err
 	}
 
@@ -472,7 +558,7 @@ func volumeSpecsForApp(app ir.App, bucket string, rep *leak.Report) (sync, commi
 	return sync, commit
 }
 
-func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.OccupancyRaw, acq plan.Acquired, priceHr float64) error {
+func emitK(o realOpts, inst string, perItem []float64, enterSec float64, occ calexec.OccupancyRaw, acq plan.Acquired, priceHr float64) error {
 	rates, err := cost.LoadRates(o.ratesFP)
 	if err != nil {
 		return fmt.Errorf("rates: %w", err)
@@ -480,7 +566,7 @@ func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.Occupanc
 	pi := measure.Aggregate(perItem)
 	m := measure.Measurement{
 		CardAskedFor: "H100", // map_batch asked for H100; R_m uses that (asymmetry §9)
-		InstanceUsed: o.instance,
+		InstanceUsed: inst,   // the ACTUAL instance used — may differ from o.instance when --allow-card-swap resolved a new one (calque#178)
 		PerItem:      pi,
 		Occupancy: measure.OccupancySummary{
 			MeanOccupancy: occ.MeanOccupancy, Samples: occ.Samples, Source: occ.Source,
@@ -490,7 +576,7 @@ func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.Occupanc
 		AcquireWaitSeconds: acq.TimeToAcquire().Seconds(),
 	}
 	occFrac, occMeasured := m.OccupancyFraction()
-	_, awsMeasured, _ := rates.AWSOnDemandPerSecond(o.instance)
+	_, awsMeasured, _ := rates.AWSOnDemandPerSecond(inst)
 	model := &cost.Model{Rates: rates, M: cost.Measured{
 		CardAskedFor: m.CardAskedFor, InstanceUsed: m.InstanceUsed, SecPerItem: pi.MeanSecs,
 		Occupancy: occFrac, SampleItems: pi.Count, AWSRateMeasured: awsMeasured,
@@ -511,7 +597,7 @@ func emitK(o realOpts, perItem []float64, enterSec float64, occ calexec.Occupanc
 		fmt.Println("NOTE: occupancy unmeasured (nvidia-smi found no samples) — K's occupancy input is a proxy.")
 	} else {
 		fmt.Printf("This K is grounded in a REAL measured run: %d items @ %.3fs/item, %.0f%% occupancy on %s.\n",
-			pi.Count, pi.MeanSecs, occFrac*100, o.instance)
+			pi.Count, pi.MeanSecs, occFrac*100, inst)
 		fmt.Printf("  %s\n", calexec.OccScopeNote(occ))
 	}
 	return nil

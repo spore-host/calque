@@ -1,6 +1,6 @@
 # Getting started
 
-**Status:** Authoritative current behavior. Verified through: v0.3.1.
+**Status:** Authoritative current behavior. Verified through: v0.4.0.
 
 This walks from a fresh clone to your first REAL, billable AWS run — the path
 [`examples/README.md`](../../examples/README.md) deliberately stops short of
@@ -53,19 +53,28 @@ Two different things need permissions, and they're easy to conflate:
 Per run: one EC2 instance (terminated at the end, or on error via a
 deferred cleanup — see "if a run is interrupted" below), and a handful of
 S3 objects under `s3://YOUR-BUCKET/runs/<run-id>/` (artifacts, manifest,
-results, summary, bootstrap log).
+results, summary, bootstrap log). The instance carries `calque:run-id`,
+`calque:managed=true`, and `calque:command` tags (calque#166) — useful for
+finding it by tag filter if a run gets interrupted; see
+[`troubleshooting.md`](troubleshooting.md).
 
-**One thing that's NOT per-run**: the IAM role+instance profile itself
-(`calque-real-run`) is created ONCE and REUSED across every subsequent
-real run, in every region, against every bucket you ever pass —
-`CreateOrGetInstanceProfile` is idempotent and just updates the existing
-role's inline policy if a later run uses a different bucket. If you audit
-your account after a run and still see this role, that's expected — it's
-a persistent, shared resource, not something a `--i-understand-this-*`
-flag ever tears down. Delete it yourself via the IAM console/CLI if you
-want it gone; calque has no `--i-understand-this-deletes-the-shared-role`
-verb for that (there's nothing sensitive stored in it — it's just a
-capability grant).
+**One thing that's NOT per-run**: the IAM role+instance profile itself is
+created ONCE PER BUCKET and REUSED across every subsequent real run
+against that SAME bucket, in every region — `CreateOrGetInstanceProfile`
+is idempotent and reuses the existing role rather than recreating it. The
+role name is derived from the bucket (`calque-real-run-<hash>`, calque#167)
+rather than one name shared across every bucket you ever pass: `PutRolePolicy`
+replaces a role's inline policy document wholesale rather than merging it,
+so two overlapping runs against DIFFERENT buckets sharing one role could
+otherwise race — a second run's launch could silently drop a first run's
+still-in-flight bucket grant. Two runs against the SAME bucket still
+correctly share one role, as before. If you audit your account after a run
+and still see one of these roles, that's expected — each is a persistent,
+shared-per-bucket resource, not something a `--i-understand-this-*` flag
+ever tears down. Delete it yourself via the IAM console/CLI if you want it
+gone; calque has no `--i-understand-this-deletes-the-shared-role` verb for
+that (there's nothing sensitive stored in it — it's just a capability
+grant, scoped to that one bucket).
 
 ### What region does calque use?
 

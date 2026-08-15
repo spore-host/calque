@@ -1,6 +1,6 @@
 # CLI reference
 
-**Status:** Authoritative current behavior. Verified through: v0.3.1.
+**Status:** Authoritative current behavior. Verified through: v0.5.0.
 
 Every flag calque's CLI accepts, sourced directly from the `flag.NewFlagSet`
 calls in `cmd/calque/*.go` (mainly `main.go`, `smoke.go`, `ramp.go`,
@@ -230,3 +230,13 @@ match, and does NOT release the slice on mismatch).
 
 `--instance-id` (required). Read-only — reports live occupancy and
 per-slice holders.
+
+## `calque version`
+
+Source: `cmd/calque/version.go`. No flags. Prints `Version`/`GitCommit`/
+`BuildDate` — `"dev"`/`"unknown"` for a plain `go build`, real values when
+built by GoReleaser (`.goreleaser.yaml`'s `-ldflags`). Never touches AWS.
+Also the `test` block both the Homebrew formula and Scoop manifest run
+after install (`brew install spore-host/tap/calque` /
+`scoop install calque`), so this must keep working on every platform
+those package the binary for.

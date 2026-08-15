@@ -100,6 +100,130 @@ func TestParseVolumeCacheHasFunctionAndClass(t *testing.T) {
 	}
 }
 
+// TestParsePerFunctionImageResolution (calque#174) proves each callable
+// resolves its OWN image=<var> against the script's known image chains,
+// instead of resolveImage's pre-#174 behavior of picking ONE image variable
+// for the WHOLE script regardless of who referenced it. special_fn/SpecialCls
+// explicitly declare image=special_image and must get numpy (NOT torch, the
+// App-level default) even though torch happens to be the lexicographically
+// later name (a case resolveImage's old "prefer literal 'image', else
+// lexicographically first" pick could have silently gotten wrong). plain_fn/
+// PlainCls declare no image= of their own and must inherit the App-level
+// default (calque#168's mechanism, extended to image= by #174) — including
+// through the class -> method chain for PlainCls's own method.
+func TestParsePerFunctionImageResolution(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/per_function_image.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	specialFn, ok := app.FindFunction("special_fn")
+	if !ok {
+		t.Fatal("special_fn not found")
+	}
+	if got := specialFn.Image.Pip; len(got) != 1 || got[0] != "numpy" {
+		t.Errorf("special_fn.Image.Pip = %v, want [numpy] (its OWN image=special_image)", got)
+	}
+
+	plainFn, ok := app.FindFunction("plain_fn")
+	if !ok {
+		t.Fatal("plain_fn not found")
+	}
+	if got := plainFn.Image.Pip; len(got) != 1 || got[0] != "torch" {
+		t.Errorf("plain_fn.Image.Pip = %v, want [torch] (inherited App-level default)", got)
+	}
+
+	var specialCls, plainCls *ir.Class
+	for i := range app.Classes {
+		switch app.Classes[i].Name {
+		case "SpecialCls":
+			specialCls = &app.Classes[i]
+		case "PlainCls":
+			plainCls = &app.Classes[i]
+		}
+	}
+	if specialCls == nil || plainCls == nil {
+		t.Fatalf("classes = %+v, want SpecialCls and PlainCls", app.Classes)
+	}
+	if got := specialCls.Image.Pip; len(got) != 1 || got[0] != "numpy" {
+		t.Errorf("SpecialCls.Image.Pip = %v, want [numpy] (its OWN image=special_image)", got)
+	}
+	if got := plainCls.Image.Pip; len(got) != 1 || got[0] != "torch" {
+		t.Errorf("PlainCls.Image.Pip = %v, want [torch] (inherited App-level default)", got)
+	}
+	if len(plainCls.Methods) != 1 {
+		t.Fatalf("PlainCls.Methods = %+v, want exactly one (run)", plainCls.Methods)
+	}
+	if got := plainCls.Methods[0].Image.Pip; len(got) != 1 || got[0] != "torch" {
+		t.Errorf("PlainCls.run.Image.Pip = %v, want [torch] (App -> class -> method chain)", got)
+	}
+}
+
+// TestParseAppLevelDefaultsInherited (calque#168) proves App(volumes=...,
+// secrets=...) actually reaches a Function/Class declaring neither — before
+// this fix, both were silently dropped with NO leak at all. Also proves a
+// callable with its OWN volumes= is NOT overwritten by the App-level
+// default, and that class-level inheritance chains correctly down to the
+// class's own method (App -> class -> method, extending the pre-existing
+// class -> method fallback one level up).
+func TestParseAppLevelDefaultsInherited(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/app_level_defaults.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if len(app.DefaultVolumes) != 1 || app.DefaultVolumes["/weights"] != "weights" {
+		t.Errorf("app.DefaultVolumes = %+v, want {/weights: weights}", app.DefaultVolumes)
+	}
+	if len(app.DefaultSecrets) == 0 {
+		t.Errorf("app.DefaultSecrets = %+v, want non-empty", app.DefaultSecrets)
+	}
+
+	plainFn, ok := app.FindFunction("plain_fn")
+	if !ok {
+		t.Fatal("plain_fn not found")
+	}
+	if plainFn.Volumes["/weights"] != "weights" {
+		t.Errorf("plain_fn.Volumes = %+v, want to inherit {/weights: weights} from the App", plainFn.Volumes)
+	}
+	if len(plainFn.Config.Secrets) == 0 {
+		t.Errorf("plain_fn.Config.Secrets = %+v, want to inherit the App's secrets", plainFn.Config.Secrets)
+	}
+
+	overriddenFn, ok := app.FindFunction("overridden_fn")
+	if !ok {
+		t.Fatal("overridden_fn not found")
+	}
+	if _, has := overriddenFn.Volumes["/weights"]; has {
+		t.Errorf("overridden_fn.Volumes = %+v, must NOT pick up the App default when it declares its own", overriddenFn.Volumes)
+	}
+	if overriddenFn.Volumes["/own"] == "" {
+		t.Errorf("overridden_fn.Volumes = %+v, want its own {/own: own-cache} preserved", overriddenFn.Volumes)
+	}
+
+	if len(app.Classes) != 1 {
+		t.Fatalf("classes = %+v, want exactly one (Scorer)", app.Classes)
+	}
+	scorer := app.Classes[0]
+	if scorer.Volumes["/weights"] != "weights" {
+		t.Errorf("Scorer.Volumes = %+v, want to inherit {/weights: weights} from the App", scorer.Volumes)
+	}
+	if len(scorer.Methods) != 1 || scorer.Methods[0].Name != "score" {
+		t.Fatalf("Scorer.Methods = %+v, want exactly one (score)", scorer.Methods)
+	}
+	if scorer.Methods[0].Volumes["/weights"] != "weights" {
+		t.Errorf("score.Volumes = %+v, want to inherit {/weights: weights} via Scorer (App -> class -> method)", scorer.Methods[0].Volumes)
+	}
+}
+
 // TestParsePortableConfig exercises the M6 B/C pass-through: portable kwargs land
 // in ir.Config, autoscaling kwargs are recognized-and-leaked (not silently
 // dropped), and the sync invocation idioms are classified beyond plain .map.
@@ -278,6 +402,115 @@ func TestParseFactoryBuiltImageIsFlagged(t *testing.T) {
 	}
 	if foundRenderImageLeak {
 		t.Errorf("render's directly-resolved image=render_image must NOT leak; leaks=%+v", rep.Leaks)
+	}
+}
+
+// TestParseTrivialFactoryImageResolves (calque#175, extending calque#76):
+// a factory function with no control flow and a single unconditional
+// return — the real shape AI-Almanac's blending_app.py uses — must resolve
+// its image chain directly, with ZERO leak. Contrast with
+// TestParseFactoryBuiltImageIsFlagged's gpu_work, whose factory branches
+// and must still leak.
+func TestParseTrivialFactoryImageResolves(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/factory_image_trivial.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	worker, ok := app.FindFunction("worker")
+	if !ok {
+		t.Fatal("worker not found")
+	}
+	if worker.Image.Base != "debian_slim" {
+		t.Errorf("worker.Image.Base = %q, want debian_slim (inlined from the _image() factory)", worker.Image.Base)
+	}
+	if len(worker.Image.Pip) == 0 || worker.Image.Pip[0] != "uv" {
+		t.Errorf("worker.Image.Pip = %v, want [uv google-cloud-storage] (inlined chain's real pip_install steps)", worker.Image.Pip)
+	}
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "worker") && strings.Contains(l.Detail, "did not resolve") {
+			t.Errorf("worker's trivial factory-built image must resolve with NO leak; got: %s", l.Detail)
+		}
+	}
+}
+
+// TestParseForLoopExpandedImagesResolve (calque#179) proves a module-level
+// `for k, v in D.items(): @app.function(...) def f(...): ...` loop —
+// mirroring AI-Almanac's forecasts_app.py's real per-env
+// run_forecast_inference/warm_model_weights pairing — expands into ONE
+// ir.Function per (registered name, resolved image) pair, not a single
+// mis-resolved entry. Asserts BOTH statements per loop iteration
+// (do_inference_*/do_warm_*) resolve, each with the correct per-env f-string
+// substitution folded into its image's run_commands step, and that gpu=
+// (an unrelated literal, unaffected by this whole change) still flows
+// through per-function.
+func TestParseForLoopExpandedImagesResolve(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/factory_image_loop.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	cases := []struct {
+		fnName     string
+		wantRunCmd string
+	}{
+		{"do_inference_alpha", "uv pip install 'examplepkg[a1,a2]'"},
+		{"do_warm_alpha", "uv pip install 'examplepkg[a1,a2]'"},
+		{"do_inference_beta", "uv pip install 'examplepkg[b1]'"},
+		{"do_warm_beta", "uv pip install 'examplepkg[b1]'"},
+	}
+	for _, c := range cases {
+		fn, ok := app.FindFunction(c.fnName)
+		if !ok {
+			t.Errorf("function %q not found", c.fnName)
+			continue
+		}
+		if fn.GPU != "A100-80GB" {
+			t.Errorf("%s.GPU = %q, want %q (unrelated literal, must pass through unaffected)", c.fnName, fn.GPU, "A100-80GB")
+		}
+		if fn.Image.Base != "debian_slim" {
+			t.Errorf("%s.Image.Base = %q, want debian_slim", c.fnName, fn.Image.Base)
+		}
+		found := false
+		for _, s := range fn.Image.Steps {
+			if s.Method == "run_commands" {
+				for _, a := range s.Args {
+					if a == c.wantRunCmd {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%s's image run_commands should contain %q (per-env f-string substitution); steps=%+v", c.fnName, c.wantRunCmd, fn.Image.Steps)
+		}
+	}
+	// do_inference_alpha and do_inference_beta must NOT share the same image
+	// (each env's f-string-substituted spec differs) — a regression here
+	// would mean the loop expansion picked one image for every iteration.
+	alpha, _ := app.FindFunction("do_inference_alpha")
+	beta, _ := app.FindFunction("do_inference_beta")
+	if len(alpha.Image.Steps) > 0 && len(beta.Image.Steps) > 0 {
+		lastAlpha := alpha.Image.Steps[len(alpha.Image.Steps)-1]
+		lastBeta := beta.Image.Steps[len(beta.Image.Steps)-1]
+		if len(lastAlpha.Args) > 0 && len(lastBeta.Args) > 0 && lastAlpha.Args[0] == lastBeta.Args[0] {
+			t.Errorf("alpha and beta resolved to the SAME image content — per-iteration substitution did not happen")
+		}
+	}
+	for _, l := range rep.Leaks {
+		for _, name := range []string{"do_inference_alpha", "do_warm_alpha", "do_inference_beta", "do_warm_beta"} {
+			if strings.Contains(l.Detail, name) && strings.Contains(l.Detail, "did not resolve") {
+				t.Errorf("%s's for-loop-expanded image must resolve with NO leak; got: %s", name, l.Detail)
+			}
+		}
 	}
 }
 
@@ -1032,5 +1265,50 @@ func TestParseProgressiveImageMergesAcrossStatements(t *testing.T) {
 		if strings.Contains(l.Detail, "image chain not rooted at a known base constructor") {
 			t.Errorf("unexpected base_unresolved leak: %+v (base was resolved in statement 1 and should have been preserved across reassignments)", l)
 		}
+	}
+}
+
+// TestStringifyArgsPreservesPositionForLocalCopyMethods (calque#180) proves
+// an unresolved add_local_file() SOURCE arg becomes a placeholder in its
+// ORIGINAL position rather than being dropped — dropping it would shift the
+// real destination path into position 0, where internal/image.localCopyArgs
+// reads it as the SOURCE, producing a mangled COPY line (found live against
+// AI-Almanac's forecasts_app.py, whose add_local_file(FORECAST_MODELS_YAML,
+// "/almanac/forecast_models.yaml") has a non-literal Path-object source).
+func TestStringifyArgsPreservesPositionForLocalCopyMethods(t *testing.T) {
+	rep := &leak.Report{}
+	args := []any{
+		map[string]any{"__unparsed__": "str(workflow_file_path)"},
+		"/root/workflow.json",
+	}
+	got := stringifyArgs(args, "add_local_file", "s.py", rep)
+	want := []string{unresolvedArgPlaceholder, "/root/workflow.json"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("stringifyArgs(add_local_file) = %#v, want %#v (unresolved source must NOT be dropped — that would shift the real destination into position 0)", got, want)
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "non-literal arg") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a non-literal-arg leak for the unresolved source")
+	}
+}
+
+// TestStringifyArgsStillDropsUnresolvedForIndependentArgMethods (calque#180)
+// proves the fix is scoped narrowly: pip_install/apt_install/run_commands
+// etc. — whose args are each independent, not a paired (src, dst) — keep
+// their EXISTING drop-on-unresolved behavior unchanged. A regression here
+// would mean an unrelated method started emitting <<unresolved>> into a
+// real shell command list.
+func TestStringifyArgsStillDropsUnresolvedForIndependentArgMethods(t *testing.T) {
+	rep := &leak.Report{}
+	args := []any{"torch", map[string]any{"__unparsed__": "some_var"}, "vllm"}
+	got := stringifyArgs(args, "pip_install", "s.py", rep)
+	want := []string{"torch", "vllm"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("stringifyArgs(pip_install) = %#v, want %#v (unrelated methods must keep dropping unresolved args, unchanged)", got, want)
 	}
 }

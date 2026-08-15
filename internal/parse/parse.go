@@ -23,17 +23,22 @@ import (
 // ---- JSON contract emitted by tools/pyast/pyast.py ----
 
 type pyOut struct {
-	Script       string              `json:"script"`
-	AppName      string              `json:"app_name"`
-	Images       map[string]pyImage  `json:"images"`
-	Volumes      map[string]pyVolume `json:"volumes"`
-	Functions    []pyFunc            `json:"functions"`
-	Classes      []pyClass           `json:"classes"`
-	Entrypoints  []pyFunc            `json:"entrypoints"`
-	MapCalls     []pyMapCall         `json:"map_calls"`
-	InvokeCalls  []pyInvokeCall      `json:"invoke_calls"`
-	VolumeWrites []pyVolumeWrite     `json:"volume_writes"`
-	HelperLeaks  []map[string]any    `json:"helper_leaks"`
+	Script  string `json:"script"`
+	AppName string `json:"app_name"`
+	// AppKwargs holds App(volumes=..., secrets=...)'s own kwargs (calque#168)
+	// — a function/class declaring neither inherits from here. image= is
+	// deliberately absent: real per-function image RESOLUTION (not just an
+	// app-level fallback) is a separately-tracked gap, see resolveImage.
+	AppKwargs    map[string]json.RawMessage `json:"app_kwargs"`
+	Images       map[string]pyImage         `json:"images"`
+	Volumes      map[string]pyVolume        `json:"volumes"`
+	Functions    []pyFunc                   `json:"functions"`
+	Classes      []pyClass                  `json:"classes"`
+	Entrypoints  []pyFunc                   `json:"entrypoints"`
+	MapCalls     []pyMapCall                `json:"map_calls"`
+	InvokeCalls  []pyInvokeCall             `json:"invoke_calls"`
+	VolumeWrites []pyVolumeWrite            `json:"volume_writes"`
+	HelperLeaks  []map[string]any           `json:"helper_leaks"`
 	// ModuleConsts is every module-level `NAME = <literal-or-expression>`
 	// assignment, keyed by name (calque#139) — the shippable half of
 	// free-variable resolution besides Functions itself (a FreeRefs name may
@@ -341,8 +346,12 @@ func build(out pyOut, rep *leak.Report) ir.App {
 		}
 	}
 
-	// Resolve the app image. Modal scripts commonly define exactly one image var;
-	// if there are several we take the first deterministically and leak the ambiguity.
+	// Resolve the app-wide DEFAULT image — the fallback any callable with no
+	// image= of its own inherits. Modal scripts commonly define exactly one
+	// image var; if there are several, resolveImage takes the first
+	// deterministically. calque#174: this is no longer what every callable
+	// actually RUNS with — see resolveCallableImage below, applied per
+	// function/class.
 	app.Image = resolveImage(out, script, rep)
 
 	// calque#76: a function/class's image=<var> kwarg may reference a name the AST
@@ -351,6 +360,11 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	// silently picks whatever DID resolve in that case — loudly flag every such
 	// dangling reference so the pick isn't mistaken for the function's real image.
 	flagUnresolvedImageRefs(out, script, rep)
+
+	// calque#168: App(volumes=..., secrets=...)'s own kwargs — a Function/Class
+	// declaring neither inherits from here (applied per-callable in buildFn/
+	// buildClass below). Previously silently dropped with NO leak at all.
+	app.DefaultVolumes, app.DefaultSecrets = resolveAppDefaults(out, script, rep)
 
 	// How is each callable invoked? (spec §13: "where .map() is called", §C: the
 	// other sync idioms .starmap/.for_each/.remote). The target of a call like
@@ -365,12 +379,18 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	items := mapItems(out)
 
 	for _, f := range out.Functions {
-		app.Functions = append(app.Functions, buildFn(f, script, rep, invokes, items))
+		fn := buildFn(f, script, rep, invokes, items)
+		applyAppDefaults(&fn.Volumes, &fn.Config.Secrets, app.DefaultVolumes, app.DefaultSecrets)
+		fn.Image = resolveCallableImage(f.Decorators, out, app.Image, script, rep)
+		app.Functions = append(app.Functions, fn)
 	}
 	for _, c := range out.Classes {
-		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items))
+		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items, app.DefaultVolumes, app.DefaultSecrets, out, app.Image))
 	}
 	for _, ep := range out.Entrypoints {
+		// @app.local_entrypoint() runs LOCALLY, not in a container — App-level
+		// volumes=/secrets=/image= inheritance doesn't apply here (nothing to
+		// mount/inject/build for).
 		app.Entrypoints = append(app.Entrypoints, buildFn(ep, script, rep, invokes, items))
 	}
 
@@ -617,11 +637,49 @@ func decodeImageRef(raw json.RawMessage) (string, bool) {
 	return ref.Ref, true
 }
 
+// resolveAppDefaults decodes App(volumes=..., secrets=...)'s own kwargs
+// (calque#168) — a Function/Class declaring neither inherits these via
+// applyAppDefaults below. Before this, App-level volumes=/secrets= were
+// silently dropped with NO leak at all (worse than App(image=), which at
+// least surfaced a generic leak) — confirmed via a live repro:
+// `modal.App("t", secrets=[...], volumes={...})` with a plain
+// `@app.function()` declaring neither produced ZERO leaks.
+func resolveAppDefaults(out pyOut, script string, rep *leak.Report) (volumes map[string]string, secrets []string) {
+	if raw, ok := out.AppKwargs["volumes"]; ok {
+		if m, ok := decodeStringMap(raw); ok {
+			volumes = m
+		} else {
+			rep.Addf(leak.PrimVolume, leak.KindUnsupportedArg, script, 0,
+				"App(volumes=...): not a {str:str} map (%s)", string(raw))
+		}
+	}
+	if raw, ok := out.AppKwargs["secrets"]; ok {
+		secrets = decodeStringListBestEffort(raw)
+		rep.Addf(leak.PrimEntrypoint, leak.KindSemanticGap, script, 0,
+			"App(secrets=%s): app-level default secrets recorded but NOT injected in the spike, same as a function's own secrets= — a payload needing them will fail unless every function/class that inherits this default also gets a matching --secret NAME=VALUE", string(raw))
+	}
+	return volumes, secrets
+}
+
+// applyAppDefaults fills volumes/secrets from the App-level defaults ONLY
+// when the callable (Function or Class) declares none of its own — the
+// same fallback-if-own-is-empty shape buildClass already used for a
+// method inheriting its class's gpu=/volumes=, extended one level up.
+func applyAppDefaults(volumes *map[string]string, secrets *[]string, defaultVolumes map[string]string, defaultSecrets []string) {
+	if *volumes == nil {
+		*volumes = defaultVolumes
+	}
+	if len(*secrets) == 0 {
+		*secrets = defaultSecrets
+	}
+}
+
 // flagUnresolvedImageRefs walks every function/class-level decorator's image=
 // kwarg and leaks loudly when it names a variable that never resolved to an
-// Image chain in out.Images (calque#76). Without this, resolveImage()'s pick
-// (whatever chain DID resolve, possibly for a wholly different function) is
-// silently substituted with no signal that the reference was dangling.
+// Image chain in out.Images (calque#76). Without this, resolveCallableImage's
+// fallback to the app-wide default (calque#174) — the best available
+// substitute when a callable's OWN image= is unresolvable — would apply with
+// no signal that the reference was dangling in the first place.
 func flagUnresolvedImageRefs(out pyOut, script string, rep *leak.Report) {
 	check := func(owner string, decos []pyDecorator) {
 		for _, d := range decos {
@@ -635,7 +693,7 @@ func flagUnresolvedImageRefs(out pyOut, script string, rep *leak.Report) {
 			}
 			if _, resolved := out.Images[ref]; !resolved {
 				rep.Addf(leak.PrimImage, leak.KindSemanticGap, script, d.Lineno,
-					"%s: image=%s did not resolve to a known Image chain (built via a factory function, or another pattern the AST walker doesn't see through); the app image picked above may NOT be %s's real image", owner, ref, owner)
+					"%s: image=%s did not resolve to a known Image chain (built via a factory function, or another pattern the AST walker doesn't see through); %s falls back to the app-wide default image, which may NOT be %s's real image", owner, ref, owner, owner)
 			}
 		}
 	}
@@ -666,7 +724,11 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 		return ir.Image{}
 	}
 	// Deterministic pick: prefer a var literally named "image", else the
-	// lexicographically first, and leak if we had to choose among several.
+	// lexicographically first. This is App.Image — the fallback a callable
+	// with no image= of its own inherits (see resolveCallableImage); it is
+	// NOT leaked as ambiguous here anymore (calque#174) — per-callable
+	// resolution below means multiple DIFFERENT images across DIFFERENT
+	// functions is the normal, correct case, not ambiguity to flag.
 	var chosenName string
 	if _, ok := out.Images["image"]; ok {
 		chosenName = "image"
@@ -677,12 +739,14 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 			}
 		}
 	}
-	if len(out.Images) > 1 {
-		rep.Addf(leak.PrimImage, leak.KindUnhandledCase, script, 0,
-			"multiple image definitions (%d); spike uses %q. Per-function image selection is deferred.",
-			len(out.Images), chosenName)
-	}
-	pi := out.Images[chosenName]
+	return buildIRImage(out.Images[chosenName], script, rep)
+}
+
+// buildIRImage translates one resolved pyImage chain into ir.Image —
+// factored out of resolveImage (calque#174) so resolveCallableImage below
+// can build an ir.Image for a SPECIFIC callable's own image=<var>, not just
+// the one app-wide pick.
+func buildIRImage(pi pyImage, script string, rep *leak.Report) ir.Image {
 	img := ir.Image{Base: pi.Base, Unresolved: pi.BaseUnresolved}
 	if pi.BaseUnresolved {
 		rep.Add(leak.PrimImage, leak.KindSemanticGap, script, 0,
@@ -696,6 +760,41 @@ func resolveImage(out pyOut, script string, rep *leak.Report) ir.Image {
 		}
 	}
 	return img
+}
+
+// resolveCallableImage resolves ONE callable's own image=<var> kwarg against
+// out.Images directly (calque#174) — the fix for resolveImage's pre-#174
+// behavior of picking ONE image for the whole script regardless of who
+// referenced it, which could silently hand a function a DIFFERENT
+// function's image even when it declared its own explicit image=.
+//
+// decos is the callable's own decorator list (a function's Decorators, or
+// classDecorators(c) for a class/method's cls_kwargs). Falls back to
+// appImage (App.Image, or App.Image inherited via a class) when the
+// callable declares no image= of its own —
+// mirroring applyAppDefaults' fallback-if-own-is-empty shape for
+// volumes=/secrets=. flagUnresolvedImageRefs (calque#76) already leaks
+// loudly when a callable's own image=<var> never resolved to a chain in
+// out.Images (e.g. built via a factory function) — this function silently
+// falls back to appImage in that case too, matching the pre-#174 posture
+// for an unresolvable reference (better to inherit SOMETHING than nothing,
+// with the existing #76 leak already naming the problem).
+func resolveCallableImage(decos []pyDecorator, out pyOut, appImage ir.Image, script string, rep *leak.Report) ir.Image {
+	for _, d := range decos {
+		raw, ok := d.Kwargs["image"]
+		if !ok {
+			continue
+		}
+		ref, ok := decodeImageRef(raw)
+		if !ok {
+			continue // inline chain or non-literal; not resolvable by name
+		}
+		if pi, resolved := out.Images[ref]; resolved {
+			return buildIRImage(pi, script, rep)
+		}
+		break // dangling ref; #76's flagUnresolvedImageRefs already leaks this
+	}
+	return appImage
 }
 
 func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any) ir.Function {
@@ -735,10 +834,16 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 	return fn
 }
 
-func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any) ir.Class {
+func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any, defaultVolumes map[string]string, defaultSecrets []string, out pyOut, appImage ir.Image) ir.Class {
 	cls := ir.Class{Name: c.Name, Line: c.Lineno}
 	gpu, vols, timeout, cfg := readConfigKwargs(c.ClsKwargs, leak.PrimGPU, c.Name, script, c.Lineno, rep)
 	cls.GPU, cls.Volumes, cls.Timeout, cls.Config = gpu, vols, timeout, cfg
+	// calque#168: App-level volumes=/secrets= inherited if the CLASS itself
+	// declares none — before a method's own class->method fallback below.
+	applyAppDefaults(&cls.Volumes, &cls.Config.Secrets, defaultVolumes, defaultSecrets)
+	// calque#174: the class's own image=<var> kwarg (cls_kwargs), falling
+	// back to the App-wide default when the class declares none of its own.
+	cls.Image = resolveCallableImage(classDecorators(c), out, appImage, script, rep)
 	if c.Enter != nil {
 		cls.EnterBody = c.Enter.Body
 		for _, lc := range c.Enter.LocalCalls {
@@ -772,13 +877,23 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 	}
 	for _, m := range c.Methods {
 		method := buildFn(m, script, rep, invokes, items)
-		// A class method inherits the class's gpu/volumes if it declares none.
+		// A class method inherits the class's gpu/volumes/secrets/image if it
+		// declares none of its own (calque#168/#174 extend this existing
+		// pattern one level up: the class itself may have already inherited
+		// from the App). A method's own image= kwarg (rare — @modal.method
+		// doesn't accept image= on real Modal, but resolveCallableImage
+		// handles the "declares none" case identically either way) resolves
+		// against the class's Image, so App->class->method chains correctly.
 		if method.GPU == "" {
 			method.GPU = cls.GPU
 		}
 		if method.Volumes == nil {
 			method.Volumes = cls.Volumes
 		}
+		if len(method.Config.Secrets) == 0 {
+			method.Config.Secrets = cls.Config.Secrets
+		}
+		method.Image = resolveCallableImage(m.Decorators, out, cls.Image, script, rep)
 		cls.Methods = append(cls.Methods, method)
 	}
 	return cls
@@ -1074,20 +1189,67 @@ func decodeStringMap(raw json.RawMessage) (map[string]string, bool) {
 	return nil, false
 }
 
+// unresolvedArgPlaceholder fills an unresolved arg's POSITION in the output
+// for a positionalArgMethods method (rather than omitting it), so
+// localCopyArgs's (src, dst) positional read never misreads a LATER arg
+// (e.g. the real destination path) as an earlier one (the source) just
+// because an earlier one silently vanished (calque#180). Deliberately an
+// obviously-invalid path fragment: if something downstream ever DOES render
+// it verbatim (it shouldn't — every caller of stringifyArgs already leaks on
+// this same non-literal arg via the __unparsed__/non-string branches below),
+// a real `docker build` fails loudly on a nonsense path instead of silently
+// copying the wrong file to the wrong place.
+const unresolvedArgPlaceholder = "<<unresolved>>"
+
+// positionalArgMethods are image-step verbs whose args have PAIRED positional
+// meaning — add_local_*/copy_local_*'s (src, dst) — as opposed to
+// pip_install/apt_install/run_commands/etc., whose args are each independent
+// (dropping one unresolved package/command from an otherwise-fine list is
+// harmless; there's no "position 2" that means something different once
+// position 1 vanishes). Scoped narrowly to preserve every OTHER method's
+// existing, already-tested "drop the unresolved one, keep the rest" behavior
+// unchanged (calque#180) — only these methods get position-preserving
+// placeholders instead.
+var positionalArgMethods = map[string]bool{
+	"add_local_dir": true, "add_local_file": true, "add_local_python_source": true,
+	"copy_local_dir": true, "copy_local_file": true,
+}
+
 // stringifyArgs coerces image-step args to strings, leaking any non-string arg
-// (e.g. an __unparsed__ marker dict) so it isn't silently dropped from the build.
+// (e.g. an __unparsed__ marker dict) so it isn't silently dropped from the
+// build. For a positionalArgMethods verb, every arg keeps its ORIGINAL
+// POSITION in the output — an unresolved arg becomes unresolvedArgPlaceholder
+// rather than being omitted, since omitting one shifts every later arg's
+// index (calque#180: add_local_file's non-literal SOURCE arg being dropped
+// entirely made its literal DESTINATION arg look like the source to
+// localCopyArgs's positional (src, dst) read). Every other method keeps
+// today's drop-on-unresolved behavior unchanged.
 func stringifyArgs(args []any, method, script string, rep *leak.Report) []string {
+	positional := positionalArgMethods[method]
 	out := make([]string, 0, len(args))
-	for _, a := range args {
+	if positional {
+		out = make([]string, len(args))
+	}
+	for i, a := range args {
 		switch v := a.(type) {
 		case string:
-			out = append(out, v)
+			if positional {
+				out[i] = v
+			} else {
+				out = append(out, v)
+			}
 		case map[string]any:
+			if positional {
+				out[i] = unresolvedArgPlaceholder
+			}
 			if u, ok := v["__unparsed__"]; ok {
 				rep.Addf(leak.PrimImage, leak.KindUnsupportedArg, script, 0,
 					"image step .%s(...) has a non-literal arg: %v", method, u)
 			}
 		default:
+			if positional {
+				out[i] = unresolvedArgPlaceholder
+			}
 			rep.Addf(leak.PrimImage, leak.KindUnsupportedArg, script, 0,
 				"image step .%s(...) has a non-string arg: %v", method, v)
 		}

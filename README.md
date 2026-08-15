@@ -1,5 +1,7 @@
 # calque
 
+![calque: run Modal-shaped code at AWS scale, unchanged](assets/hero.png)
+
 **Run Modal-shaped code at AWS scale, unchanged.**
 
 Modal is where inference/batch code is *prototyped* — great inner loop, pay-nothing-when-idle.
@@ -23,14 +25,30 @@ matrix below for exactly where that frontier is today.
 - **Prove:** the plumbing carries Modal's semantics onto AWS — a real Modal script's decorators,
   execution shape, and payload code run unchanged against real AWS hardware.
 - **Fake behind the seam:** all card-selection / cost-optimization intelligence. The recommender
-  returns a constant (`RTX PRO 6000`) behind an interface. See `internal/target`.
+  is a plumbing pass-through, not a decision — it carries the script's own requested card through
+  unchanged, falling back to one constant (`RTX PRO 6000`) only when the script declares no `gpu=`
+  at all. No real phase-detection, right-sizing, or cost/latency optimization exists behind the
+  interface (calque#134). See `internal/target`.
 
 ## Quick start (zero spend)
 
 Everything here runs locally and **launches no AWS GPU** — no credentials required.
 
-**Prerequisites:** Go 1.26 (matches `go.mod`), Python 3, and [`uv`](https://docs.astral.sh/uv/).
-AWS credentials are needed only for real (billable) runs, not for anything below.
+**Prerequisites:** [`uv`](https://docs.astral.sh/uv/) either way. AWS credentials are needed
+only for real (billable) runs, not for anything below.
+
+**Install a release** (macOS / Linux via Homebrew, Windows via Scoop — sets `CALQUE_PYAST_DIR`
+automatically):
+
+```bash
+brew install spore-host/tap/calque
+```
+```powershell
+scoop bucket add spore-host https://github.com/spore-host/scoop-bucket
+scoop install calque
+```
+
+**Or build from source** (also needs Go 1.26, matching `go.mod`):
 
 ```
 git clone https://github.com/spore-host/calque && cd calque
@@ -84,7 +102,9 @@ run, then driving your own script's own real body on real hardware.
 
 ## Status
 
-Spike, in active build. Tracking lives on GitHub (Issues / Projects / milestones), not local files.
+Experimental, versioned releases shipping — see the
+[latest release](https://github.com/spore-host/calque/releases/latest) (packaged installs via
+Homebrew/Scoop). Tracking lives on GitHub (Issues / Projects / milestones), not local files.
 **Phase 2 (Modal-idiom porting, milestones M5–M10) is merged.**
 
 The single most direct answer to "does calque support my script" is
@@ -272,6 +292,10 @@ Projects / milestones), not in local files.
 go build ./...          # control plane
 cd tools/pyast && uv sync   # Python AST helper deps
 ```
+
+See [`.goreleaser.yaml`](.goreleaser.yaml) for the packaged-release archive
+layout (Homebrew/Scoop install instructions are at the top of this README,
+under "Quick start") if you're installing from a plain tarball/zip instead.
 
 ## Trademarks
 

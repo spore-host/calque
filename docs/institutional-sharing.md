@@ -1,6 +1,6 @@
 # Institutional GPU sharing
 
-**Status:** Authoritative current behavior. Verified through: v0.3.1.
+**Status:** Authoritative current behavior. Verified through: v0.4.0.
 
 calque's core job is Modal-shaped workload → AWS execution — a real script
 runs unchanged on real AWS hardware. **Institutional GPU sharing is an

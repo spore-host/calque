@@ -9,6 +9,218 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+### Added
+
+- A `--script` real run whose picked unit's `.image` chain has steps
+  LAYERED on a pullable `from_registry`/`from_aws_ecr` base, or no
+  pullable base at all, now gets its Dockerfile built ON THE ACQUIRED
+  INSTANCE (calque#177) instead of falling back to a hand-typed
+  `--pip`/`--stage-file` substitute — no ECR round-trip, no ambient
+  Docker requirement on the caller's machine, no second/throwaway
+  instance.
+- `calque real`'s new `--allow-card-swap` flag (calque#178) opts into a
+  curated, real-hardware-verified table of GPU substitutions (e.g. for a
+  card AWS has no matching single-GPU instance for at all) — off by
+  default; the asked-for card is always what gets used unless explicitly
+  opted in AND a verified table entry exists. First entry:
+  `A100-80GB` → `RTX PRO 6000`, verified on a real g7e.2xlarge spot
+  instance running earth2studio's AIFS model end-to-end (real weight
+  load, real live GFS data, real inference rollout) for AI-Almanac's
+  `forecasts_app.py`.
+- A specific `image=<var>` shape now resolves correctly (calque#179): a
+  parameterized factory function called from a dict comprehension, then
+  consumed by a module-level `for k, v in D.items(): @app.function(...)
+  def f(...): ...` loop — the idiom AI-Almanac's `forecasts_app.py` uses
+  for its per-environment earth2studio images. Expands into one real
+  function per (key, value) pair with the factory's own f-string
+  substitution folded correctly per iteration, instead of every function
+  silently falling back to the app-wide default image.
+
+## [0.5.1] - 2026-08-14
+
+### Documentation
+- Add `CITATION.cff` — calque's Zenodo GitHub integration is now enabled, and
+  this release mints its first DOI.
+- Brand graphics (hero, logo, open-graph, sticker).
+- Fix a stale README claim about the recommender always returning a constant.
+- Move install instructions to the top of the README; soften the "spike"
+  status line now that packaged installs exist.
+
+## [0.5.0] - 2026-08-14
+
+5 commits since v0.4.0: a real per-function/class image-resolution bug is
+fixed (calque#174 — worse than the App-level default gap #168 already
+closed, since it could silently override an EXPLICIT per-function choice),
+two stale claims in the porting guide are corrected, and calque gets its
+first packaged install path — GoReleaser-built Homebrew/Scoop
+distributions, alongside a new `calque version` verb. Minor bump: a real
+correctness fix plus a new user-facing capability (packaged installs) are
+more than housekeeping.
+
+### Added
+
+- **GoReleaser config + release workflow for Homebrew/Scoop installs**
+  (a2a20ab, 75ed3d3): calque previously had no packaged install path at
+  all — source clone + `go build` was the only way in, unlike sibling
+  spore-host CLIs (`spawn`/`truffle`/`lagotto`). New `.goreleaser.yaml`
+  builds `calque` for linux/darwin/windows × amd64/arm64; every
+  archive/package bundles `tools/pyast/{pyast.py,pyproject.toml,uv.lock}`
+  alongside the binary (calque is not self-contained at runtime —
+  `analyze`/`run`/`real`/etc. shell out to `pyast.py` via `uv run
+  --project tools/pyast`), and both package-manager formulas point
+  `CALQUE_PYAST_DIR` at wherever they placed those files — the same
+  escape hatch README already documented for "a copied/`go install`'ed
+  binary out of tree," now actually exercised by the packaging path.
+  `brew install spore-host/tap/calque` / `scoop install calque` both
+  declare `uv` as a runtime dependency. New `.github/workflows/
+  release.yaml` (tag-triggered) re-runs the full local verification gate,
+  runs GoReleaser, attests SLSA build provenance; also gained a
+  `workflow_dispatch` dry-run mode (`--snapshot --skip=sign,publish` —
+  builds/archives/checksums only, never touches the public
+  homebrew-tap/scoop-bucket repos or creates a GitHub Release),
+  live-verified in real CI before the first real tag.
+- **New `calque version` verb** (a2a20ab): required by both package
+  managers' install `test` block (`system "#{bin}/calque", "version"`),
+  which calque had no verb to satisfy before this. `-ldflags`-injected
+  `Version`/`GitCommit`/`BuildDate`, with `"dev"`/`"unknown"` defaults for
+  a plain `go build` outside the release pipeline.
+
+### Fixed
+
+- **Real per-function/class image resolution** (calque#174; 96c8335):
+  split out from calque#168 (which fixed App-level `secrets=`/`volumes=`
+  inheritance but deferred `image=` as a separate, deeper problem).
+  `resolveImage` previously picked exactly ONE image variable for the
+  WHOLE script (preferring one literally named `image`, else the
+  lexicographically first) and assigned it to `ir.App.Image`, regardless
+  of which function's decorator actually referenced it — confirmed via
+  live repro: a function with its OWN explicit `image=special_image`
+  could silently get a DIFFERENT function's image instead, despite
+  declaring its own choice. This is worse than #168's gap: not "the
+  default doesn't inherit" but "an explicit per-function choice can be
+  silently overridden by an unrelated function's image." `ir.Function`
+  and `ir.Class` now both carry their own `Image` field; each callable
+  resolves its own `image=` against the script's known image chains,
+  falling back to the App-level default only when it declares none of its
+  own — the same App→class→method fallback chain calque#168 used for
+  `secrets=`/`volumes=`. The now-inaccurate "multiple image definitions …
+  ambiguity" leak is removed — per-callable resolution means different
+  functions legitimately using different images is the normal, correct
+  case, not ambiguity to flag.
+- **Two stale claims in `docs/porting-modal-to-aws.md` that survived
+  v0.4.0** (calque#173; bceda8e): the App-level defaults row still said
+  `secrets=`/`volumes=` were "recorded as a leak, never applied" — false
+  since calque#168 shipped real inheritance;
+  `docs/modal-compatibility-matrix.md` already had the corrected wording
+  but this doc's row was never updated in the same pass. Cross-app
+  `Function.from_name(...).remote(...)` was still called a "permanent,
+  decided non-goal" — the "not currently supported" wording (a real design
+  gap, not a promise never to build it) was applied to
+  `docs/behind-the-seam-register.md` in v0.3.1 but missed this doc. Both
+  survived link-checking and the doc's own "Verified through: v0.4.0"
+  banner, since neither tool checks prose against a specific shipped fix
+  — `CONTRIBUTING.md`'s release checklist now names the concrete method
+  this gap motivated: for every CHANGELOG Fixed/Changed entry, grep
+  authoritative docs for the OLD claim it just made false, not just
+  confirm links resolve.
+
+## [0.4.0] - 2026-08-13
+
+7 commits since v0.3.1: every calque-launched EC2 instance is now tagged
+with run-id/ownership metadata (closing a real "which instance was this"
+gap), a real IAM cross-run race is fixed, and a real silent-data-loss
+parser bug (App-level `volumes=`/`secrets=` defaults vanishing with zero
+leak at all) is fixed — plus a CI hardening pass (Action SHA pinning,
+Markdown link-validation) and a docs staleness sweep. Minor bump: one new
+capability (EC2 tagging) and a correctness fix that previously produced
+silently-wrong output are more than housekeeping.
+
+### Added
+
+- **Every calque-launched EC2 instance now tagged with run-id/ownership
+  metadata** (calque#166; 459a646): every launch path (`real`, `ramp`,
+  `smoke`, fleet's D4 dedicated-instance fallback, `spawn-run`, `pool`,
+  fleet workers) now stamps `calque:run-id`, `calque:managed=true`,
+  `calque:command`, and `calque:created-at` on the instance it acquires —
+  previously NO launch path tagged instances at all beyond spawn's own
+  internal `spawn:*` tags, so an interrupted run's orphaned instance was
+  only findable by launch time/instance type (`docs/guide/
+  troubleshooting.md`'s own documented workaround, now fixed).
+  `internal/plan/spawn.go`'s `SpawnLauncher` gains `RunID`/`Command`
+  fields; `internal/pool`'s worker/fleet provisioning paths (which build
+  `spawnaws.LaunchConfig` directly, not via `SpawnLauncher`) gain the same
+  tags alongside their existing `calque:pool-model`/`calque:fleet-run`/
+  `calque:role` tags. `docs/guide/troubleshooting.md`'s interrupted-run
+  section now filters by `Name=tag:calque:run-id` (or `calque:managed` for
+  "which run was this") instead of the old launch-time/instance-type
+  guess.
+
+### Fixed
+
+- **calque's real-run IAM role is now scoped per-bucket, not one shared
+  role** (calque#167; 982eabb): the single-instance real-run path shared
+  ONE role name (`calque-real-run`) across every bucket ever passed to
+  `--bucket` — since IAM's `PutRolePolicy` replaces a role's inline policy
+  document wholesale rather than merging it, two overlapping real runs
+  against DIFFERENT buckets could race: the later run's launch silently
+  revokes the earlier run's still-in-flight S3 access, non-deterministically
+  depending on exact timing. Not previously demonstrated as a live
+  incident, but a real gap implied directly by the documented
+  shared-mutable-role design. `roleNameForBucket` now derives a stable
+  per-bucket role name (`calque-real-run-<8-byte SHA-256 hex>`); two runs
+  against different buckets now use two different, never-colliding roles
+  by construction. Two runs against the SAME bucket still correctly share
+  one role, unchanged.
+
+- **App-level `volumes=`/`secrets=` defaults are now inherited by a
+  Function/Class declaring neither, instead of silently dropped**
+  (calque#168; 3c6bb8c): `modal.App("t", secrets=[api_key],
+  volumes={"/w": weights})` paired with a plain `@app.function()`
+  declaring neither previously produced ZERO leaks at all — not even the
+  generic leak `App(image=...)` at least got — exactly the silently-wrong
+  output calque's "recognize and leak, never silently drop" philosophy
+  exists to prevent. `tools/pyast/pyast.py` already extracted `App(...)`'s
+  own `volumes=`/`secrets=` into a dict but only ever read the `image` key
+  back out; the other two were captured then discarded. `ir.App` gains
+  `DefaultVolumes`/`DefaultSecrets`; `applyAppDefaults` fills a
+  Function/Class's own `Volumes`/`Config.Secrets` ONLY when it declares
+  neither, mirroring the existing class→method fallback shape one level
+  up (App → class/function). A callable with its OWN `volumes=`/`secrets=`
+  is never overwritten; entrypoints are excluded (they run locally, not in
+  a container). `realrun.go`'s existing "which declared secrets weren't
+  covered by `--secret`" leak automatically benefits with zero additional
+  code.
+
+- **Smoke-run cost wording is now region/time-independent** (fix#169;
+  0645a09): `docs/guide/getting-started.md`'s "this costs a few cents"
+  baked in a price assumption that wouldn't stay accurate as AWS pricing
+  or calque's default instance choice changes.
+
+### Changed
+
+- **Docs sweep for stale status claims; `Verified through:` banners
+  bumped to v0.3.1** (63571c4): `docs/modal-compatibility-matrix.md` had
+  two rows describing already-closed issues (#97, #98) as open gaps;
+  fixed to reflect shipped state. Everything else the sweep's phrase list
+  matched was independently reconfirmed still accurate and left
+  unchanged.
+
+### CI
+
+- **GitHub Actions pinned to commit SHAs; Dependabot added for the
+  `github-actions` ecosystem** (calque#171; 1e275c7): every `uses:` line
+  was pinned by floating major/minor version tag, not a commit SHA —
+  calque's own `SECURITY.md` already treats supply-chain compromise as a
+  real concern for a tool that handles AWS credentials and launches cloud
+  infrastructure. `.github/dependabot.yml` (weekly) keeps SHA pins from
+  going stale silently.
+- **Markdown link-validation job** (calque#170; 2c121e2): new CI job
+  (mirroring the existing per-concern job pattern — golangci-lint, ruff,
+  race, govulncheck) checks every relative link across README/
+  CONTRIBUTING/docs/examples resolves to a real file, via `lychee` in
+  offline mode (internal links only, to avoid flaky CI from external-host
+  rate limits).
+
 ## [0.3.1] - 2026-08-12
 
 5 commits since v0.3.0: housekeeping release -- no CLI behavior changes.

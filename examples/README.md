@@ -39,7 +39,7 @@ The canonical shape calque supports today: a `.map()` fan-out over prompts, a
 
 ```
 === map_batch_inference.py (app "map-batch-inference") ===
-  functions=0 classes=1 entrypoint=true image.base="debian_slim" pip=[vllm==0.6.3 transformers==4.45.2 huggingface_hub]
+  functions=0 classes=1 entrypoints=1 image.default.base="debian_slim" pip=[vllm==0.6.3 transformers==4.45.2 huggingface_hub]
   gpu[Batcher]: clean_swap requested="H100" -> RTX PRO 6000 (single-card, no coupling signal; memory-bound B=1 substitution is legal)
   volume: "weights" -> volumes/weights/ (mount /weights, delta-sync => warm-cache reuse)
 
@@ -156,7 +156,7 @@ invocations instead of reloading from the image each time.
 
 ```
 === volume_cache.py (app "volume-cache") ===
-  functions=1 classes=1 entrypoints=1 image.base="debian_slim" pip=[torch==2.4.1 torchvision==0.19.1]
+  functions=1 classes=1 entrypoints=1 image.default.base="debian_slim" pip=[torch==2.4.1 torchvision==0.19.1]
   gpu[download_weights]: no_gpu requested="" (no gpu= declared)
   gpu[Scorer]: clean_swap requested="L4" -> RTX PRO 6000 (single-card, no coupling signal; memory-bound B=1 substitution is legal)
   volume: "weights" -> volumes/weights/ (mount /models, delta-sync => warm-cache reuse)
@@ -189,7 +189,7 @@ silently ignoring it or crashing.
 
 ```
 === cross_app.py (app "cross-app") ===
-  functions=1 classes=0 entrypoints=1 image.base="" pip=[]
+  functions=1 classes=0 entrypoints=1 image.default.base="" pip=[]
   gpu[caller]: no_gpu requested="" (no gpu= declared)
   volume: "weights" -> volumes/weights/ (mount /weights, delta-sync => warm-cache reuse)
 ...

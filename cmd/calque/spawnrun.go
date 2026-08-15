@@ -189,6 +189,7 @@ func runSpawnShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnC
 		RunCmd: boot.Command(), TTL: o.ttl, OnComplete: "terminate",
 		Username: "ubuntu", AMI: o.ami,
 		IamInstanceProfile: iamProfile,
+		RunID:              o.runID, Command: "spawn-run",
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
 	// calque#134: carry THIS callable's own requested card (parsed at #111's

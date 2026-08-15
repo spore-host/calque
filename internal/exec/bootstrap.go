@@ -3,6 +3,7 @@ package exec
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -57,6 +58,67 @@ type BootstrapConfig struct {
 	// SAME path without needing to build/pull that whole image. Directories
 	// are created as needed; nil/empty is a no-op.
 	StageFiles map[string]string
+	// RegistryRef overrides BaseImage's pull target with a --script real
+	// run's OWN resolved image (calque#176) — set only when the picked
+	// unit's ir.Image resolved to a real "from_registry"/"from_aws_ecr" ref
+	// (internal/parse.resolveCallableImage), instead of always pulling the
+	// hardcoded vLLM reference image. Empty (the default) reproduces prior
+	// behavior exactly: BaseImage stays what it was. When RegistryRef looks
+	// like an ECR hostname (isECRHostname), Command() authenticates via
+	// `aws ecr get-login-password` before the pull; a public registry (or
+	// any other private registry calque has no credential-sourcing
+	// mechanism for, e.g. GCP Artifact Registry) is pulled anonymously,
+	// matching today's behavior for BaseImage. When BuildDockerfile is also
+	// set, RegistryRef instead names the Dockerfile's OWN FROM base (if
+	// any) purely for this same auth decision — docker build needs to pull
+	// that base itself, same as a plain docker pull would.
+	RegistryRef string
+	// BuildDockerfile builds a Dockerfile (rendered by internal/image.Render,
+	// uploaded to the artifact prefix by the caller via
+	// internal/exec.UploadDockerfile) on the instance itself, instead of
+	// pulling an already-published image (calque#177) — for a --script real
+	// run whose resolved .image chain has steps beyond a bare pullable
+	// from_registry/from_aws_ecr ref (e.g. blending_app.py's
+	// debian_slim()...run_commands(...) chain, or a from_registry base with
+	// .pip_install(...)/.add_local_file(...) layered on top). The
+	// Dockerfile is already present at "<WorkerDir>/Dockerfile" by the time
+	// Command() runs it — the existing `aws s3 cp --recursive` artifact
+	// sync (which every docker-mode run already does) downloads it for
+	// free, no separate fetch step needed. False (the default) reproduces
+	// prior behavior exactly: RegistryRef/BaseImage is pulled, never built.
+	BuildDockerfile bool
+	// BuildTag is the tag `docker build` produces and `docker run` then
+	// uses, when BuildDockerfile is set — callers should pass
+	// internal/image.Digest(dockerfile) so an identical resolved chain is a
+	// local `docker build` cache hit on a re-run (mirroring the same
+	// content-addressing property internal/image already documents for a
+	// future ECR push path). Ignored when BuildDockerfile is false.
+	BuildTag string
+}
+
+// ecrHostname matches an ECR registry hostname, e.g.
+// "123456789012.dkr.ecr.us-east-1.amazonaws.com" — the account id + region
+// are embedded in the hostname itself, which is what `aws ecr
+// get-login-password --region <region>` needs to know to fetch a token
+// scoped to the right account/region.
+var ecrHostname = regexp.MustCompile(`^(\d{12})\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com`)
+
+// isECRHostname reports whether ref's registry host is an ECR endpoint, and
+// if so, the region embedded in that hostname (calque#176). A ref with no
+// registry host at all (e.g. "vllm/vllm-openai:latest", Docker Hub's
+// implicit default) or a non-ECR host (Docker Hub, GCP Artifact Registry,
+// etc.) is never treated as ECR — those either need no auth (public) or an
+// auth mechanism calque doesn't have (leaked separately by the caller).
+func isECRHostname(ref string) (region string, ok bool) {
+	host := ref
+	if i := strings.Index(host, "/"); i >= 0 {
+		host = host[:i]
+	}
+	m := ecrHostname.FindStringSubmatch(host)
+	if m == nil {
+		return "", false
+	}
+	return m[2], true
 }
 
 // Command builds the shell command the instance runs (via spawn JobArrayCommand /
@@ -194,6 +256,55 @@ func (b BootstrapConfig) Command() string {
 		return strings.Join(lines, "\n")
 	}
 
+	// calque#176: a --script real run whose picked unit resolved to a real
+	// from_registry/from_aws_ecr image pulls THAT image instead of the
+	// hardcoded vLLM reference (b.BaseImage stays the vLLM default when
+	// RegistryRef is unset — every existing corpus run's docker-mode
+	// behavior is unchanged).
+	pullImage := b.BaseImage
+	if b.RegistryRef != "" {
+		pullImage = b.RegistryRef
+	}
+	if region, ok := isECRHostname(pullImage); ok {
+		// Authenticate before the pull/build — docker itself has no notion
+		// of IAM instance-role credentials; `aws ecr get-login-password`
+		// exchanges them for a short-lived ECR token via
+		// ecr:GetAuthorizationToken (internal/plan.RealRunPolicy grants
+		// this), piped straight into `docker login` without ever touching
+		// disk. Needed for BuildDockerfile too when the Dockerfile's own
+		// FROM line is a private ECR ref (RegistryRef names that base in
+		// that case — see BuildDockerfile's doc).
+		lines = append(lines,
+			fmt.Sprintf("aws ecr get-login-password --region %s | sudo docker login --username AWS --password-stdin %s",
+				region, strings.SplitN(pullImage, "/", 2)[0]),
+		)
+	}
+
+	// runImage is what `docker run` below actually invokes — either the
+	// pulled reference (today's #176 behavior) or the tag `docker build`
+	// just produced (calque#177).
+	runImage := pullImage
+	if b.BuildDockerfile {
+		// calque#177: the picked unit's resolved .image chain has steps
+		// beyond a bare pullable ref (e.g. .pip_install/.run_commands
+		// layered on a from_registry base, or a from-scratch
+		// debian_slim()... chain with no publishable image at all) — build
+		// it ON THIS INSTANCE from the Dockerfile the caller already
+		// uploaded to the artifact prefix (downloaded for free by the `aws
+		// s3 cp --recursive` line above, alongside warmd/runner.py). No
+		// ECR round-trip, no ambient Docker requirement on the CALLER's
+		// machine, no second/throwaway instance.
+		runImage = b.BuildTag
+		lines = append(lines,
+			fmt.Sprintf("sudo docker build -t %s -f %s/Dockerfile %s", b.BuildTag, wd, wd),
+		)
+	} else {
+		lines = append(lines,
+			// Pull the base inference image (fast from within AWS). sudo: see above.
+			fmt.Sprintf("sudo docker pull %s", pullImage),
+		)
+	}
+
 	// docker needs root on the DL AMI (the login user isn't in the docker group —
 	// "permission denied ... docker.sock" otherwise). Run docker under sudo.
 	dockerRun := []string{
@@ -209,12 +320,10 @@ func (b BootstrapConfig) Command() string {
 	}
 	dockerRun = append(dockerRun,
 		"--entrypoint "+wd+"/warmd",
-		b.BaseImage,
+		runImage,
 		"run --manifest "+manifest,
 	)
 	lines = append(lines,
-		// Pull the base inference image (fast from within AWS). sudo: see above.
-		fmt.Sprintf("sudo docker pull %s", b.BaseImage),
 		// Run the worker: GPU on, artifacts mounted, AWS creds via instance role
 		// (passed through by the metadata service — no keys on the command line).
 		strings.Join(dockerRun, " "),

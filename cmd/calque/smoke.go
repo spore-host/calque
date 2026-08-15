@@ -144,6 +144,7 @@ func smoke(o smokeOpts) (err error) {
 		Username: "ubuntu", AMI: o.ami, PricePerHour: pricePerHr,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 		IamInstanceProfile: iamProfile,
+		RunID:              o.runID, Command: "smoke",
 	}.Build()
 	if o.spot {
 		// Honesty (§9/§10): a spot smoke test acquires against a SPOT R_a, and the

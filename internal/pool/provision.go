@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -156,6 +157,9 @@ func ProvisionWorkers(ctx context.Context, client *spawnaws.Client, cfg CreateCo
 		Tags: map[string]string{
 			"calque:pool-model": cfg.Model,
 			"calque:role":       "pool-worker",
+			"calque:managed":    "true",
+			"calque:command":    "pool",
+			"calque:created-at": time.Now().UTC().Format(time.RFC3339),
 		},
 	}
 

@@ -1,6 +1,6 @@
 # Troubleshooting
 
-**Status:** Authoritative current behavior. Verified through: v0.3.1.
+**Status:** Authoritative current behavior. Verified through: v0.4.0.
 
 Real, previously-hit problems, told as symptom → cause → fix. Most were
 found and fixed during calque's own live-AWS validation passes (see
@@ -165,16 +165,21 @@ the termination call.
    calque CLI process is even still running. If you're not in a hurry,
    waiting out the TTL costs nothing extra to fix (though you still pay
    for the compute until it expires).
-2. **To find and terminate it immediately** instead of waiting:
+2. **To find and terminate it immediately** instead of waiting: every
+   instance calque launches carries a `calque:run-id` tag matching the
+   `--run-id` you passed (calque#166), so filter directly on it instead of
+   guessing from launch time/instance type:
    ```
    aws ec2 describe-instances --region YOUR-REGION \
-     --filters "Name=instance-state-name,Values=running,pending" \
+     --filters "Name=tag:calque:run-id,Values=YOUR-RUN-ID" \
+       "Name=instance-state-name,Values=running,pending" \
      --query 'Reservations[].Instances[].[InstanceId,LaunchTime,InstanceType]' \
      --output table
    ```
-   calque doesn't currently tag instances with the `--run-id` you passed
-   (a real gap, worth filing if it bites you), so identify the right one
-   by launch time/instance type rather than a tag filter. Then:
+   If you don't remember the exact `--run-id`, drop that filter and use
+   `Name=tag:calque:managed,Values=true` instead to see every
+   calque-launched instance still running, then narrow by
+   `calque:command`/`LaunchTime`. Then:
    ```
    aws ec2 terminate-instances --region YOUR-REGION --instance-ids i-XXXXXXXX
    ```

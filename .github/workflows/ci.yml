@@ -131,7 +131,7 @@ jobs:
           args: >-
             --offline --no-progress
             --include-fragments
-            '*.md' 'docs/**/*.md' 'examples/**/*.md'
+            '*.md' 'docs/**/*.md' 'examples/**/*.md' 'assets/**/*.md'
           fail: true
 
   # Python <-> Go parser contract. The parser tests skip when uv is absent (see

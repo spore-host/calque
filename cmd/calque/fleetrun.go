@@ -43,8 +43,12 @@ func fleetRun(o realOpts, shards int) (err error) {
 	}
 	ctx := context.Background()
 	rep := &leak.Report{}
+	instLabel := o.instance
+	if instLabel == "" {
+		instLabel = "(auto)" // resolved later — possibly via --allow-card-swap (calque#178)
+	}
 	fmt.Printf("=== calque FLEET run (model=%s N=%d shards=%d region=%s instance=%s) ===\n",
-		o.model, o.n, shards, o.region, o.instance)
+		o.model, o.n, shards, o.region, instLabel)
 
 	// Route-away gate (§11, G3): refuse to rent a FLEET for a Bedrock-exact model.
 	if printOffersAndStop(bedrockOffersForModel(ctx, o.model, rep)) {
@@ -99,7 +103,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 		// GPU guard parity with dry-run (run.go's swapLegal check, §7): refuse
 		// a flagged multi-GPU/coupled swap for the whole fleet rather than
 		// silently launching every shard on a wrong-shaped instance.
-		glog := gpu.RewriteApp(app, rep)
+		glog := gpu.RewriteApp(app, rep, o.allowCardSwap)
 		if !swapLegal(glog, unit.class.Name) {
 			return fmt.Errorf("gpu= swap for %q is FLAGGED (multi-GPU or coupled); out of single-node scope — see leak report", unit.class.Name)
 		}
@@ -113,10 +117,21 @@ func fleetRun(o realOpts, shards int) (err error) {
 		shs[i].ManifestKey, shs[i].ResultPrefix, shs[i].SummaryKey, shs[i].LogKey = mk, rp, sk, lk
 	}
 
+	// calque#134/#178: carry the script's real requested card (when
+	// --script parsed one) through Recommend for every shard's Target,
+	// instead of always hardcoding DefaultCard; when --allow-card-swap
+	// applied a verified substitution (and the operator didn't pin
+	// --instance explicitly), resolve a real instance for the NEW card via
+	// truffle instead of the old hardcoded-default fallback. Computed here,
+	// BEFORE pricing/AZ-sweep/quota-check, so every one of those uses the
+	// SAME possibly-swapped instance, not the stale o.instance.
+	tgt := recommendedTarget(unit, o.instance, defaultRealInstance, o.allowCardSwap, rep)
+	inst := tgt.Instance
+
 	// Price once (homogeneous fleet) — also R_a for the cost model.
 	var pricePerHr float64
 	if pricer, perr := plan.NewTrufflePricer(ctx); perr == nil {
-		if rate, rerr := pricer.OnDemandPrice(ctx, o.instance, o.region); rerr == nil {
+		if rate, rerr := pricer.OnDemandPrice(ctx, inst, o.region); rerr == nil {
 			pricePerHr = rate
 		}
 	}
@@ -125,7 +140,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	ec2c := ec2.NewFromConfig(cfg)
 	// AZ sweep shared across shards (each acquire tries every offered AZ).
 	var places []plan.Placement
-	if found, aerr := calexec.AZsForInstance(ctx, ec2c, o.instance); aerr == nil {
+	if found, aerr := calexec.AZsForInstance(ctx, ec2c, inst); aerr == nil {
 		for _, f := range found {
 			places = append(places, plan.Placement{AZ: f.AZ, Subnet: f.Subnet})
 		}
@@ -146,13 +161,8 @@ func fleetRun(o realOpts, shards int) (err error) {
 			"spot acquisition: R_a is a spot rate and the instance is interruptible — this is a spot-rate cost measurement, not the on-demand one")
 	}
 
-	// calque#134: carry the script's real requested card (when --script
-	// parsed one) through Recommend for every shard's Target, instead of
-	// always hardcoding DefaultCard.
-	tgt := recommendedTarget(unit, o.instance)
-
 	// Pre-flight quota check (calque#141): query the account's real quota
-	// headroom for o.instance/o.region/o.spot BEFORE committing to `shards`
+	// headroom for inst/o.region/o.spot BEFORE committing to `shards`
 	// concurrent acquisitions, instead of finding out via a live
 	// MaxSpotInstanceCountExceeded error — the exact shape of calque#18's
 	// real N=100k fleet run incident this issue tracks (2 of 10 shards failed
@@ -160,8 +170,8 @@ func fleetRun(o realOpts, shards int) (err error) {
 	// g7e.2xlarge instances).
 	var repMu sync.Mutex
 	safeRep := &syncReport{rep: rep, mu: &repMu}
-	rawCeiling, qerr := plan.QuotaCeiling(ctx, cfg, o.instance, o.region, o.spot)
-	ceiling := resolveFleetCeiling(safeRep, o.model, o.instance, o.region, o.spot, shards, rawCeiling, qerr)
+	rawCeiling, qerr := plan.QuotaCeiling(ctx, cfg, inst, o.region, o.spot)
+	ceiling := resolveFleetCeiling(safeRep, o.model, inst, o.region, o.spot, shards, rawCeiling, qerr)
 
 	// D2 (calque#145 slice 2): provision `ceiling` WORKERS once, keep them
 	// warm across every shard they serve, instead of a fresh acquire+
@@ -180,7 +190,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 		return fmt.Errorf("create run queue: %w", err)
 	}
 	fleetCfg := calpool.FleetCreateConfig{
-		RunID: o.runID, Region: o.region, InstanceType: o.instance,
+		RunID: o.runID, Region: o.region, InstanceType: inst,
 		Workers: ceiling, MinViable: ceiling, // slice 2: require ALL requested workers, not best-effort
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 		TTL: o.ttl, IdleTimeout: fleetWorkerIdleTimeout.String(),
@@ -282,7 +292,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 				shardErrs[i] = fmt.Errorf("shard %d wait summary: %w", shs[i].ID, werr)
 				return
 			}
-			m, failed, merr := measurementFromPoolSummary(ctx, s3c, o, shs[i], summaryBytes)
+			m, failed, merr := measurementFromPoolSummary(ctx, s3c, o, inst, shs[i], summaryBytes)
 			measurements[i], shardFailed[i], shardErrs[i] = m, failed, merr
 		}(i)
 	}
@@ -334,7 +344,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 		// occupancy already correctly describe the original claim's fixed
 		// costs, and per-item timing is re-derived from Collect at D3
 		// regardless of which claim produced which item.
-		_, _, merr := measurementFromPoolSummary(ctx, s3c, o, sub, summaryBytes)
+		_, _, merr := measurementFromPoolSummary(ctx, s3c, o, inst, sub, summaryBytes)
 		if merr != nil {
 			shardErrs[i] = fmt.Errorf("shard %d item-redrive: %w", shs[i].ID, merr)
 		}
@@ -390,7 +400,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 			live = append(live, m)
 		}
 	}
-	if err := emitFleetK(o, live, pricePerHr); err != nil {
+	if err := emitFleetK(o, inst, live, pricePerHr); err != nil {
 		return err
 	}
 
@@ -534,10 +544,10 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 		IamInstanceProfile: iamProfile,
+		RunID:              o.runID, Command: "fleet",
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
 	tgt := *baseTgt // per-shard copy — Acquire mutates Region; avoid a cross-goroutine race
-	tgt.Instance = o.instance
 	acquired, err := acq.Acquire(ctx, &tgt, o.region)
 	if err != nil {
 		return measure.Measurement{}, fmt.Errorf("shard %d acquire: %w", sh.ID, err)
@@ -572,7 +582,7 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 	_ = json.Unmarshal(summaryBytes, &summary)
 
 	return measure.Measurement{
-		CardAskedFor: "H100", InstanceUsed: o.instance,
+		CardAskedFor: "H100", InstanceUsed: baseTgt.Instance,
 		PerItem: measure.Aggregate(summary.PerItemSecs),
 		Occupancy: measure.OccupancySummary{
 			MeanOccupancy: summary.Occupancy.MeanOccupancy, Samples: summary.Occupancy.Samples,
@@ -611,7 +621,7 @@ func needsItemRedrive(shardErr error, failed []int) bool {
 // DrainBatch) that permanently failed within an otherwise-completed claim.
 // Non-empty alongside a nil error means the shard needs D4a's item-level
 // re-drive, not D4's whole-shard dedicated-instance fallback.
-func measurementFromPoolSummary(ctx context.Context, s3c *s3.Client, o realOpts, sh calexec.Shard, summaryBytes []byte) (measure.Measurement, []int, error) {
+func measurementFromPoolSummary(ctx context.Context, s3c *s3.Client, o realOpts, inst string, sh calexec.Shard, summaryBytes []byte) (measure.Measurement, []int, error) {
 	var summary calpool.Summary
 	if err := json.Unmarshal(summaryBytes, &summary); err != nil {
 		return measure.Measurement{}, nil, fmt.Errorf("shard %d decode pool summary: %w", sh.ID, err)
@@ -624,7 +634,7 @@ func measurementFromPoolSummary(ctx context.Context, s3c *s3.Client, o realOpts,
 	for i, r := range results {
 		perItemSecs[i] = r.Seconds
 	}
-	return measurementFromPoolSummaryFields(summary, perItemSecs, o.instance), summary.Failed, nil
+	return measurementFromPoolSummaryFields(summary, perItemSecs, inst), summary.Failed, nil
 }
 
 // measurementFromPoolSummaryFields is measurementFromPoolSummary's pure
@@ -657,7 +667,7 @@ func measurementFromPoolSummaryFields(summary calpool.Summary, perItemSecs []flo
 }
 
 // emitFleetK folds the per-instance measurements (D5) and emits one fleet K.
-func emitFleetK(o realOpts, perInstance []measure.Measurement, priceHr float64) error {
+func emitFleetK(o realOpts, inst string, perInstance []measure.Measurement, priceHr float64) error {
 	rates, err := cost.LoadRates(o.ratesFP)
 	if err != nil {
 		return fmt.Errorf("rates: %w", err)
@@ -668,7 +678,7 @@ func emitFleetK(o realOpts, perInstance []measure.Measurement, priceHr float64) 
 	}
 	agg := measure.FleetFold(perInstance)
 	occFrac, occMeasured := agg.OccupancyFraction()
-	_, awsMeasured, _ := rates.AWSOnDemandPerSecond(o.instance)
+	_, awsMeasured, _ := rates.AWSOnDemandPerSecond(inst) // the ACTUAL instance used — may differ from o.instance when --allow-card-swap resolved a new one (calque#178)
 	model := &cost.Model{Rates: rates, M: cost.Measured{
 		CardAskedFor: agg.CardAskedFor, InstanceUsed: agg.InstanceUsed, SecPerItem: agg.PerItem.MeanSecs,
 		Occupancy: occFrac, SampleItems: agg.PerItem.Count, AWSRateMeasured: awsMeasured,

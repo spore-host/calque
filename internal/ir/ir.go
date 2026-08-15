@@ -19,10 +19,18 @@ type App struct {
 	// before @enter, never written back — matches Modal, where an
 	// uncommitted local write is never visible to another container).
 	CommittedVolumes map[string]bool
-	Functions        []Function // @app.function
-	Classes          []Class    // @app.cls
-	Entrypoints      []Function // @app.local_entrypoint (may be more than one)
-	Script           string     // source path, for leak attribution (§10)
+	// DefaultVolumes/DefaultSecrets are App(volumes=..., secrets=...)'s own
+	// kwargs (calque#168) — a Function/Class declaring neither inherits
+	// from here, the same fallback-if-own-is-empty shape buildClass already
+	// uses for a method inheriting its class's gpu=/volumes=. Before this,
+	// App-level volumes=/secrets= were silently dropped with NO leak at
+	// all — worse than image=, which at least surfaced a generic leak.
+	DefaultVolumes map[string]string
+	DefaultSecrets []string
+	Functions      []Function // @app.function
+	Classes        []Class    // @app.cls
+	Entrypoints    []Function // @app.local_entrypoint (may be more than one)
+	Script         string     // source path, for leak attribution (§10)
 	// EntrypointInvokes attributes invoke-kind evidence to the SPECIFIC
 	// @app.local_entrypoint() whose body contains the call site (calque#98):
 	// entrypoint name -> invoked callable's leaf name -> best InvokeKind seen
@@ -181,7 +189,15 @@ type Config struct {
 
 // Function is an @app.function (or, when embedded in a Class, an @method).
 type Function struct {
-	Name      string
+	Name string
+	// Image is THIS callable's own resolved image (calque#174) — its own
+	// image=<var> kwarg resolved against the script's known image chains,
+	// falling back to App.Image only when this callable declares no
+	// image= of its own. Before #174, every callable in a script shared
+	// ONE globally-picked image (App.Image) regardless of which image=
+	// var it actually referenced — a function with its OWN explicit
+	// image= could silently get a DIFFERENT function's image.
+	Image     Image
 	GPU       string            // raw from source, e.g. "H100" or "A100:8" — guarded/rewritten in §7
 	Volumes   map[string]string // mount path -> Modal volume name (from_name)
 	Timeout   int               // seconds; 0 if unset
@@ -251,7 +267,11 @@ const (
 // Class is an @app.cls: a warm, stateful unit whose @enter body runs once per
 // container and whose @method bodies process items against the loaded state.
 type Class struct {
-	Name      string
+	Name string
+	// Image is THIS class's own resolved image (calque#174) — see
+	// Function.Image's doc comment; the same App->class->method
+	// resolution chain gpu=/volumes= already used is extended to image=.
+	Image     Image
 	GPU       string
 	Volumes   map[string]string
 	Timeout   int

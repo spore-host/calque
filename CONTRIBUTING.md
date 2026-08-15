@@ -94,6 +94,18 @@ describes pre-this-release behavior as current. See the two status-banner
 forms below — a doc marked "Authoritative current behavior" is exactly the
 kind that should be checked here.
 
+**Concrete method, not just intent:** for every "Fixed"/"Changed" entry
+you're about to add to `CHANGELOG.md`, `grep` the authoritative docs for the
+OLD claim that entry just made false, not only the new one. Link
+validation and status banners can't catch this — a doc can pass every link
+check and still assert the pre-fix behavior in prose. (Concretely: a past
+release fixed App-level `secrets=`/`volumes=` inheritance and updated
+`docs/modal-compatibility-matrix.md` accordingly, but a near-identical
+sentence in `docs/porting-modal-to-aws.md` describing the OLD "recorded,
+never applied" behavior survived two releases before an external review
+caught it — the fix's own commit should have grepped for that exact
+phrase across every doc, not just the one it happened to touch.)
+
 ## Doc status banners
 
 Every doc in `docs/` should open with one of two status lines, so a reader

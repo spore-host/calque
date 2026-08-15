@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spore-host/cohort"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
@@ -188,8 +189,12 @@ func ProvisionFleetWorkers(ctx context.Context, client *spawnaws.Client, cfg Fle
 		OnComplete:         "terminate",
 		UserData:           launcher.EncodeLinuxUserData(userData),
 		Tags: map[string]string{
-			fleetWorkerTag: cfg.RunID,
-			"calque:role":  "fleet-worker",
+			fleetWorkerTag:      cfg.RunID,
+			"calque:role":       "fleet-worker",
+			"calque:run-id":     cfg.RunID, // calque#166: same value as fleetWorkerTag, under the
+			"calque:managed":    "true",    // repo-wide calque:* tag convention other launch paths use
+			"calque:command":    "fleet",
+			"calque:created-at": time.Now().UTC().Format(time.RFC3339),
 		},
 	}
 

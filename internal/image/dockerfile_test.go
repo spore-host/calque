@@ -132,6 +132,122 @@ func TestNewlyHandledVerbs(t *testing.T) {
 
 // TestFromAwsEcrBase (A2): from_aws_ecr resolves to the named ECR image as the
 // FROM base and notes the pull-permission requirement.
+// TestRegistryRef (calque#176) proves the extraction cmd/calque/realrun.go
+// needs to decide whether a --script real run can pull the picked unit's
+// OWN resolved image, instead of resolveBase's Dockerfile-FROM-line logic
+// (which additionally leaks/falls back — not what a pull decision needs).
+func TestRegistryRef(t *testing.T) {
+	cases := []struct {
+		name    string
+		img     ir.Image
+		wantRef string
+		wantOK  bool
+	}{
+		{
+			name: "from_registry resolves",
+			img: ir.Image{
+				Base:  "from_registry",
+				Steps: []ir.ImageStep{{Method: "from_registry", Args: []string{"us-central1-docker.pkg.dev/ai-almanac/almanac/romp:latest"}}},
+			},
+			wantRef: "us-central1-docker.pkg.dev/ai-almanac/almanac/romp:latest",
+			wantOK:  true,
+		},
+		{
+			name: "from_aws_ecr resolves",
+			img: ir.Image{
+				Base:  "from_aws_ecr",
+				Steps: []ir.ImageStep{{Method: "from_aws_ecr", Args: []string{"123456789012.dkr.ecr.us-west-2.amazonaws.com/myrepo:latest"}}},
+			},
+			wantRef: "123456789012.dkr.ecr.us-west-2.amazonaws.com/myrepo:latest",
+			wantOK:  true,
+		},
+		{
+			name:   "debian_slim has no pullable ref",
+			img:    ir.Image{Base: "debian_slim", Steps: []ir.ImageStep{{Method: "debian_slim"}}},
+			wantOK: false,
+		},
+		{
+			name:   "unresolved never returns a ref",
+			img:    ir.Image{Unresolved: true},
+			wantOK: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ref, ok := RegistryRef(c.img)
+			if ok != c.wantOK {
+				t.Errorf("RegistryRef() ok = %v, want %v", ok, c.wantOK)
+			}
+			if ref != c.wantRef {
+				t.Errorf("RegistryRef() ref = %q, want %q", ref, c.wantRef)
+			}
+		})
+	}
+}
+
+// TestNeedsBuild (calque#177) proves the three-way split realrun.go relies
+// on to pick pull-only (#176) vs. build-on-instance (#177) vs. host-mode
+// (#79): a bare pullable ref needs no build, a pullable ref with layered
+// steps on top DOES need a build (pulling the base alone would silently
+// drop those steps), a from-scratch chain (no pullable base at all) needs
+// a build, and an unresolved/empty image needs neither (the caller's
+// existing host-mode fallback already covers that case).
+func TestNeedsBuild(t *testing.T) {
+	cases := []struct {
+		name string
+		img  ir.Image
+		want bool
+	}{
+		{
+			name: "bare from_registry, no layered steps: pull-only, no build",
+			img: ir.Image{
+				Base:  "from_registry",
+				Steps: []ir.ImageStep{{Method: "from_registry", Args: []string{"nvcr.io/nvidia/pytorch:25.12-py3"}}},
+			},
+			want: false,
+		},
+		{
+			name: "from_registry with pip_install layered on top: needs build",
+			img: ir.Image{
+				Base: "from_registry",
+				Steps: []ir.ImageStep{
+					{Method: "from_registry", Args: []string{"nvcr.io/nvidia/pytorch:25.12-py3"}},
+					{Method: "pip_install", Args: []string{"earth2studio"}},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "from-scratch debian_slim chain, no pullable base: needs build",
+			img: ir.Image{
+				Base: "debian_slim",
+				Steps: []ir.ImageStep{
+					{Method: "debian_slim"},
+					{Method: "apt_install", Args: []string{"git"}},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "unresolved: no build (host-mode fallback handles it)",
+			img:  ir.Image{Unresolved: true},
+			want: false,
+		},
+		{
+			name: "empty/zero-value image: no build",
+			img:  ir.Image{},
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := NeedsBuild(c.img); got != c.want {
+				t.Errorf("NeedsBuild() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestFromAwsEcrBase(t *testing.T) {
 	rep := &leak.Report{}
 	ref := "123456789012.dkr.ecr.us-west-2.amazonaws.com/myrepo:latest"

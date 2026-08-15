@@ -1,6 +1,6 @@
 # Behind-the-seam register (M10 — what calque deliberately does NOT port)
 
-**Status:** Authoritative current behavior. Verified through: v0.3.1.
+**Status:** Authoritative current behavior. Verified through: v0.4.0.
 Living decision record (§1/§4/§18) — kept current as primitives ship
 (several rows below have moved from "deferred" to "shipped" as the
 project progressed; check each row's own status, not just this header).

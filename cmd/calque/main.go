@@ -84,6 +84,8 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "version":
+		printVersion()
 	default:
 		usage()
 		os.Exit(2)
@@ -273,7 +275,7 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 	bucket := fs.String("bucket", "", "S3 bucket (required)")
 	region := fs.String("region", "us-east-1", "AWS region")
 	runID := fs.String("run-id", "", "unique run id (required)")
-	instance := fs.String("instance", "g6.2xlarge", "GPU instance type")
+	instance := fs.String("instance", "", "GPU instance type; empty => \"g6.2xlarge\", UNLESS --allow-card-swap substituted a different card, in which case an instance for that card is resolved automatically (calque#178)")
 	ami := fs.String("ami", "", "pin the AMI; empty => spawn auto-selects a GPU-capable AMI (verified working on g6/g6e/g7/g7e, calque#75)")
 	model := fs.String("model", "Qwen/Qwen2.5-1.5B-Instruct", "HF model repo id (must NOT be on Bedrock)")
 	n := fs.Int("n", 1, "number of prompts (N=1 validates inference; N~100 for amortized K)")
@@ -299,12 +301,13 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 	pythonVersion := fs.String("python-version", "", "Python version for uv to install on the instance (calque#148), e.g. 3.11 — only meaningful alongside --pip; empty lets uv pick its own default")
 	stageFiles := stageFileFlag{}
 	fs.Var(stageFiles, "stage-file", "URL=PATH, repeatable — downloads URL to the absolute PATH on the instance (parent dirs created) before warmd runs; for a script body that shells out to a hardcoded absolute path its original Docker image would have placed there")
+	allowCardSwap := fs.Bool("allow-card-swap", false, "opt into target.CardSwapFor's curated substitution table (calque#178) for a CleanSwap gpu= site whose asked-for card has a VERIFIED cheaper alternative (e.g. A100-80GB, which AWS has no single-GPU instance for at all) — false (the default) always carries the script's own asked-for card through unchanged")
 	confirmFlag := fs.Bool("i-understand-this-spends-money", false, "required: launches a billable GPU instance")
 	if err := fs.Parse(args); err != nil {
 		return realOpts{}, 0, false, false, err
 	}
 	if *bucket == "" || *runID == "" {
-		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--entrypoint NAME] [--function NAME] [--secret NAME=VALUE] [--item-file PATH] [--arg-file IDX=PATH] [--arg-json IDX=JSON] [--pip PACKAGE] [--python-version X.Y] [--stage-file URL=PATH] --i-understand-this-spends-money")
+		return realOpts{}, 0, false, false, fmt.Errorf("usage: calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] [--spot] [--script FILE.py] [--entrypoint NAME] [--function NAME] [--secret NAME=VALUE] [--item-file PATH] [--arg-file IDX=PATH] [--arg-json IDX=JSON] [--pip PACKAGE] [--python-version X.Y] [--stage-file URL=PATH] [--allow-card-swap] --i-understand-this-spends-money")
 	}
 	opts = realOpts{
 		bucket: *bucket, region: *region, runID: *runID, instance: *instance, ami: *ami,
@@ -312,6 +315,7 @@ func parseRealArgs(args []string) (opts realOpts, shards int, pool bool, confirm
 		spot: *spot, spotMaxPrice: *spotMaxPrice, script: *script, entrypoint: *entrypoint, function: *function,
 		pipPackages: pipPackages, pythonVersion: *pythonVersion,
 		secrets: secrets, itemFile: *itemFile, argFiles: argFiles, argJSON: argJSON, stageFiles: stageFiles,
+		allowCardSwap: *allowCardSwap,
 	}
 	return opts, *shardsFlag, *poolFlag, *confirmFlag, nil
 }
@@ -408,6 +412,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque pool create --model M --instance-type T --manifest-bucket B --results-bucket B --runner-path P [--workers N] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque spawn-run --bucket B --run-id ID --ami AMI [--instance m7i.large] <script.py> --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque session <checkout|checkin|status|list> ... (institutional MIG/MPS slice check-out/check-in, docs/tenancy-vs-session.md)")
+	fmt.Fprintln(os.Stderr, "  calque version")
 }
 
 // pyastDir locates the helper relative to the repo. We resolve it from this
@@ -472,7 +477,7 @@ func analyze(scripts []string) error {
 			}
 		}
 
-		log := gpu.RewriteApp(app, rep)
+		log := gpu.RewriteApp(app, rep, false) // corpus analyze: informational only, not a real launch (calque#178)
 		c := log.Counts()
 		corpus.CleanSwaps += c.CleanSwaps
 		corpus.FlagMulti += c.FlagMulti
@@ -480,7 +485,12 @@ func analyze(scripts []string) error {
 		corpus.NoGPU += c.NoGPU
 
 		fmt.Printf("=== %s (app %q) ===\n", filepath.Base(s), app.Name)
-		fmt.Printf("  functions=%d classes=%d entrypoints=%d image.base=%q pip=%v\n",
+		// calque#174: this is the app-wide DEFAULT image (the fallback a
+		// callable with no image= of its own inherits) — not necessarily
+		// what every function/class actually builds with. A function/class
+		// with its OWN image= kwarg resolves independently; see each
+		// gpu[fn] line's owner if you need to check a specific callable.
+		fmt.Printf("  functions=%d classes=%d entrypoints=%d image.default.base=%q pip=%v\n",
 			len(app.Functions), len(app.Classes), len(app.Entrypoints), app.Image.Base, app.Image.Pip)
 		for _, sub := range log.Subs {
 			// Every clean swap resolves its instance via the seam, never inlined.
