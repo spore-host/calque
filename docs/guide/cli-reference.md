@@ -83,7 +83,7 @@ against acquired capacity — a single instance by default, a fleet with
 | `--bucket` | *(required)* | S3 bucket. |
 | `--region` | `us-east-1` | AWS region. |
 | `--run-id` | *(required)* | Unique run id. |
-| `--instance` | `g6.2xlarge` | GPU instance type. |
+| `--instance` | `""` → `g6.2xlarge` | GPU instance type. Empty resolves to `g6.2xlarge`, UNLESS `--allow-card-swap` substituted a different card, in which case an instance for that card is resolved automatically (calque#178). |
 | `--ami` | `""` | Pin the AMI; empty auto-selects (verified working on g6/g6e/g7/g7e, calque#75). |
 | `--model` | `Qwen/Qwen2.5-1.5B-Instruct` | HF model repo id — must NOT be an exact Bedrock match, or the route-away gate stops the run before any spend. |
 | `--n` | `1` | Number of prompts/items to drive through the hardcoded vLLM reference body (ignored once `--script` picks a real unit with its own real iterable — see `--script` below). |
@@ -104,6 +104,7 @@ against acquired capacity — a single instance by default, a fleet with
 | `--pip PACKAGE` | none, repeatable | Third-party Python package to `uv install` on the instance before running a `--script`-picked unit's real body (calque#148) — needed when the script's own `pip_install(...)` chain wasn't statically resolvable (e.g. built via a factory function). Accepts a plain PyPI name or a full `uv`-style spec, including a git URL (`"momp @ git+https://github.com/hholb/ROMP.git@main"`). |
 | `--python-version X.Y` | `""` | Python version for `uv` to install on the instance — only meaningful alongside `--pip`. Empty lets `uv` pick its own current default. |
 | `--stage-file URL=PATH` | none, repeatable | Downloads `URL` to the absolute `PATH` on the instance (creating parent directories) **before** `warmd` runs — for a script body that shells out to a hardcoded absolute path its original Docker image would have placed there. |
+| `--allow-card-swap` | `false` | Opt into `internal/target.CardSwapFor`'s curated substitution table (calque#178) for a `CleanSwap` `gpu=` site whose asked-for card has a VERIFIED cheaper alternative (e.g. `A100-80GB`, which AWS has no single-GPU instance for at all). `false` (the default) always carries the script's own asked-for card through unchanged. |
 | `--i-understand-this-spends-money` | `false` | **Required.** |
 
 **Flag interactions worth knowing up front:**
