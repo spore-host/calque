@@ -19,8 +19,37 @@ type SpawnCallable struct {
 	EnterBody  string // "" for a plain @app.function (calque#80's synthetic-class shape, no @enter)
 	MethodBody string
 	MethodArg  string
+	// MethodArgs (calque#191) is the full non-self/cls parameter list, e.g.
+	// ["job_id","model_id","config"] for run_forecast_inference(job_id,
+	// model_id, config) — mirrors ir.Function.Args minus self/cls, the
+	// same list run.go's checkInvokeSupport/nonSelfArgs already derive for
+	// the OTHER three drivers (run/real/fleetrun). Before this field
+	// existed, a spawned callable with 2+ args had MethodArg naming only
+	// the FIRST one — spawnArgsPayload already packed every real arg into
+	// a list, but nothing on the callable-definition side had anywhere to
+	// carry the other names, so runner.py's single-param
+	// __calque_method__ silently left them unbound (NameError on real
+	// hardware). len(MethodArgs) <= 1 reproduces every pre-#191 SpawnCallable
+	// byte-for-byte (BuildSpawnManifests/runSpawnShard only start
+	// splatting once there's more than one name to bind).
+	MethodArgs []string
 	GPU        string
 	IsClass    bool // true if this callable is an @app.cls (EnterBody/MethodArg came from its .map'd/first method)
+}
+
+// nonSelfCls returns args with any leading "self"/"cls" removed — the
+// callable-definition-side counterpart to spawnArgsPayload's call-SITE
+// packing, mirroring cmd/calque/run.go's own nonSelfArgs exactly (kept as
+// a package-local copy since internal/exec cannot import cmd/calque).
+func nonSelfCls(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "self" || a == "cls" {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // ResolveSpawnCallables walks app's Functions and Classes, returning one
@@ -45,7 +74,7 @@ func ResolveSpawnCallables(app ir.App) []SpawnCallable {
 			continue
 		}
 		out = append(out, SpawnCallable{
-			Key: f.Name, MethodBody: f.Body, MethodArg: f.ItemArg, GPU: f.GPU,
+			Key: f.Name, MethodBody: f.Body, MethodArg: f.ItemArg, MethodArgs: nonSelfCls(f.Args), GPU: f.GPU,
 		})
 	}
 	for _, c := range app.Classes {
@@ -55,7 +84,7 @@ func ResolveSpawnCallables(app ir.App) []SpawnCallable {
 			}
 			out = append(out, SpawnCallable{
 				Key: m.Name, EnterBody: c.EnterBody, MethodBody: m.Body, MethodArg: m.ItemArg,
-				GPU: c.GPU, IsClass: true,
+				MethodArgs: nonSelfCls(m.Args), GPU: c.GPU, IsClass: true,
 			})
 		}
 	}
@@ -111,11 +140,18 @@ func BuildSpawnManifests(callables []SpawnCallable, sites []SpawnCallSite, base,
 // spawnArgsPayload converts a call site's raw string args into the payload
 // shape warmd's runner.py expects: a single value for one arg (matching the
 // existing single-positional-arg protocol every other invocation idiom
-// already uses, per §6), or a list for multiple args (best-effort — a
-// .spawn()'d callable with more than one positional arg has no established
-// binding convention yet in calque's protocol; this is the same single-arg
-// limitation checkInvokeSupport already flags for .starmap, not a NEW gap
-// this function introduces).
+// already uses, per §6), or a LIST for multiple args — runner.py's
+// starmap-splat path (item()'s `if self.starmap and isinstance(payload,
+// (list, tuple))` branch) binds this list across SpawnCallable.MethodArgs
+// positionally, the same mechanism .starmap() itself uses (calque#191:
+// runSpawnShard now sets Starmap=true and passes MethodArgs through
+// WriteManifestBody whenever a callable has 2+ args, closing what used to
+// be a dead end here — this function's OWN list-building was already
+// correct, nothing downstream consumed it as a splat before now).
+// spawnArgsPayload cannot itself know each real arg's true value when
+// _spawn_arg_str couldn't resolve it (a variable reference, not a
+// literal) — a nil entry becomes "" here, an HONEST but lossy stand-in,
+// same as every other best-effort literal extraction in this codebase.
 func spawnArgsPayload(args []*string) any {
 	switch len(args) {
 	case 0:
@@ -158,20 +194,21 @@ func (e *ErrCallableNotFound) Error() string {
 // leak/call-graph-driven caller wants "resolve THIS one name."
 func ResolveOneSpawnCallable(app ir.App, name string) (SpawnCallable, error) {
 	if f, ok := app.FindFunction(name); ok {
-		return SpawnCallable{Key: f.Name, MethodBody: f.Body, MethodArg: f.ItemArg, GPU: f.GPU}, nil
+		return SpawnCallable{Key: f.Name, MethodBody: f.Body, MethodArg: f.ItemArg, MethodArgs: nonSelfCls(f.Args), GPU: f.GPU}, nil
 	}
 	if c, ok := app.FindClass(name); ok {
 		var mBody, mArg string
+		var mArgs []string
 		for _, m := range c.Methods {
 			if m.IsMap {
-				mBody, mArg = m.Body, m.ItemArg
+				mBody, mArg, mArgs = m.Body, m.ItemArg, nonSelfCls(m.Args)
 				break
 			}
 		}
 		if mBody == "" && len(c.Methods) > 0 {
-			mBody, mArg = c.Methods[0].Body, c.Methods[0].ItemArg
+			mBody, mArg, mArgs = c.Methods[0].Body, c.Methods[0].ItemArg, nonSelfCls(c.Methods[0].Args)
 		}
-		return SpawnCallable{Key: c.Name, EnterBody: c.EnterBody, MethodBody: mBody, MethodArg: mArg, GPU: c.GPU, IsClass: true}, nil
+		return SpawnCallable{Key: c.Name, EnterBody: c.EnterBody, MethodBody: mBody, MethodArg: mArg, MethodArgs: mArgs, GPU: c.GPU, IsClass: true}, nil
 	}
 	return SpawnCallable{}, &ErrCallableNotFound{Name: name}
 }

@@ -153,6 +153,33 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 	return nil
 }
 
+// spawnManifestBody builds the calexec.ManifestBody runSpawnShard writes
+// for callable — factored out as a pure function (no ctx/S3) so the
+// calque#191 splat-routing decision is unit-testable without live AWS,
+// mirroring items.go's manifestBodyForUnit.
+//
+// calque#191: a callable with 2+ real args (e.g. run_forecast_inference(
+// job_id, model_id, config)) needs runner.py's starmap-splat path to bind
+// every name, not just the first — spawnArgsPayload
+// (internal/exec/spawnshard.go) already packs a multi-arg call site's
+// payload into a list; without Starmap=true + MethodArgs set here, that
+// list arrived at a single-param __calque_method__ and every name past
+// the first stayed undefined on real hardware. len(callable.MethodArgs)
+// <= 1 (the overwhelmingly common case — a plain single-arg spawned
+// callable) reproduces the pre-#191 manifest byte-for-byte.
+func spawnManifestBody(callable calexec.SpawnCallable) calexec.ManifestBody {
+	arg := callable.MethodArg
+	if arg == "" {
+		arg = "item"
+	}
+	body := calexec.ManifestBody{EnterBody: callable.EnterBody, MethodBody: callable.MethodBody, MethodArg: arg}
+	if len(callable.MethodArgs) > 1 {
+		body.MethodArgs = callable.MethodArgs
+		body.Starmap = true
+	}
+	return body
+}
+
 // runSpawnShard acquires ONE instance for one named shard, writes its
 // manifest (using THIS callable's own EnterBody/MethodBody — the point of
 // calque#111's resolver, replacing fleetRun's shared realEnterBody/
@@ -167,11 +194,8 @@ func runSpawnShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnC
 		Bucket: o.bucket, ArtifactPfx: "spawn/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
 	}
-	arg := callable.MethodArg
-	if arg == "" {
-		arg = "item"
-	}
-	if err := calexec.WriteManifest(ctx, s3c, shardLayout, callable.EnterBody, callable.MethodBody, arg, hostWorkerDir, sh.Items); err != nil {
+	body := spawnManifestBody(callable)
+	if err := calexec.WriteManifestBody(ctx, s3c, shardLayout, body, hostWorkerDir, sh.Items, nil, nil); err != nil {
 		return fmt.Errorf("shard %q write manifest: %w", sh.Key, err)
 	}
 	boot := calexec.BootstrapConfig{
