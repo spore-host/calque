@@ -1,6 +1,7 @@
 cff-version: 1.2.0
 message: "If you use calque in your research, please cite it as below."
 title: "calque: run Modal-shaped code at AWS scale, unchanged"
+doi: "10.5281/zenodo.21953697"
 abstract: >-
   calque is a structure-preserving translation layer that runs Modal-idiom
   Python scripts unchanged at AWS scale: the same script that runs over a

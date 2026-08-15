@@ -2,6 +2,10 @@
 
 ![calque: run Modal-shaped code at AWS scale, unchanged](assets/hero.png)
 
+[![CI](https://github.com/spore-host/calque/actions/workflows/ci.yml/badge.svg)](https://github.com/spore-host/calque/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21953697.svg)](https://doi.org/10.5281/zenodo.21953697)
+
 **Run Modal-shaped code at AWS scale, unchanged.**
 
 Modal is where inference/batch code is *prototyped* — great inner loop, pay-nothing-when-idle.
