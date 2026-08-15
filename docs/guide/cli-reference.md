@@ -189,6 +189,50 @@ never touch billing. `list` reports on the one named `--model` pool, not a
 registry of every pool that exists — calque keeps no such registry (see
 the doc comment in `pool.go` for why).
 
+## `calque ami <subcommand>`
+
+Source: `cmd/calque/ami.go`. Pre-bakes a custom AMI with a docker image's
+layers already pulled, so `real`/`ramp`/`fleetrun`/`spawn-run`'s bootstrap
+(`internal/exec/bootstrap.go`) doesn't pay a fresh multi-GB Docker Hub pull
+on every single boot (calque#144). Image-only: model weights (`--model`,
+a free-form Hugging Face repo id) are never baked and still download fresh
+on first `@enter`, unchanged — baking a specific model's weights would
+conflict with `--model`'s free-form design. Baking is entirely opt-in and
+manual: `ami bake` prints an AMI id, and the operator passes it to any
+run command's own `--ami` flag explicitly, exactly like pinning any other
+AMI today. No run command auto-selects a baked AMI.
+
+### `calque ami bake [flags]` — billable
+
+Acquires an instance, pulls the target docker image, snapshots it to a new
+AMI, then terminates the source instance — all before returning.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--bucket` | *(required)* | S3 bucket for the bake's done-marker/log. |
+| `--run-id` | *(required)* | Unique bake id. |
+| `--name` | *(required)* | Name tag for the resulting AMI. |
+| `--region` | `us-west-2` | AWS region. |
+| `--instance` | `g6.2xlarge` | Instance type to bake on (no GPU actually needed for a docker pull; matches vLLM's own target family for layer/arch parity). |
+| `--ami` | `""` | Base AMI to bake FROM; empty auto-selects a stock GPU-capable AMI (same as every other command). |
+| `--image` | `vllm/vllm-openai:latest` | Docker image to pre-pull into the baked AMI. |
+| `--ttl` | `45m` | Instance TTL hard cap — must exceed the target image's pull time (spawn's TTL enforcer terminates unconditionally on expiry). |
+| `--deadline-min` | `30` | Give up acquiring/waiting after N minutes — must also exceed the pull time. |
+| `--spot` / `--spot-max-price` | `false` / `""` | Acquire the bake instance on the Spot market. |
+| `--i-understand-this-spends-money` | `false` | **Required.** |
+
+### `calque ami list [flags]` — read-only
+
+`--region` (`us-west-2`). Lists only calque-baked AMIs (filtered by the
+`calque:baked-image` tag), not every AMI in the account.
+
+### `calque ami delete <ami-id> [flags]` — destructive
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--region` | `us-west-2` | AWS region. |
+| `--i-understand-this-deletes-the-ami` | `false` | **Required.** Permanently deregisters the AMI and cleans up its backing snapshot(s) not shared with another AMI. |
+
 ## `calque spawn-run [flags] <script.py>` — billable
 
 Source: `cmd/calque/spawnrun.go`. Block-and-wait `.spawn()`/`.get()`

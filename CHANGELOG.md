@@ -11,6 +11,15 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Added
 
+- New `calque ami bake`/`ami list`/`ami delete` subcommands (calque#144)
+  pre-bake a custom AMI with a docker image's layers already pulled, so
+  `real`/`ramp`/`fleetrun`/`spawn-run`'s bootstrap no longer pays a fresh
+  multi-GB Docker Hub pull on every single boot — the existing
+  unconditional `docker pull` line becomes a fast manifest check against
+  the AMI's own cache. Image-only: model weights stay fully free-form via
+  `--model` and are never baked. Purely additive/opt-in — bake an AMI,
+  then pass its id to any run command's existing `--ami` flag explicitly;
+  no run command auto-selects a baked AMI.
 - A `--script` real run whose picked unit's `.image` chain has steps
   LAYERED on a pullable `from_registry`/`from_aws_ecr` base, or no
   pullable base at all, now gets its Dockerfile built ON THE ACQUIRED
