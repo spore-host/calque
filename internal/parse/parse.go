@@ -214,6 +214,14 @@ type pyInvokeCall struct {
 	// and "starmap" kinds when pyast could statically resolve the call's
 	// iterable argument; nil otherwise (and for every other Kind).
 	Iterable *pyIterable `json:"iterable,omitempty"`
+	// Candidates (calque#189) is populated for a "spawn" kind ONLY when
+	// Target is empty because the receiver was a Subscript on a known
+	// dict-of-functions var (e.g. `SEASON_BUNDLE_FNS[_model_env(model_id)]
+	// .spawn(...)`) — every function name ever assigned into that dict
+	// anywhere in the module, NOT the specific runtime-selected one (that
+	// key genuinely can't be resolved statically). nil for every other
+	// case, including a spawn whose target WAS resolved normally.
+	Candidates []string `json:"candidates,omitempty"`
 }
 
 // Parse runs the helper on scriptPath and returns the IR plus any leaks emitted
@@ -248,19 +256,63 @@ type SpawnCallSite struct {
 // currently pays for two helper invocations; this is acceptable for a
 // design-time convenience function driving a real-AWS-verification-gated
 // path (calque#112), not a hot loop.
+//
+// calque#189: a call site whose Target came back empty because the
+// receiver was a dict-of-functions Subscript (e.g. `SEASON_BUNDLE_FNS[key]
+// .spawn(...)`) expands into ONE SpawnCallSite per pyInvokeCall.Candidate
+// instead of being silently dropped — every candidate gets the SAME call
+// args (the real runtime-selected callable isn't resolvable, so this
+// fans out to every possibility a driver could route to, rather than
+// nothing at all). rep leaks this expansion so it's visible, not a silent
+// multiplication of shards. A call site with neither a resolved Target nor
+// any Candidates (e.g. a Subscript on a var pyast never saw populated)
+// still contributes nothing, matching today's behavior exactly.
 func SpawnCallSites(ctx context.Context, scriptPath string, runner string, runnerArgs ...string) ([]SpawnCallSite, error) {
+	return spawnCallSites(ctx, scriptPath, nil, runner, runnerArgs...)
+}
+
+// SpawnCallSitesReport is SpawnCallSites plus the calque#189 candidate-
+// expansion leak, for a caller (cmd/calque/spawnrun.go) that already
+// carries a *leak.Report through its own parse step and wants this
+// expansion surfaced in the SAME report rather than swallowed.
+func SpawnCallSitesReport(ctx context.Context, scriptPath string, rep *leak.Report, runner string, runnerArgs ...string) ([]SpawnCallSite, error) {
+	return spawnCallSites(ctx, scriptPath, rep, runner, runnerArgs...)
+}
+
+func spawnCallSites(ctx context.Context, scriptPath string, rep *leak.Report, runner string, runnerArgs ...string) ([]SpawnCallSite, error) {
 	out, err := runHelper(ctx, scriptPath, runner, runnerArgs...)
 	if err != nil {
 		return nil, err
 	}
+	return spawnCallSitesFromInvokeCalls(out.InvokeCalls, scriptPath, rep), nil
+}
+
+// spawnCallSitesFromInvokeCalls is spawnCallSites' pure expansion logic,
+// factored out so calque#189's candidate-fanout behavior is unit-testable
+// against a hand-built []pyInvokeCall without a pyast subprocess.
+func spawnCallSitesFromInvokeCalls(invokeCalls []pyInvokeCall, scriptPath string, rep *leak.Report) []SpawnCallSite {
 	var sites []SpawnCallSite
-	for _, ic := range out.InvokeCalls {
+	for _, ic := range invokeCalls {
 		if ic.Kind != "spawn" {
 			continue
 		}
-		sites = append(sites, SpawnCallSite{Target: leafName(ic.Target), Args: ic.Args})
+		if ic.Target != "" {
+			sites = append(sites, SpawnCallSite{Target: leafName(ic.Target), Args: ic.Args})
+			continue
+		}
+		if len(ic.Candidates) == 0 {
+			continue // no resolved target AND no candidates — nothing to route to, unchanged from before #189
+		}
+		if rep != nil {
+			rep.Addf(leak.PrimMap, leak.KindSemanticGap, scriptPath, ic.Lineno,
+				".spawn(...) receiver is a dict-of-functions Subscript selected by a runtime key; the actual key isn't statically resolvable, so this expands into %d candidate call site(s) (%v) instead of the one real target — see calque#189",
+				len(ic.Candidates), ic.Candidates)
+		}
+		for _, c := range ic.Candidates {
+			sites = append(sites, SpawnCallSite{Target: leafName(c), Args: ic.Args})
+		}
 	}
-	return sites, nil
+	return sites
 }
 
 // runHelper invokes the pyast helper and decodes its JSON output — the

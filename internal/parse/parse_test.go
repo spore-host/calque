@@ -773,6 +773,87 @@ func TestSpawnCallSitesCapturesStringAndNumericArgs(t *testing.T) {
 	}
 }
 
+// TestSpawnCallSitesResolvesDictSubscriptCandidates (calque#189): a real
+// pyast run against spawn_dict_dispatch.py — a .spawn() receiver that's a
+// Subscript on a dict-of-functions populated by a module-level for-loop
+// (mirroring AI-Almanac's forecasts_app.py's real
+// `SEASON_BUNDLE_FNS[_model_env(model_id)].spawn(...)` exactly). Before
+// #189 this call site vanished entirely (empty Target, no Candidates
+// wired). Confirms the end-to-end pyast->Go wire path, not just the
+// pure-Go expansion logic (see TestSpawnCallSitesFromInvokeCallsExpandsCandidates
+// for that).
+func TestSpawnCallSitesResolvesDictSubscriptCandidates(t *testing.T) {
+	r, args := runner(t)
+	script, _ := filepath.Abs("../../testdata/scripts/spawn_dict_dispatch.py")
+
+	rep := &leak.Report{}
+	sites, err := SpawnCallSitesReport(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("SpawnCallSitesReport: %v", err)
+	}
+	if len(sites) != 1 {
+		t.Fatalf("sites = %+v, want exactly 1 (the single \"bundle\" candidate — the loop's trailing dict-assign statement blocks calque#179's per-env expansion, same as forecasts_app.py's own real shape)", sites)
+	}
+	if sites[0].Target != "bundle" {
+		t.Errorf("sites[0].Target = %q, want %q", sites[0].Target, "bundle")
+	}
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "candidate call site") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a leak noting the candidate expansion; leaks=%+v", rep.Leaks)
+	}
+}
+
+// TestSpawnCallSitesFromInvokeCallsExpandsCandidates is the pure-Go unit
+// test for calque#189's expansion logic (no pyast subprocess — always
+// runs) — a spawn call site with an empty Target and 2 Candidates expands
+// into 2 SpawnCallSites, each carrying the SAME args (the real
+// runtime-selected callable isn't resolvable, so every candidate gets
+// routed the identical call payload).
+func TestSpawnCallSitesFromInvokeCallsExpandsCandidates(t *testing.T) {
+	arg := "job-1"
+	invokeCalls := []pyInvokeCall{
+		{Kind: "spawn", Target: "", Args: []*string{&arg}, Candidates: []string{"bundle_a", "bundle_b"}, Lineno: 12},
+	}
+	rep := &leak.Report{}
+	sites := spawnCallSitesFromInvokeCalls(invokeCalls, "s.py", rep)
+	if len(sites) != 2 {
+		t.Fatalf("sites = %+v, want 2 (one per candidate)", sites)
+	}
+	wantTargets := map[string]bool{"bundle_a": true, "bundle_b": true}
+	for _, s := range sites {
+		if !wantTargets[s.Target] {
+			t.Errorf("unexpected site target %q", s.Target)
+		}
+		if len(s.Args) != 1 || s.Args[0] == nil || *s.Args[0] != arg {
+			t.Errorf("site %+v should carry the same args as the original call site", s)
+		}
+	}
+	if len(rep.Leaks) != 1 {
+		t.Errorf("expected exactly 1 leak noting the candidate expansion, got %d: %+v", len(rep.Leaks), rep.Leaks)
+	}
+}
+
+// TestSpawnCallSitesFromInvokeCallsNoTargetNoCandidatesContributesNothing
+// guards the pre-#189 behavior for the genuinely-unresolvable case (a
+// Subscript on a var pyast never saw populated, or any other empty-target
+// spawn) — must contribute NOTHING, not a spurious empty-string site.
+func TestSpawnCallSitesFromInvokeCallsNoTargetNoCandidatesContributesNothing(t *testing.T) {
+	invokeCalls := []pyInvokeCall{{Kind: "spawn", Target: "", Candidates: nil}}
+	rep := &leak.Report{}
+	sites := spawnCallSitesFromInvokeCalls(invokeCalls, "s.py", rep)
+	if len(sites) != 0 {
+		t.Errorf("sites = %+v, want empty", sites)
+	}
+	if len(rep.Leaks) != 0 {
+		t.Errorf("expected no leak when there's nothing to expand, got %+v", rep.Leaks)
+	}
+}
+
 // TestInvocationKindsPartitionsByEntrypoint (calque#98): a unit test on
 // invocationKinds itself (no pyast subprocess, so it always runs even
 // without uv on PATH) — proves the returned per-entrypoint map correctly
