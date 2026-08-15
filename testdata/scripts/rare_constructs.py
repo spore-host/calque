@@ -3,9 +3,15 @@ invisible (Dict/Queue/NetworkFileSystem/App.include/.deploy) or silently
 MISCATEGORIZED as an unrelated construct (CloudBucketMount used inline as a
 volumes= value used to be indistinguishable from an ordinary Volume mount).
 
-None of these are modeled — this fixture only proves each is now a distinct,
-greppable leak (`where` in helper_leaks) instead of silence or a false
-classification, per calque#91's "tag before you have real usage evidence" plan.
+Dict/Queue and App.include/.deploy stay unmodeled — this fixture proves each
+is a distinct, greppable leak (`where` in helper_leaks) instead of silence or
+a false classification, per calque#91's "tag before you have real usage
+evidence" plan. modal.NetworkFileSystem is DIFFERENT as of Workstream B: its
+from_name(...) binding is now structurally tracked (mirroring Volume's own
+zero-leak-on-just-the-binding posture) — see network_file_system.py for the
+positive (real EFS mount) case. shared_fs below is bound but never used as a
+network_file_systems= mount value, so it emits no leak at all here, same as
+an unused Volume var wouldn't.
 """
 
 import modal
@@ -20,7 +26,8 @@ counters = modal.Dict.from_name("counters", create_if_missing=True)
 # modal.Queue.from_name(...) — same invisibility as Dict.
 work_queue = modal.Queue.from_name("work-queue", create_if_missing=True)
 
-# modal.NetworkFileSystem.from_name(...) — same invisibility.
+# modal.NetworkFileSystem.from_name(...) — structurally tracked (calque#91
+# Workstream B), not leaked merely for existing; never used as a mount here.
 shared_fs = modal.NetworkFileSystem.from_name("shared-fs")
 
 # modal.CloudBucketMount(...) used INLINE as a volumes= value (the real Modal

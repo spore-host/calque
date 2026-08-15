@@ -73,6 +73,14 @@ type SpawnLauncher struct {
 	// as a zero-value default only so existing tests that don't care about
 	// IAM don't need updating, never as an intentional caller choice.
 	IamInstanceProfile string
+	// SecurityGroupIDs attaches one or more EC2 security groups to the
+	// launched instance (calque#91 Workstream B) — e.g. the NFS ingress
+	// group EnsureNFSSecurityGroup (efs.go) resolves for a script with a
+	// real network_file_systems= mount. Empty (the default, every pre-
+	// Workstream-B caller) reproduces prior behavior byte-for-byte: spawn's
+	// own LaunchConfig.SecurityGroupIDs is nil, and spawn creates its own
+	// default security group as it always has.
+	SecurityGroupIDs []string
 	// RunID and Command populate the calque:run-id/calque:command tags
 	// (calque#166) — without these, an interrupted run leaves an instance
 	// discoverable only by launch time/instance type (see
@@ -109,6 +117,7 @@ func (s SpawnLauncher) Build() spawnaws.LaunchConfig {
 		Spot:               s.Spot,               // Spot market: different capacity pool than on-demand
 		SpotMaxPrice:       s.SpotMaxPrice,       // "" => spawn caps at on-demand price
 		IamInstanceProfile: s.IamInstanceProfile, // calque#148: empty => instance has NO S3/AWS credentials at all
+		SecurityGroupIDs:   s.SecurityGroupIDs,   // calque#91 Workstream B: nil => spawn's own default SG (unchanged)
 		Tags:               s.tags(),
 	}
 }

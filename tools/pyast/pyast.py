@@ -142,6 +142,39 @@ def _cloud_bucket_mount(node: ast.Call, leaks: list[dict[str, Any]] | None) -> d
     return {"__cloud_bucket_mount__": {"bucket_name": bucket_name, "key_prefix": key_prefix, "read_only": read_only}}
 
 
+def _network_file_systems_map(node: ast.AST, leaks: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """Extract `network_file_systems={"/mount": nfs_handle}` as
+    {mount_path: nfs_var_name} (calque#91 Workstream B).
+
+    Unlike CloudBucketMount, `network_file_systems=` is Modal's own SEPARATE
+    decorator kwarg — never nested inside `volumes=` — so this is its own
+    small dict-walker rather than a branch inside _volumes_map. The values
+    are bare Name references to a `NetworkFileSystem.from_name(...)`-derived
+    variable (a NetworkFileSystem is always assigned to a variable first,
+    unlike CloudBucketMount's inline-constructor idiom), mirroring
+    _volumes_map's own plain-Name resolution for Volume exactly. Returns
+    None if this isn't a dict we can map.
+    """
+    if not isinstance(node, ast.Dict):
+        return None
+    out: dict[str, Any] = {}
+    for k, v in zip(node.keys, node.values):
+        key = _const_str(k) if k is not None else None
+        if key is None:
+            continue
+        if isinstance(v, ast.Name):
+            out[key] = v.id
+        else:
+            if leaks is not None and isinstance(v, ast.Call):
+                construct = _unsupported_construct_call(_attr_chain(v.func))
+                if construct is not None:
+                    leaks.append(
+                        {"where": construct, "detail": f"{construct}(...) used as a network_file_systems= value, recognized but not modeled (calque#91)", "lineno": getattr(v, "lineno", 0)}
+                    )
+            out[key] = ast.unparse(v)  # e.g. an inline expression we can't structurally resolve
+    return out
+
+
 def _volumes_map(node: ast.AST, leaks: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """Extract `volumes={"/mount": vol_handle}` as {mount_path: volume_var_name}.
 
@@ -302,7 +335,8 @@ def _schedule_marker(node: ast.AST) -> dict[str, Any] | None:
 def _decorator_kwargs(node: ast.AST, leaks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """kwargs of a decorator call. `gpu=`, `timeout=`, `image=`, `volumes=` etc.
     leaks, when supplied, receives calque#91's unsupported-construct tags found
-    while walking volumes= (see _volumes_map)."""
+    while walking volumes= (see _volumes_map) or network_file_systems= (see
+    _network_file_systems_map)."""
     if not isinstance(node, ast.Call):
         return {}
     out: dict[str, Any] = {}
@@ -313,6 +347,13 @@ def _decorator_kwargs(node: ast.AST, leaks: list[dict[str, Any]] | None = None) 
         if kw.arg == "volumes":
             vm = _volumes_map(kw.value, leaks)
             out["volumes"] = vm if vm is not None else _literal(kw.value)
+            continue
+        if kw.arg == "network_file_systems":
+            # calque#91 Workstream B: a SEPARATE decorator kwarg from
+            # volumes= (never nested inside it) — see
+            # _network_file_systems_map's own doc comment.
+            nfsm = _network_file_systems_map(kw.value, leaks)
+            out["network_file_systems"] = nfsm if nfsm is not None else _literal(kw.value)
             continue
         if kw.arg == "image" and isinstance(kw.value, ast.Name):
             # image=image_var — record the referenced var name so IR can resolve it.
@@ -1202,6 +1243,10 @@ class Collector(ast.NodeVisitor):
         self.entrypoints: list[dict[str, Any]] = []
         self.images: dict[str, Any] = {}       # varname -> image chain
         self.volumes: dict[str, Any] = {}       # varname -> {from_name: str, lineno}
+        # network_file_systems mirrors volumes' own shape exactly (calque#91
+        # Workstream B): varname -> {from_name: str, lineno}, populated by
+        # visit_Assign's NetworkFileSystem.from_name(...) branch below.
+        self.network_file_systems: dict[str, Any] = {}
         self.map_calls: list[dict[str, Any]] = []  # every `.map(` occurrence
         self.invoke_calls: list[dict[str, Any]] = []  # §C: starmap/for_each/remote/spawn/map.aio
         self.volume_writes: list[dict[str, Any]] = []  # §E: volume.commit()/reload() call sites
@@ -1317,13 +1362,50 @@ class Collector(ast.NodeVisitor):
             for t in node.targets:
                 if isinstance(t, ast.Name):
                     self.volumes[t.id] = {"from_name": name, "lineno": node.lineno}
-        # calque#91: d = modal.Dict.from_name(...) / q = modal.Queue.from_name(...) /
-        # nfs = modal.NetworkFileSystem.from_name(...) — none of these are Volumes,
-        # but before this branch existed they simply vanished (no visit_Assign
-        # branch matched, so the whole statement fell through generic_visit unseen).
+        # calque#91 Workstream B: nfs = modal.NetworkFileSystem.from_name(...)
+        # is now structurally tracked (self.network_file_systems), mirroring
+        # Volume.from_name's OWN binding above exactly — including its
+        # zero-leak posture: assigning the binding itself is not leak-worthy,
+        # only a genuine mount-recognition failure is (see
+        # _network_file_systems_map). Before this, EVERY from_name of this
+        # construct (used as a real mount or not) hit the generic
+        # "recognized but not modeled" leak below.
+        if isinstance(val, ast.Call) and _attr_chain(val.func)[-2:] == ["NetworkFileSystem", "from_name"]:
+            name = _const_str(val.args[0]) if val.args else None
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    self.network_file_systems[t.id] = {"from_name": name, "lineno": node.lineno}
+            # calque#91 Workstream B: create_if_missing=True asks Modal to
+            # auto-create the filesystem if it doesn't already exist — calque
+            # is bring-your-own EFS only (never auto-creates), so this is a
+            # leak, never a hard failure: the operator just needs to
+            # pre-provision the filesystem (tagged calque:nfs-name=<name>,
+            # see internal/plan/efs.go's DiscoverEFSFilesystem) instead of
+            # relying on Modal's own auto-create.
+            for kw in val.keywords:
+                if kw.arg == "create_if_missing":
+                    try:
+                        v = ast.literal_eval(kw.value)
+                    except (ValueError, SyntaxError):
+                        v = None
+                    if v is True:
+                        self.leaks.append(
+                            {
+                                "where": "modal.NetworkFileSystem(create_if_missing=)",
+                                "detail": f"create_if_missing=True for {name!r} is not supported — calque is bring-your-own EFS only; pre-provision an EFS filesystem tagged calque:nfs-name={name!r} instead (calque#91)",
+                                "lineno": node.lineno,
+                            }
+                        )
+        # calque#91: d = modal.Dict.from_name(...) / q = modal.Queue.from_name(...) —
+        # neither is a Volume nor (as of Workstream B) NetworkFileSystem, so
+        # both still vanished before this branch existed (no visit_Assign
+        # branch matched, so the whole statement fell through generic_visit
+        # unseen). NetworkFileSystem is deliberately excluded here now — its
+        # own branch above already tracks it structurally with no leak,
+        # matching Volume's posture.
         if isinstance(val, ast.Call):
             construct = _unsupported_construct_from_name(_attr_chain(val.func))
-            if construct is not None:
+            if construct is not None and construct != "modal.NetworkFileSystem":
                 self.leaks.append(
                     {"where": construct, "detail": f"{construct}.from_name(...) recognized but not modeled (calque#91)", "lineno": node.lineno}
                 )
@@ -1764,6 +1846,9 @@ def analyze(path: str) -> dict[str, Any]:
         "app_kwargs": c.app_kwargs,
         "images": c.images,
         "volumes": c.volumes,
+        # calque#91 Workstream B: module-level NetworkFileSystem.from_name(...)
+        # vars, keyed by var name — mirrors volumes' own shape exactly.
+        "network_file_systems": c.network_file_systems,
         "functions": c.functions,
         "classes": c.classes,
         "entrypoints": c.entrypoints,

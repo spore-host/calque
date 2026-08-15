@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/efs"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/spore-host/lagotto/pkg/failure"
@@ -146,6 +147,21 @@ func fleetRun(o realOpts, shards int) (err error) {
 			places = append(places, plan.Placement{AZ: f.AZ, Subnet: f.Subnet})
 		}
 	}
+
+	// calque#91 Workstream B: the same real modal.NetworkFileSystem.
+	// from_name(...) wiring realrun.go added (networkFileSystemSpecsForApp)
+	// — every shard shares the SAME resolved mounts/security group (they
+	// all drive the same picked unit's own body), and the fleet-wide
+	// `places` sweep is narrowed to AZs with live EFS mount-target coverage
+	// BEFORE any shard's Acquirer is built, same rationale as realRun's
+	// single-instance wiring. A script with no NetworkFileSystems (the vast
+	// majority) leaves places unchanged and returns no lines/security
+	// groups.
+	fleetNFSMountLines, fleetNFSSecurityGroupIDs, narrowedFleetPlaces, err := networkFileSystemSpecsForApp(ctx, efs.NewFromConfig(cfg), ec2c, app, o.region, places, rep)
+	if err != nil {
+		return fmt.Errorf("resolve network_file_systems: %w", err)
+	}
+	places = narrowedFleetPlaces
 
 	if o.spot {
 		// Honesty (§9/§10): a spot fleet measures K against a SPOT R_a, and any
@@ -392,7 +408,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 				waitForQuotaHeadroom(ctx, cfg, inst, o.region, o.spot, safeRep)
 			}
 			fmt.Fprintf(os.Stderr, "[fleet] shard %d failed (%v); re-driving once on a fresh instance\n", shs[i].ID, shardErrs[i])
-			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep, shardVolumeSync, shardVolumeCommit, shardCloudBucketMountLines, shardCloudBucketMountBuckets)
+			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep, shardVolumeSync, shardVolumeCommit, shardCloudBucketMountLines, shardCloudBucketMountBuckets, fleetNFSMountLines, fleetNFSSecurityGroupIDs)
 			measurements[i], shardErrs[i] = m, serr
 			if serr != nil {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
@@ -593,7 +609,8 @@ const fleetWorkerIdleTimeout = 1 * time.Minute
 // pointer across shards would race on that mutation).
 func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o realOpts,
 	sh calexec.Shard, places []plan.Placement, pricePerHr float64, baseTgt *target.Target, body calexec.ManifestBody, hostMode bool, rep *syncReport,
-	volumeSync, volumeCommit []calexec.VolumeSyncSpec, cloudBucketMountLines, cloudBucketMountBuckets []string) (measure.Measurement, error) {
+	volumeSync, volumeCommit []calexec.VolumeSyncSpec, cloudBucketMountLines, cloudBucketMountBuckets []string,
+	nfsMountLines, nfsSecurityGroupIDs []string) (measure.Measurement, error) {
 	shardLayout := calexec.RunLayout{
 		Bucket: o.bucket, ArtifactPfx: "fleet/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
@@ -606,6 +623,7 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 		ManifestKey: shardLayout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
 		LogKey: shardLayout.LogKey, HostMode: hostMode, ModelEnv: o.model,
 		CloudBucketMountLines: cloudBucketMountLines,
+		NFSMountLines:         nfsMountLines, // calque#91 Workstream B: nil unless the script has a real network_file_systems= mount
 	}
 	// calque#148: see realrun.go's identical fix — without this, the
 	// dedicated fallback instance has no credentials for its own
@@ -622,6 +640,7 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 		IMDSv2HopLimit: 2, RootVolumeGiB: 200,
 		Spot: o.spot, SpotMaxPrice: o.spotMaxPrice,
 		IamInstanceProfile: iamProfile,
+		SecurityGroupIDs:   nfsSecurityGroupIDs, // calque#91 Workstream B: nil unless the script has a real network_file_systems= mount
 		RunID:              o.runID, Command: "fleet",
 	}.Build()
 	acq := &plan.Acquirer{LaunchConfig: launchCfg, Report: rep.rep, Deadline: o.deadline, Placements: places}
