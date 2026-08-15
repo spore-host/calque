@@ -55,7 +55,7 @@ func TestStarmapEndToEndDryRun(t *testing.T) {
 	}
 
 	// checkInvokeSupport must NOT refuse now that real tuple data exists.
-	if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
+	if err := checkInvokeSupport(app.Script, unit.method, rep, false); err != nil {
 		t.Fatalf("checkInvokeSupport must not refuse a .starmap unit with real Items, got: %v", err)
 	}
 

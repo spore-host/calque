@@ -242,7 +242,7 @@ func realRun(o realOpts) (err error) {
 	var dockerfileText string
 	body := calexec.ManifestBody{EnterBody: realEnterBody, MethodBody: realMethodBody, MethodArg: "prompt"}
 	if scriptBody, ok := manifestBodyForUnit(app, unit, rep); ok {
-		if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
+		if err := checkInvokeSupport(app.Script, unit.method, rep, forceStarmap); err != nil {
 			return err
 		}
 		// GPU guard parity with dry-run (run.go's swapLegal check, calque#7/§7):
