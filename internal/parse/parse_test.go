@@ -902,6 +902,40 @@ func TestInvocationKindsPartitionsByEntrypoint(t *testing.T) {
 	}
 }
 
+// TestInvocationKindsClassifiesSpawnCandidatesNotEmptyTarget (calque#189
+// follow-up): a spawn call site with an empty Target but real Candidates
+// (a dict-of-functions Subscript receiver) must classify EVERY candidate
+// as ir.InvokeSpawn — NOT the empty string. Found via an end-to-end test
+// that actually wired Parse->ResolveSpawnCallables->BuildSpawnManifests
+// together (see internal/exec's own TestBuildSpawnManifestsForDictDispatch
+// fixture-driven test): SpawnCallSites' own candidate expansion (the
+// original #189 fix) was necessary but not sufficient — without ALSO
+// fixing invocationKinds here, ResolveSpawnCallables never marks the
+// candidate callable as InvokeSpawn in the first place, so
+// BuildSpawnManifests' byTarget lookup has a call site with nothing to
+// shard against and silently produces ZERO shards. This is the gap
+// BETWEEN two already-individually-tested layers, not a bug inside either
+// one — exactly why an end-to-end test caught it and isolated unit tests
+// on SpawnCallSites alone did not.
+func TestInvocationKindsClassifiesSpawnCandidatesNotEmptyTarget(t *testing.T) {
+	out := pyOut{
+		InvokeCalls: []pyInvokeCall{
+			{Target: "", Kind: "spawn", Candidates: []string{"bundle_a", "bundle_b"}},
+		},
+	}
+	rep := &leak.Report{}
+	whole, _ := invocationKinds(out, "s.py", rep)
+	if whole["bundle_a"] != ir.InvokeSpawn {
+		t.Errorf(`whole["bundle_a"] = %q, want %q`, whole["bundle_a"], ir.InvokeSpawn)
+	}
+	if whole["bundle_b"] != ir.InvokeSpawn {
+		t.Errorf(`whole["bundle_b"] = %q, want %q`, whole["bundle_b"], ir.InvokeSpawn)
+	}
+	if _, ok := whole[""]; ok {
+		t.Errorf(`whole must not classify the empty string as invoked; got %+v`, whole)
+	}
+}
+
 // TestParseEntrypointScopedInvokes (calque#98): the fixture's two entrypoints
 // each invoke a wholly DIFFERENT callable (do_train -> Trainer.train_step via
 // .map(), do_evaluate -> evaluate via .remote()) — app.EntrypointInvokes must

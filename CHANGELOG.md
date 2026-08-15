@@ -11,6 +11,26 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Fixed
 
+- calque#189's fix was necessary but not sufficient: `SpawnCallSites`'
+  candidate expansion made a dict-subscript `.spawn()` call SITE visible,
+  but the candidate callable's own `ir.Function.Invoke` was still never
+  set to `InvokeSpawn` (it stayed the empty string) — `invocationKinds`'
+  `consider()` call for the "spawn" case was still keyed on the empty
+  `ic.Target`, not the candidates. `ResolveSpawnCallables`
+  (`internal/exec/spawnshard.go`) only ever finds a callable whose OWN
+  `Invoke` is `InvokeSpawn`, so a real end-to-end
+  `Parse -> ResolveSpawnCallables -> BuildSpawnManifests` run still
+  produced ZERO shards for a script using this idiom, silently — the exact
+  failure #189 was filed to prevent, one layer deeper. Found by writing a
+  synthesized end-to-end test that actually wires the pipeline together
+  (`cmd/calque/spawn_dict_dispatch_e2e_test.go`) instead of only testing
+  `SpawnCallSites` in isolation — the defect lived in the gap BETWEEN two
+  already-individually-tested layers, invisible to either one's own unit
+  tests. `invocationKinds` now classifies every candidate as `InvokeSpawn`
+  when the call site's `Target` is empty but `Candidates` is populated.
+  Also surfaced (filed separately, not fixed here — a distinct, pre-
+  existing limitation): calque#191, `spawn-run` only ever binds a spawned
+  callable's FIRST positional arg regardless of how many it real has.
 - A `.spawn()` call whose receiver is a Subscript on a module-level
   dict-of-functions selected by a runtime key (e.g. AI-Almanac's
   `forecasts_app.py`'s `SEASON_BUNDLE_FNS[_model_env(model_id)].spawn(...)`)
