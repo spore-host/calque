@@ -11,6 +11,21 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Fixed
 
+- A `.spawn()` call whose receiver is a Subscript on a module-level
+  dict-of-functions selected by a runtime key (e.g. AI-Almanac's
+  `forecasts_app.py`'s `SEASON_BUNDLE_FNS[_model_env(model_id)].spawn(...)`)
+  no longer resolves to an invisible empty target (calque#189) —
+  `_attr_chain` never saw through the Subscript, so `calque spawn-run`'s
+  driver had no callable key to route the call to at all. pyast now tracks
+  every function ever assigned into such a dict via `NAME[<key>] =
+  some_function` (the actual runtime-selected key still isn't resolvable —
+  that's an honest limit, not fixed here), and a `.spawn()` on that dict's
+  Subscript now lists every candidate instead of going silently empty.
+  `SpawnCallSites`/`SpawnCallSitesReport` expand one call site per
+  candidate (same args, since the real selection can't be known), with a
+  leak noting the expansion. Found while investigating whether `calque
+  spawn-run` could drive `forecasts_app.py`'s real `.spawn()` fan-out for
+  real.
 - A picked warm unit with 2+ non-self/cls positional args that ISN'T
   `.starmap()`'d (e.g. a `.spawn()`-invoked function like AI-Almanac's
   `forecasts_app.py`'s `run_forecast_inference(job_id, model_id, config)`)

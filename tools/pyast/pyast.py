@@ -1227,6 +1227,20 @@ class Collector(ast.NodeVisitor):
         # visit_For to expand a `for k, v in THIS_NAME.items(): @app.function(...)`
         # loop into one function+image pair per (key, value).
         self._dict_of_images: dict[str, dict[Any, dict[str, Any]]] = {}
+        # calque#189: varname -> ordered list of function names ever assigned
+        # into it via `NAME[<key>] = some_function`, e.g. AI-Almanac's
+        # forecasts_app.py's `SEASON_BUNDLE_FNS[_env] = run_season_forecast_
+        # bundle` (inside a module-level for-loop, so this assignment's own
+        # subscript key is a LOOP VARIABLE, never a literal — there is no
+        # static way to know which dict entry a later runtime `.spawn()` call
+        # picks). Deliberately NOT keyed by the subscript's own value (that's
+        # exactly the part that isn't statically resolvable here) — this only
+        # answers "what are the POSSIBLE callables this dict could dispatch
+        # to," the candidate-listing fallback a dynamic `.spawn()` receiver
+        # needs (see visit_Call's `attr == "spawn"` branch). Values are
+        # deduped but ORDER-STABLE (first-seen order), matching every other
+        # module-level collection in this file.
+        self._callable_dicts: dict[str, list[str]] = {}
         self.app_name: str | None = None
         # app_kwargs holds App(...)'s own volumes=/secrets= (calque#168) — a
         # function/class that declares neither inherits from here (the same
@@ -1409,6 +1423,21 @@ class Collector(ast.NodeVisitor):
                 self.leaks.append(
                     {"where": construct, "detail": f"{construct}.from_name(...) recognized but not modeled (calque#91)", "lineno": node.lineno}
                 )
+        # calque#189: NAME[<key>] = some_function — a module-level dict
+        # populated by subscript assignment, e.g. AI-Almanac's
+        # forecasts_app.py's `SEASON_BUNDLE_FNS[_env] = run_season_forecast_
+        # bundle` (inside a for-loop, so <key> is a loop variable, never a
+        # literal — see _callable_dicts' own doc comment). Records the RHS
+        # name as a CANDIDATE target for this dict var, regardless of what
+        # the subscript key is; a later `.spawn()` on a Subscript of this
+        # same dict var (visit_Call) lists every candidate collected here,
+        # since the actual runtime key can't be resolved statically.
+        if isinstance(val, ast.Name):
+            for t in node.targets:
+                if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
+                    bucket = self._callable_dicts.setdefault(t.value.id, [])
+                    if val.id not in bucket:
+                        bucket.append(val.id)
         self.generic_visit(node)
 
     # ---- calque#179: module-level `for k, v in D.items(): @app.function(...) def f(...): ...` ----
@@ -1592,15 +1621,35 @@ class Collector(ast.NodeVisitor):
                 # per-call PAYLOAD a real driver sends, not just an app-name
                 # string — a numeric literal like worker.spawn(5) must not
                 # silently collapse to the same None a variable reference gets).
-                self.invoke_calls.append(
-                    {
-                        "target": ".".join(_attr_chain(node.func)[:-1]),
-                        "kind": "spawn",
-                        "lineno": node.lineno,
-                        "args": [_spawn_arg_str(a) for a in node.args],
-                        "entrypoint": self._current_entrypoint,
-                    }
-                )
+                #
+                # calque#189: a real-world .spawn() receiver can be a
+                # SUBSCRIPT on a dict-of-functions selected by a runtime key
+                # (e.g. AI-Almanac's forecasts_app.py's
+                # `SEASON_BUNDLE_FNS[_model_env(model_id)].spawn(...)`) —
+                # _attr_chain only walks Name/Attribute nodes, so node.func
+                # (the Attribute whose .value is a Subscript) resolves to an
+                # EMPTY target, invisible to any driver keyed by target name.
+                # When the subscript's own dict var is a known
+                # _callable_dicts entry, list every candidate collected
+                # there instead of silently going empty — the actual
+                # runtime-selected key still isn't resolved (that's the
+                # honest limit), but a fan-out driver now has SOMETHING to
+                # route to rather than nothing at all.
+                target = ".".join(_attr_chain(node.func)[:-1])
+                candidates = None
+                recv = node.func.value
+                if target == "" and isinstance(recv, ast.Subscript) and isinstance(recv.value, ast.Name):
+                    candidates = self._callable_dicts.get(recv.value.id)
+                ic = {
+                    "target": target,
+                    "kind": "spawn",
+                    "lineno": node.lineno,
+                    "args": [_spawn_arg_str(a) for a in node.args],
+                    "entrypoint": self._current_entrypoint,
+                }
+                if candidates:
+                    ic["candidates"] = candidates
+                self.invoke_calls.append(ic)
             elif attr == "local":
                 # calque#81: .local() runs the callee in the CALLER's own process —
                 # no new container, no serialization boundary. Recorded so the Go

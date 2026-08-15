@@ -272,7 +272,7 @@ func spawnRunFromScript(o spawnOpts, script string) error {
 	if err != nil {
 		return fmt.Errorf("parse: %w", err)
 	}
-	sites, err := parse.SpawnCallSites(ctx, script, runner, runnerArgs...)
+	sites, err := parse.SpawnCallSitesReport(ctx, script, rep, runner, runnerArgs...)
 	if err != nil {
 		return fmt.Errorf("resolve spawn call sites: %w", err)
 	}
