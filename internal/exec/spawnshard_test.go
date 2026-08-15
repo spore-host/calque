@@ -48,6 +48,55 @@ func TestResolveSpawnCallablesFindsOnlySpawnClassified(t *testing.T) {
 	}
 }
 
+// TestResolveSpawnCallablesPopulatesMethodArgsMinusSelfCls (calque#191):
+// a spawn-classified callable with multiple real positional args (e.g.
+// AI-Almanac's forecasts_app.py's run_forecast_inference(job_id, model_id,
+// config)) must carry ALL of them in MethodArgs, with self/cls stripped —
+// before this, only MethodArg (the first name) was ever populated, and
+// runner.py's single-param binding silently dropped the rest on real
+// hardware.
+func TestResolveSpawnCallablesPopulatesMethodArgsMinusSelfCls(t *testing.T) {
+	app := ir.App{
+		Functions: []ir.Function{
+			{Name: "run_forecast_inference", Body: "...", ItemArg: "job_id", Args: []string{"job_id", "model_id", "config"}, Invoke: ir.InvokeSpawn},
+		},
+	}
+	callables := ResolveSpawnCallables(app)
+	if len(callables) != 1 {
+		t.Fatalf("callables = %d, want 1", len(callables))
+	}
+	want := []string{"job_id", "model_id", "config"}
+	if !reflect.DeepEqual(callables[0].MethodArgs, want) {
+		t.Errorf("MethodArgs = %v, want %v", callables[0].MethodArgs, want)
+	}
+}
+
+// TestResolveSpawnCallablesStripsSelfFromClassMethodArgs is the @app.cls
+// sibling of the above: a class method's Args includes "self" (unlike a
+// plain @app.function) — MethodArgs must strip it, since self is bound
+// separately by runner.py's own __calque_method__(self, ...) signature,
+// not part of the splat.
+func TestResolveSpawnCallablesStripsSelfFromClassMethodArgs(t *testing.T) {
+	app := ir.App{
+		Classes: []ir.Class{
+			{
+				Name: "Batcher", EnterBody: "self.model = load()",
+				Methods: []ir.Function{
+					{Name: "generate", Body: "...", ItemArg: "a", Args: []string{"self", "a", "b"}, Invoke: ir.InvokeSpawn},
+				},
+			},
+		},
+	}
+	callables := ResolveSpawnCallables(app)
+	if len(callables) != 1 {
+		t.Fatalf("callables = %d, want 1", len(callables))
+	}
+	want := []string{"a", "b"}
+	if !reflect.DeepEqual(callables[0].MethodArgs, want) {
+		t.Errorf("MethodArgs = %v, want %v (self must be stripped)", callables[0].MethodArgs, want)
+	}
+}
+
 // TestResolveSpawnCallablesHandlesClasses proves an @app.cls's spawn-
 // classified method resolves with the CLASS's EnterBody (once-per-container
 // load) plus that specific method's own Body — mirroring how pickWarmUnit

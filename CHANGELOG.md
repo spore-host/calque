@@ -11,6 +11,24 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Fixed
 
+- `calque spawn-run` now binds EVERY real positional arg of a spawned
+  callable, not just the first (calque#191) — `SpawnCallable.MethodArg`
+  only ever carried the FIRST non-self/cls parameter name, so a callable
+  like AI-Almanac's `forecasts_app.py`'s `run_forecast_inference(job_id,
+  model_id, config)` would build a real shard (once calque#189's target-
+  resolution fix landed) but silently leave `model_id`/`config` undefined
+  inside the worker — the same class of arity gap calque#187 fixed for
+  `run`/`real`/`fleetrun`, but `spawn-run`'s own separate driver had no
+  equivalent. New `SpawnCallable.MethodArgs` carries the full non-self/cls
+  arg list; `spawnManifestBody` (`cmd/calque/spawnrun.go`) now routes a
+  2+-arg callable through the SAME `Starmap`/`MethodArgs` splat mechanism
+  `.starmap()` already uses in `runner.py` — `spawnArgsPayload`
+  (`internal/exec/spawnshard.go`) was already building the right list
+  payload, nothing downstream consumed it as a splat until now. A
+  single-arg callable (the common case) is byte-for-byte unchanged.
+  Verified via a real subprocess execution test asserting both args'
+  actual bound values (`TestSpawnDictDispatchMultiArgBindingEndToEnd`),
+  not just manifest-field inspection.
 - calque#189's fix was necessary but not sufficient: `SpawnCallSites`'
   candidate expansion made a dict-subscript `.spawn()` call SITE visible,
   but the candidate callable's own `ir.Function.Invoke` was still never

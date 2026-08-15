@@ -10,6 +10,7 @@ import (
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/parse"
+	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
 // TestSpawnDictDispatchEndToEndProducesRealShards is the end-to-end
@@ -72,6 +73,19 @@ func TestSpawnDictDispatchEndToEndProducesRealShards(t *testing.T) {
 	if len(callables) != 1 || callables[0].Key != "bundle" {
 		t.Fatalf("ResolveSpawnCallables = %+v, want exactly one callable keyed \"bundle\"", callables)
 	}
+	// calque#191: bundle(job_id, config) takes 2 real args — MethodArgs
+	// must carry BOTH names, not just MethodArg's first-arg-only "job_id",
+	// or runSpawnShard has nothing to splat against and silently drops
+	// "config" on real hardware.
+	if want := []string{"job_id", "config"}; len(callables[0].MethodArgs) != len(want) {
+		t.Errorf("callables[0].MethodArgs = %v, want %v", callables[0].MethodArgs, want)
+	} else {
+		for i, a := range want {
+			if callables[0].MethodArgs[i] != a {
+				t.Errorf("callables[0].MethodArgs[%d] = %q, want %q", i, callables[0].MethodArgs[i], a)
+			}
+		}
+	}
 
 	sites, err := parse.SpawnCallSitesReport(ctx, script, rep, runner, args...)
 	if err != nil {
@@ -91,5 +105,87 @@ func TestSpawnDictDispatchEndToEndProducesRealShards(t *testing.T) {
 	}
 	if shards[0].Key != "bundle" {
 		t.Errorf("shards[0].Key = %q, want %q", shards[0].Key, "bundle")
+	}
+}
+
+// TestSpawnDictDispatchMultiArgBindingEndToEnd (calque#191) is the
+// strongest available proof for the actual arg-binding fix: it drives
+// bundle(job_id, config) — the SAME callable/fixture as the test above —
+// through the REAL warm supervisor + runner.py subprocess (not just
+// inspecting the built ManifestBody's fields) and asserts the ACTUAL
+// RETURNED VALUES for BOTH job_id and config are correct. Before #191,
+// runSpawnShard's manifest carried only MethodArg="job_id" with no
+// Starmap/MethodArgs — config would have compiled into
+// __calque_method__'s signature as undefined, a real NameError on real
+// hardware. This proves the fix the same way TestStarmapEndToEndDryRun
+// proves .starmap()'s own splat: real subprocess, real computed result.
+func TestSpawnDictDispatchMultiArgBindingEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Skip("uv not on PATH; skipping pyast contract test")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; skipping warm-runner subprocess test")
+	}
+	setPyastDirEnv(t)
+	script, err := filepath.Abs("../../testdata/scripts/spawn_dict_dispatch.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	rep := &leak.Report{}
+	runner, args := parse.DefaultRunner(pyastDir())
+
+	app, err := parse.Parse(ctx, script, rep, runner, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	callables := calexec.ResolveSpawnCallables(app)
+	if len(callables) != 1 {
+		t.Fatalf("callables = %+v, want exactly 1", callables)
+	}
+	callable := callables[0]
+
+	body := spawnManifestBody(callable)
+	if !body.Starmap || len(body.MethodArgs) != 2 {
+		t.Fatalf("spawnManifestBody(%+v) = %+v, want Starmap=true with 2 MethodArgs", callable, body)
+	}
+
+	runnerPy, err := filepath.Abs("../../worker/warm-runner/runner.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := warm.NewMemSink()
+	sup := &warm.Supervisor{
+		Python: uvPythonArgv(nil),
+		Script: runnerPy,
+		Sink:   sink,
+		Config: warm.Config{
+			EnterBody: body.EnterBody, MethodBody: body.MethodBody,
+			MethodArg: body.MethodArg, MethodArgs: body.MethodArgs, Starmap: body.Starmap,
+		},
+	}
+	// One real spawn call site's args: job_id="real-job-42", config="cfg-abc".
+	items := []warm.Item{{Index: 0, Payload: []any{"real-job-42", "cfg-abc"}}}
+	failed, err := sup.Run(ctx, items)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %v, want none — a multi-arg spawn callable must not NameError on its own real args", failed)
+	}
+	results := sink.Results()
+	r, ok := results[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	got, ok := r.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("result = %v (%T), want a dict with job_id/config", r.Result, r.Result)
+	}
+	if got["job_id"] != "real-job-42" {
+		t.Errorf(`result["job_id"] = %v, want "real-job-42"`, got["job_id"])
+	}
+	if got["config"] != "cfg-abc" {
+		t.Errorf(`result["config"] = %v, want "cfg-abc" — THIS is the calque#191 regression: before the fix, config was never bound at all`, got["config"])
 	}
 }

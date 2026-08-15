@@ -23,7 +23,11 @@ for _env in ("a", "b"):
 
     @app.function(name=f"bundle_{_env}")
     def bundle(job_id, config):
-        return {"job_id": job_id}
+        # Returns BOTH args (not just job_id) so a real end-to-end test can
+        # prove config bound correctly too — calque#191 found that only
+        # MethodArg (the FIRST non-self/cls name) was ever populated for a
+        # spawned callable, silently leaving every arg past it undefined.
+        return {"job_id": job_id, "config": config}
 
     REGISTRY[_env] = bundle
 
