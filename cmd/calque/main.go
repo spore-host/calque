@@ -74,6 +74,15 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "ami":
+		if len(os.Args) < 3 {
+			usage()
+			os.Exit(2)
+		}
+		if err := amiCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	case "spawn-run":
 		if err := spawnRunCmd(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -410,6 +419,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque real --bucket B --run-id ID [--ami AMI] [--instance g6.2xlarge] [--model ...] [--n 1] [--shards 1] [--pool] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque ramp --bucket B --run-id ID [--ami AMI] [--instance g7e.2xlarge] [--rungs 1,100,1000] [--fallback-regions us-west-2,eu-central-1] --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque pool create --model M --instance-type T --manifest-bucket B --results-bucket B --runner-path P [--workers N] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque ami bake --bucket B --run-id ID --name NAME [--image vllm/vllm-openai:latest] [--ami AMI] [--instance g6.2xlarge] --i-understand-this-spends-money")
+	fmt.Fprintln(os.Stderr, "  calque ami list [--region R]")
+	fmt.Fprintln(os.Stderr, "  calque ami delete <ami-id> [--region R] --i-understand-this-deletes-the-ami")
 	fmt.Fprintln(os.Stderr, "  calque spawn-run --bucket B --run-id ID --ami AMI [--instance m7i.large] <script.py> --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque session <checkout|checkin|status|list> ... (institutional MIG/MPS slice check-out/check-in, docs/tenancy-vs-session.md)")
 	fmt.Fprintln(os.Stderr, "  calque version")
