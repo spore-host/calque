@@ -9,11 +9,30 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-15
+
+22 commits since v0.5.0 (folding in the changes originally staged under an
+untagged `[0.5.1]` section below, which never got its own git tag — see that
+section's own note). Minor bump: three real construct-mapping features
+(on-instance Dockerfile build for a layered `--script` image, curated
+GPU card-swap substitution, and closing calque#91's `modal.CloudBucketMount`
+Workstream A / `modal.NetworkFileSystem` Workstream B into real S3/EFS
+mounts), a new `calque ami bake/list/delete` opt-in AMI-prebake path, and a
+quota-headroom-polling correctness fix are more than housekeeping.
+
+Also fixes a real doc-drift gap caught by this release's own pre-tag
+checklist (`CONTRIBUTING.md` "Before tagging a release"): `docs/guide/
+getting-started.md`'s IAM policy JSON snippet said `RealRunPolicy` "grants
+exactly" two S3 statements — stale since calque#176 (ECR pull permissions,
+shipped before v0.5.0's own tag but never reflected here) and calque#91
+Workstream A (per-script `CloudBucketMount` bucket grants, this release).
+Fixed to describe the real, current statement set.
+
 ### Added
 
 - Real `modal.NetworkFileSystem` → EFS mount support (calque#91 Workstream
   B), the second real-mapping workstream calque#91 was tracking (Workstream
-  A, `modal.CloudBucketMount` → S3, shipped in v0.5.1). A real
+  A, `modal.CloudBucketMount` → S3, this same release — see below). A real
   `NetworkFileSystem.from_name(name)` used as a
   `network_file_systems={mount: nfs}` value (a SEPARATE decorator kwarg
   from `volumes=`, never nested inside it) now resolves to a real EFS-over-
@@ -27,6 +46,17 @@ per [semver.org](https://semver.org/#spec-item-4).
   (`elasticfilesystem:ClientMount`/`ClientWrite`) is explicitly out of
   scope for this pass. `modal.Dict`/`Queue`/`App.include` remain
   deliberately leak-only, out of scope.
+- Real `modal.CloudBucketMount` → S3 mount support (calque#91 Workstream
+  A): a real `CloudBucketMount(bucket_name, key_prefix=, read_only=)` used
+  INLINE as a `volumes=` value (the real Modal idiom — constructed
+  directly in the dict, not assigned to a variable first) resolves to a
+  real `mountpoint-s3` mount against the SCRIPT'S OWN S3 bucket, spliced
+  into the bootstrap script before `@enter` runs. The instance role gains
+  read/write/list access to that bucket specifically, separate from
+  calque's own `--bucket` staging area. `secret=`/`bucket_endpoint_url=`/
+  `requester_pays=`/`force_path_style=` are each leaked distinctly as
+  unhonored — mounting is against AWS S3 with default settings only,
+  authenticated via the instance's own IAM role.
 - New `calque ami bake`/`ami list`/`ami delete` subcommands (calque#144)
   pre-bake a custom AMI with a docker image's layers already pulled, so
   `real`/`ramp`/`fleetrun`/`spawn-run`'s bootstrap no longer pays a fresh
@@ -42,7 +72,9 @@ per [semver.org](https://semver.org/#spec-item-4).
   INSTANCE (calque#177) instead of falling back to a hand-typed
   `--pip`/`--stage-file` substitute — no ECR round-trip, no ambient
   Docker requirement on the caller's machine, no second/throwaway
-  instance.
+  instance. A bare, unlayered `from_registry`/`from_aws_ecr` reference
+  (calque#176) still just `docker pull`s the exact ref, authenticating via
+  `aws ecr get-login-password` for ECR hostnames.
 - `calque real`'s new `--allow-card-swap` flag (calque#178) opts into a
   curated, real-hardware-verified table of GPU substitutions (e.g. for a
   card AWS has no matching single-GPU instance for at all) — off by
@@ -70,6 +102,16 @@ per [semver.org](https://semver.org/#spec-item-4).
   hatch as before. `calque real`'s host-mode bootstrap similarly always
   provisions a `uv`-managed venv now, even with no `--pip` packages —
   the AMI's own `apt-get`/`dnf install python3` fallback is gone.
+- `@modal.batched(...)` now gets a distinguishable `modal.batched` leak
+  (calque#91) instead of falling through unnoticed — the function still
+  runs, just without Modal's request-coalescing behavior. Real batching
+  execution remains out of scope (rare, ~2/212 files in modal-examples).
+- A zero-arg, undecorated, control-flow-free factory function returning a
+  single `modal.Image` chain (calque#175) now resolves that chain instead
+  of silently falling back to the app-wide default — closes the base
+  case AI-Almanac's `blending_app.py` hit (`def _image(): return
+  modal.Image.debian_slim()...`). A branching or argument-taking factory
+  still correctly leaks, not silently resolves.
 
 ### Fixed
 
@@ -84,8 +126,44 @@ per [semver.org](https://semver.org/#spec-item-4).
   wall. Falls back to one fixed-duration sleep if the quota poll itself
   fails, matching #141's own "don't block on a failed quota check"
   principle.
+- `--pip` with a git-URL package spec no longer fails with `Git
+  executable not found` on Amazon Linux 2023 (calque's non-GPU
+  auto-selected AMI) — the bootstrap script now ensures `git` is present
+  (apt-get first, dnf fallback) before any `uv pip install` step whenever
+  `--pip` is used.
+- An `add_local_file(...)` call whose source arg isn't a string literal
+  (calque#180) no longer drops that argument from the positional args list
+  entirely — it previously turned a 2-arg (source, dest) call into a
+  1-arg list, which `internal/image.localCopyArgs` misread as "dest
+  only," rendering a mangled double-path `COPY` line. Now preserved as an
+  explicit `<<unresolved>>` placeholder for `add_local_*`/`copy_local_*`
+  calls specifically, so a real build fails loudly on an obviously-broken
+  path instead of silently copying the wrong file to the wrong place.
+- `docs/guide/getting-started.md`'s IAM policy JSON snippet was stale
+  (see the entry summary above) — fixed to describe the real, current
+  ECR + per-script-bucket statement set `RealRunPolicy` grants.
+
+### Documentation
+
+- Audited `docs/guide/{getting-started,which-verb,cli-reference,
+  troubleshooting}.md`, root `README.md`'s CLI section, `docs/README.md`,
+  and `docs/modal-compatibility-matrix.md` against current CLI/parser
+  source (calque#149): fixed `cli-reference.md`'s missing
+  `--allow-card-swap` row and stale `--instance` default claim, and the
+  compatibility matrix's stale `modal.Cron`/`modal.Period` object-form
+  rows (already recognized structurally, just not reflected in the
+  table).
+- `docs/behind-the-seam-register.md`'s spawn#353 container-primitive
+  thread updated: spawn shipped the primitive as of v0.100.0 (calque's
+  current dependency) — the real remaining blocker is one seam deeper, in
+  lagotto's `snipe.Options` shape, not spawn's own readiness.
 
 ## [0.5.1] - 2026-08-14
+
+Note: this section was written (commit `884634f`) before the git tag was
+ever created — no `v0.5.1` tag exists. These changes are covered by the
+`v0.6.0` tag above instead; kept here as an accurate historical record of
+what was staged at the time.
 
 ### Documentation
 - Add `CITATION.cff` — calque's Zenodo GitHub integration is now enabled, and

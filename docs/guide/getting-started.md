@@ -1,6 +1,6 @@
 # Getting started
 
-**Status:** Authoritative current behavior. Verified through: v0.4.0.
+**Status:** Authoritative current behavior. Verified through: v0.6.0.
 
 This walks from a fresh clone to your first REAL, billable AWS run — the path
 [`examples/README.md`](../../examples/README.md) deliberately stops short of
@@ -32,21 +32,32 @@ Two different things need permissions, and they're easy to conflate:
    above explicitly.
 2. **The EC2 instance itself** gets a SEPARATE, narrower role that calque
    creates and manages for you — you never need to hand-write this one.
-   `internal/plan/iam.go`'s `RealRunPolicy` grants exactly:
+   `internal/plan/iam.go`'s `RealRunPolicy` grants:
    ```json
    {
      "Version": "2012-10-17",
      "Statement": [
        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": ["arn:aws:s3:::YOUR-BUCKET/*"]},
-       {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketLocation"], "Resource": ["arn:aws:s3:::YOUR-BUCKET"]}
+       {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketLocation"], "Resource": ["arn:aws:s3:::YOUR-BUCKET"]},
+       {"Effect": "Allow", "Action": ["ecr:GetAuthorizationToken"], "Resource": ["*"]},
+       {"Effect": "Allow", "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"], "Resource": ["arn:aws:ecr:REGION:ACCOUNT:repository/*"]}
      ]
    }
    ```
-   scoped to the ONE bucket you passed via `--bucket` — nothing
-   account-wide. Additionally, `AmazonSSMManagedInstanceCore` is attached
-   automatically (needed so spawn's own acquisition/liveness machinery can
-   reach the instance) — this is spawn's convention, not something calque
-   adds on top.
+   The S3 statements are scoped to the ONE bucket you passed via `--bucket`
+   — nothing account-wide. The ECR statements (calque#176) are granted
+   unconditionally, not just when a given run's script actually pulls a
+   registry image, since the role is reused across every future run
+   against this bucket rather than recreated per run;
+   `ecr:GetAuthorizationToken` can't be resource-scoped at all (AWS
+   requires `Resource: "*"` for that specific action). If your script uses
+   an inline `modal.CloudBucketMount(...)` (calque#91 Workstream A), the
+   role ALSO gets the same S3 read/write/list statements — scoped to that
+   mount's own bucket, separate from your `--bucket` staging area — added
+   automatically per script, not something you configure. Additionally,
+   `AmazonSSMManagedInstanceCore` is attached automatically (needed so
+   spawn's own acquisition/liveness machinery can reach the instance) —
+   this is spawn's convention, not something calque adds on top.
 
 ### What does calque actually create in my AWS account?
 

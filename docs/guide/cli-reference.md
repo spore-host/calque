@@ -1,6 +1,6 @@
 # CLI reference
 
-**Status:** Authoritative current behavior. Verified through: v0.5.0.
+**Status:** Authoritative current behavior. Verified through: v0.6.0.
 
 Every flag calque's CLI accepts, sourced directly from the `flag.NewFlagSet`
 calls in `cmd/calque/*.go` (mainly `main.go`, `smoke.go`, `ramp.go`,

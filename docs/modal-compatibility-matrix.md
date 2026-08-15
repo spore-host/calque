@@ -1,6 +1,6 @@
 # Modal compatibility matrix
 
-**Status:** Authoritative current behavior. Verified through: v0.5.0.
+**Status:** Authoritative current behavior. Verified through: v0.6.0.
 calque's goal is broad enough Modal-idiom mimicry that real Modal code
 ports to AWS **unchanged**. This document is the single most direct
 answer to "does calque support my script."
