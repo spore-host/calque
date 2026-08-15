@@ -8,6 +8,12 @@ answer to "does calque support my script."
 **Provenance:**
 - Verified against calque v0.5.0 (2026-08-14) — updated the App-level
   defaults row for calque#174 (image= per-function resolution fix).
+  Also fixed the §H `modal.Cron`/`modal.Period` rows (calque#149 doc
+  audit pass): they had claimed the object forms were entirely
+  unrecognized (⬜), which was stale — `tools/pyast/pyast.py`'s
+  `_schedule_marker` and `internal/parse/parse.go`'s
+  `decodeScheduleMarker` already recognize both structurally (calque#91),
+  same "recorded but not honored" posture as the bare-string form.
   Content otherwise last verified at commit `19b4a1a` (2026-08-12); the
   tracking-column re-check for #97/#98/#168 happened at v0.4.0
   (2026-08-13).
@@ -96,7 +102,7 @@ real gap — should not stay this way) · ⬜ not present at all.
 | `memory=` (plain int MB or tuple) | MiB; tuple limit is a **hard OOM-kill** ceiling (different failure mode than CPU's throttle). | 🔥 | ✅ recorded+leaked correctly. | Same sizing-deferred caveat as `cpu=`. | — |
 | `retries=` (plain int or `modal.Retries(...)`) | Per-input retry cap; plain int = fixed delay, object = exponential backoff. | ⚪ | ✅ (plain int) wired into the warm supervisor's crash-restart cap — a genuine reliability knob that's honored. `Retries(...)` object form: recognized+leaked (falls back to default cap). | Exponential-backoff semantics not reproduced even when leaked — acceptable per behind-the-seam scope. | — |
 | `secrets=` | List of `Secret` objects, injected as env vars in list order (later overrides earlier on key clash). | 🔥 | 🟨 declared names recorded, NOT resolved from Modal's own secret store — see §K for the `--secret NAME=VALUE` escape hatch (calque#150) that lets a caller supply the same values directly. | See §K. | — |
-| `schedule=` (bare cron string) | — | ⚪ | 🟨 recorded, not honored, leaked. | See §H — the *object* forms (`modal.Cron`/`modal.Period`) aren't recognized at all, only a bare string kwarg. | [#91](https://github.com/spore-host/calque/issues/91) |
+| `schedule=` (bare cron string) | — | ⚪ | 🟨 recorded, not honored, leaked. | See §H — the *object* forms (`modal.Cron`/`modal.Period`) are ALSO now recognized structurally (calque#91), not just the bare string. | [#91](https://github.com/spore-host/calque/issues/91) |
 | `region=` / `cloud=` | Placement hints. | ⚪ | 🟨 both recorded+leaked (`cloud=` fixed 2026-08-07, calque#91 — mirrors `region=`'s pattern exactly: `ir.Config.Cloud`, dedicated "recorded but NOT honored" leak). | calque always targets AWS regardless of `cloud=`'s value — recorded for visibility, not acted on (a script requesting GCP/OCI isn't rejected, just silently run against AWS anyway, same posture as every other portable-but-unhonored kwarg). | closed |
 | Autoscaling kwargs, old spellings: `concurrency_limit`, `allow_concurrent_inputs`, `min_containers`, `max_containers`, `keep_warm`, `container_idle_timeout` | Warm-pool/scaling config. | 🟡 | 🟨 explicit named set (`autoscalingKwargs` in `internal/parse/parse.go`), each gets a dedicated "behind the seam" leak. | — | — |
 | Autoscaling kwargs, **current spellings**: `min_containers` (was `keep_warm`), `max_containers` (was `concurrency_limit`), `scaledown_window` (was `container_idle_timeout`), `buffer_containers` | Same knobs, renamed at Modal 1.0 (v0.73.76). | 🟡 (real scripts will use EITHER era depending on when they were written) | ✅ (fixed 2026-08-07, calque#82) `scaledown_window`/`buffer_containers` added to `autoscalingKwargs`; `min_containers`/`max_containers` were already present from an earlier pass. | — | closed |
@@ -171,8 +177,8 @@ real gap — should not stay this way) · ⬜ not present at all.
 | Construct | Modal semantics | Frequency | calque status | Behavior difference / risk | Tracking |
 |---|---|---|---|---|---|
 | `schedule=` bare string kwarg | — | ⚪ | 🟨 recorded, leaked as unhonored (no scheduler in the spike). | — | — |
-| `modal.Cron(cron_string, timezone=None)` | Standard 5-field cron; requires the app to be **deployed** to activate (no effect on ephemeral runs). | ⚪ (~5% of files; when present, OFTEN the entire app — e.g. earth-mover/forecast-datacube-demo uses only plain functions + Cron) | ⬜ Not recognized as a distinct construct — only the bare-string `schedule=` kwarg case is handled, and `modal.Cron(...)` is a call expression, not a literal, so it likely falls into the "unmodeled decorator arg" fallback rather than the dedicated `schedule=` leak. | Real scheduled-pipeline apps (a real, recurring shape per Pass 3) get a worse leak than intended. | [#91](https://github.com/spore-host/calque/issues/91) |
-| `modal.Period(days=, hours=, ...)` | Fixed-interval, **deployment-anchored, not wall-clock-anchored** — resets on every redeploy. | 🧊 | ⬜ same gap as `modal.Cron`. | — | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.Cron(cron_string, timezone=None)` | Standard 5-field cron; requires the app to be **deployed** to activate (no effect on ephemeral runs). | ⚪ (~5% of files; when present, OFTEN the entire app — e.g. earth-mover/forecast-datacube-demo uses only plain functions + Cron) | 🟨 (fixed calque#91) recognized structurally via pyast's `_schedule_marker` (the object-call form is matched by trailing attribute name, `Cron`/`Period`, rather than falling through to a generic literal-eval) and decoded by `decodeScheduleMarker` — the cron string (first positional arg) becomes `ir.Config.Schedule` verbatim, `timezone=` is discarded. Recorded, not honored (no scheduler in the spike) — same "recorded but NOT honored" leak as the bare-string `schedule=` case above, plus a suffix noting it was recognized from the object form. | Same behavior gap as the bare-string case: no scheduler exists in the spike, so nothing actually fires on a cron cadence. | [#91](https://github.com/spore-host/calque/issues/91) (recognition landed; execution remains out of scope) |
+| `modal.Period(days=, hours=, ...)` | Fixed-interval, **deployment-anchored, not wall-clock-anchored** — resets on every redeploy. | 🧊 | 🟨 (fixed calque#91) same recognition path as `modal.Cron` above — `days=`/`hours=`/`minutes=`/`seconds=` kwargs are summed (Modal itself combines any subset) into one normalized `<n>d<n>h<n>m<n>s` string, recorded but NOT honored. | Same as `modal.Cron` above. | [#91](https://github.com/spore-host/calque/issues/91) (recognition landed; execution remains out of scope) |
 
 ---
 
@@ -305,9 +311,12 @@ a generic "unmodeled arg" message.
     selects — call-site-to-entrypoint attribution shipped and is
     live-verified end-to-end — [#98](https://github.com/spore-host/calque/issues/98)
     (closed).
-12. Lower-priority/rare: `modal.Dict`/`Queue`, `@modal.batched`,
-    `modal.NetworkFileSystem`, `modal.CloudBucketMount`, `modal.Cron`/`Period`
-    object forms, `cloud=`, `App.include`/`.deploy`/`.run` lifecycle nuances.
+12. Lower-priority/rare, still open: `modal.Dict`/`Queue`,
+    `@modal.batched`, `modal.NetworkFileSystem`, `modal.CloudBucketMount`,
+    `App.include`/`.deploy`/`.run` lifecycle nuances. (`cloud=` closed
+    separately, calque#91's own §C fix; `modal.Cron`/`Period` object-form
+    *recognition* also closed under calque#91 — see §H — though actually
+    executing on a schedule remains out of scope.)
     [#91](https://github.com/spore-host/calque/issues/91)
 
 Not individually filed (genuinely low-priority/narrow; revisit if real usage
