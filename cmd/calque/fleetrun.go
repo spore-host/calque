@@ -247,6 +247,18 @@ func fleetRun(o realOpts, shards int) (err error) {
 	// shard shares the SAME resolved mounts, since they all drive the
 	// same picked unit's own body. Computed once, outside the loop.
 	shardVolumeSync, shardVolumeCommit := volumeSpecsForApp(app, o.bucket, rep)
+	// calque#91 Workstream A: the same real modal.CloudBucketMount(...)
+	// wiring realrun.go added — see cloudBucketMountSpecsForApp's doc
+	// comment. Every shard shares the SAME resolved mounts (they all drive
+	// the same picked unit's own body), passed into runShard's own
+	// BootstrapConfig/IAM setup below (D4's dedicated-fallback-instance
+	// path). NOTE: unlike VolumeSync/VolumeCommit, this does NOT currently
+	// reach the D2 shared-worker-pool path (ProvisionFleetWorkers/
+	// buildFleetWorkerBootstrapCommand, internal/pool/fleet_provision.go) —
+	// that path builds its own bootstrap script independent of
+	// calexec.BootstrapConfig and, same as this pre-existing Volume
+	// plumbing, has no CloudBucketMount mounting either; out of scope here.
+	shardCloudBucketMountLines, shardCloudBucketMountBuckets := cloudBucketMountSpecsForApp(app, rep)
 	var wg sync.WaitGroup
 	for i := range shs {
 		if err := calexec.WriteManifestBody(ctx, s3c, calexec.RunLayout{
@@ -380,7 +392,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 				waitForQuotaHeadroom(ctx, cfg, inst, o.region, o.spot, safeRep)
 			}
 			fmt.Fprintf(os.Stderr, "[fleet] shard %d failed (%v); re-driving once on a fresh instance\n", shs[i].ID, shardErrs[i])
-			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep, shardVolumeSync, shardVolumeCommit)
+			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep, shardVolumeSync, shardVolumeCommit, shardCloudBucketMountLines, shardCloudBucketMountBuckets)
 			measurements[i], shardErrs[i] = m, serr
 			if serr != nil {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, o.model, 0,
@@ -581,7 +593,7 @@ const fleetWorkerIdleTimeout = 1 * time.Minute
 // pointer across shards would race on that mutation).
 func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o realOpts,
 	sh calexec.Shard, places []plan.Placement, pricePerHr float64, baseTgt *target.Target, body calexec.ManifestBody, hostMode bool, rep *syncReport,
-	volumeSync, volumeCommit []calexec.VolumeSyncSpec) (measure.Measurement, error) {
+	volumeSync, volumeCommit []calexec.VolumeSyncSpec, cloudBucketMountLines, cloudBucketMountBuckets []string) (measure.Measurement, error) {
 	shardLayout := calexec.RunLayout{
 		Bucket: o.bucket, ArtifactPfx: "fleet/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
@@ -593,11 +605,14 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 		BaseImage: "vllm/vllm-openai:latest", Bucket: o.bucket, ArtifactPrefix: shardLayout.ArtifactPfx,
 		ManifestKey: shardLayout.ManifestKey, WorkerDir: hostWorkerDir, Region: o.region,
 		LogKey: shardLayout.LogKey, HostMode: hostMode, ModelEnv: o.model,
+		CloudBucketMountLines: cloudBucketMountLines,
 	}
 	// calque#148: see realrun.go's identical fix — without this, the
 	// dedicated fallback instance has no credentials for its own
 	// bootstrap's aws s3 cp/sync calls, including its own failure log.
-	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket)
+	// calque#91 Workstream A: also grants access to the script's OWN
+	// CloudBucketMount bucket(s), if any (cloudBucketMountBuckets).
+	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket, cloudBucketMountBuckets...)
 	if err != nil {
 		return measure.Measurement{}, fmt.Errorf("shard %d set up IAM instance profile: %w", sh.ID, err)
 	}

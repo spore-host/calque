@@ -187,6 +187,16 @@ type Config struct {
 	Cloud    string // cloud= ("aws"/"gcp"/"oci"/"auto"); recorded, not honored (calque#91)
 }
 
+// CloudBucketMount is one modal.CloudBucketMount(...) used inline as a
+// volumes= value (calque#91) — mounts the USER'S OWN S3 bucket directly
+// via mountpoint-s3, not calque's own --bucket staging area the way an
+// ordinary Volume does.
+type CloudBucketMount struct {
+	BucketName string
+	KeyPrefix  string
+	ReadOnly   bool
+}
+
 // Function is an @app.function (or, when embedded in a Class, an @method).
 type Function struct {
 	Name string
@@ -197,17 +207,24 @@ type Function struct {
 	// ONE globally-picked image (App.Image) regardless of which image=
 	// var it actually referenced — a function with its OWN explicit
 	// image= could silently get a DIFFERENT function's image.
-	Image     Image
-	GPU       string            // raw from source, e.g. "H100" or "A100:8" — guarded/rewritten in §7
-	Volumes   map[string]string // mount path -> Modal volume name (from_name)
-	Timeout   int               // seconds; 0 if unset
-	Config    Config            // portable decorator config (cpu/memory/retries/secrets/schedule/region)
-	IsMap     bool              // is this callable's .map() invoked anywhere in the script?
-	Invoke    InvokeKind        // how the callable is invoked (map/starmap/for_each/remote); §C
-	EntryKind EntryKind         // execution shape: batch (default) or serve (§F)
-	Body      string            // verbatim payload, shipped to the worker
-	Args      []string          // verbatim parameter names, incl. self/cls (calque#92: needed to reconstruct a .local()-referenced sibling's call signature)
-	ItemArg   string            // first non-self parameter name — the per-item arg the warm runner binds
+	Image   Image
+	GPU     string            // raw from source, e.g. "H100" or "A100:8" — guarded/rewritten in §7
+	Volumes map[string]string // mount path -> Modal volume name (from_name)
+	// CloudBucketMounts is every modal.CloudBucketMount(...) used INLINE as a
+	// volumes= value on this callable (calque#91 Workstream A) — mounts the
+	// USER'S OWN S3 bucket directly via mountpoint-s3, not calque's own
+	// --bucket staging area the way an ordinary Volume mount is. Keyed by
+	// mount path, disjoint from Volumes above (a given mount path is either
+	// an ordinary Volume or a CloudBucketMount, never both).
+	CloudBucketMounts map[string]CloudBucketMount
+	Timeout           int        // seconds; 0 if unset
+	Config            Config     // portable decorator config (cpu/memory/retries/secrets/schedule/region)
+	IsMap             bool       // is this callable's .map() invoked anywhere in the script?
+	Invoke            InvokeKind // how the callable is invoked (map/starmap/for_each/remote); §C
+	EntryKind         EntryKind  // execution shape: batch (default) or serve (§F)
+	Body              string     // verbatim payload, shipped to the worker
+	Args              []string   // verbatim parameter names, incl. self/cls (calque#92: needed to reconstruct a .local()-referenced sibling's call signature)
+	ItemArg           string     // first non-self parameter name — the per-item arg the warm runner binds
 	// LocalCalls are the leaf names of sibling callables THIS function's own
 	// body references via .local() (calque#92) — a property of the body, not
 	// of how this function itself is invoked (distinct from Invoke/IsMap).
@@ -271,14 +288,17 @@ type Class struct {
 	// Image is THIS class's own resolved image (calque#174) — see
 	// Function.Image's doc comment; the same App->class->method
 	// resolution chain gpu=/volumes= already used is extended to image=.
-	Image     Image
-	GPU       string
-	Volumes   map[string]string
-	Timeout   int
-	Config    Config     // portable decorator config (§B)
-	EnterBody string     // @modal.enter body — runs ONCE in the warm runner (§6)
-	HasExit   bool       // @modal.exit() present (calque#86); teardown is not reproduced
-	Methods   []Function // @modal.method bodies
+	Image   Image
+	GPU     string
+	Volumes map[string]string
+	// CloudBucketMounts mirrors Function.CloudBucketMounts (calque#91
+	// Workstream A) — see its doc comment.
+	CloudBucketMounts map[string]CloudBucketMount
+	Timeout           int
+	Config            Config     // portable decorator config (§B)
+	EnterBody         string     // @modal.enter body — runs ONCE in the warm runner (§6)
+	HasExit           bool       // @modal.exit() present (calque#86); teardown is not reproduced
+	Methods           []Function // @modal.method bodies
 	// EnterLocalCalls are sibling callables the @enter body itself references
 	// via .local() (calque#92) — EnterBody is a bare string with no other Function
 	// to carry this on.

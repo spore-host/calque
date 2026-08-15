@@ -1123,13 +1123,19 @@ func TestParseScheduleObjectForms(t *testing.T) {
 }
 
 // TestParseRareConstructsAreTaggedNotSilent (calque#91): modal.Dict/Queue/
-// NetworkFileSystem.from_name(...), an inline modal.CloudBucketMount(...) used
-// as a volumes= value, and App.include(...) must each fire a DISTINCT, named
-// leak — before this fix, the first three vanished entirely (no visit_Assign
-// branch matched them) and CloudBucketMount was silently miscategorized as an
-// ordinary Volume mount (no leak at all). None of these are modeled; this only
-// proves each is now a clean grep hit instead of silence or a false
-// classification.
+// NetworkFileSystem.from_name(...) and App.include(...) must each fire a
+// DISTINCT, named leak — before this fix, all three vanished entirely (no
+// visit_Assign branch matched them). None of these are modeled; this only
+// proves each is now a clean grep hit instead of silence.
+//
+// modal.CloudBucketMount is NOT asserted here anymore (calque#91 Workstream
+// A): it moved from "recognized but not modeled" to a REAL, resolved S3
+// mount — rare_constructs.py's own CloudBucketMount("my-bucket", secret=None)
+// usage has a literal bucket_name and an explicit secret=None (a no-op, not a
+// real secret= request), so it now resolves cleanly with ZERO leak at all,
+// the same as an ordinary Volume mount. See
+// TestParseCloudBucketMountResolves for the positive (modeled) case, using
+// testdata/scripts/cloud_bucket_mount.py instead.
 func TestParseRareConstructsAreTaggedNotSilent(t *testing.T) {
 	r, args := runner(t)
 	rep := &leak.Report{}
@@ -1143,7 +1149,6 @@ func TestParseRareConstructsAreTaggedNotSilent(t *testing.T) {
 		"modal.Dict":              true,
 		"modal.Queue":             true,
 		"modal.NetworkFileSystem": true,
-		"modal.CloudBucketMount":  true,
 		"App.include":             true,
 	}
 	for _, l := range rep.Leaks {
@@ -1155,6 +1160,48 @@ func TestParseRareConstructsAreTaggedNotSilent(t *testing.T) {
 	}
 	if len(wantTag) != 0 {
 		t.Errorf("missing distinct leak tag for %v; leaks=%+v", wantTag, rep.Leaks)
+	}
+}
+
+// TestParseCloudBucketMountResolves (calque#91 Workstream A) proves the
+// POSITIVE case: a real modal.CloudBucketMount(...) used inline as a
+// volumes= value, with a literal bucket_name/key_prefix/read_only, resolves
+// to ir.Function.CloudBucketMounts — a real S3 mount via mountpoint-s3 — not
+// a leak. testdata/scripts/cloud_bucket_mount.py is the fixture.
+func TestParseCloudBucketMountResolves(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/cloud_bucket_mount.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	fn, ok := app.FindFunction("use_bucket_mount")
+	if !ok {
+		t.Fatalf("function %q not found in parsed app", "use_bucket_mount")
+	}
+	mount, ok := fn.CloudBucketMounts["/data"]
+	if !ok {
+		t.Fatalf("CloudBucketMounts[%q] missing; got %+v", "/data", fn.CloudBucketMounts)
+	}
+	if mount.BucketName != "my-real-bucket" {
+		t.Errorf("BucketName = %q, want %q", mount.BucketName, "my-real-bucket")
+	}
+	if mount.KeyPrefix != "foo/" {
+		t.Errorf("KeyPrefix = %q, want %q", mount.KeyPrefix, "foo/")
+	}
+	if !mount.ReadOnly {
+		t.Error("ReadOnly = false, want true")
+	}
+	if fn.Volumes != nil {
+		t.Errorf("Volumes = %+v, want nil (this mount is a CloudBucketMount, not an ordinary Volume)", fn.Volumes)
+	}
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "CloudBucketMount") {
+			t.Errorf("unexpected CloudBucketMount leak for a fully-resolved literal mount: %+v", l)
+		}
 	}
 }
 

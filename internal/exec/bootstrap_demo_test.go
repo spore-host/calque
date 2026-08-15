@@ -268,3 +268,61 @@ func TestBootstrapCommandDockerModeWithNonECRRegistryRefNoLogin(t *testing.T) {
 		t.Errorf("non-ECR RegistryRef should still be pulled (anonymously); got:\n%s", cmd)
 	}
 }
+
+// TestBootstrapCommandSplicesCloudBucketMountLinesDockerMode (calque#91
+// Workstream A) proves CloudBucketMountLines are spliced into Command()'s
+// output AFTER the artifact sync but BEFORE the docker run invocation —
+// the mount must be live before @enter runs.
+func TestBootstrapCommandSplicesCloudBucketMountLinesDockerMode(t *testing.T) {
+	c := BootstrapConfig{
+		BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art",
+		ManifestKey: "runs/x/manifest.json", Region: "us-west-2",
+		CloudBucketMountLines: []string{"mkdir -p /data", "mount-s3 my-bucket /data"},
+	}
+	cmd := c.Command()
+	for _, w := range []string{"mkdir -p /data", "mount-s3 my-bucket /data"} {
+		if !strings.Contains(cmd, w) {
+			t.Errorf("missing %q in:\n%s", w, cmd)
+		}
+	}
+	syncIdx := strings.Index(cmd, "aws s3 cp --recursive")
+	mountIdx := strings.Index(cmd, "mount-s3 my-bucket /data")
+	runIdx := strings.Index(cmd, "docker run")
+	if syncIdx == -1 || mountIdx == -1 || runIdx == -1 {
+		t.Fatalf("missing expected markers in:\n%s", cmd)
+	}
+	if syncIdx >= mountIdx || mountIdx >= runIdx {
+		t.Errorf("expected order artifact-sync < cloud-bucket-mount < docker-run; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandSplicesCloudBucketMountLinesHostMode is the HostMode
+// sibling: the mount must be live before warmd itself runs (host mode has
+// no docker run invocation at all).
+func TestBootstrapCommandSplicesCloudBucketMountLinesHostMode(t *testing.T) {
+	c := BootstrapConfig{
+		Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json",
+		Region: "us-west-2", HostMode: true,
+		CloudBucketMountLines: []string{"mkdir -p /data", "mount-s3 my-bucket /data"},
+	}
+	cmd := c.Command()
+	mountIdx := strings.Index(cmd, "mount-s3 my-bucket /data")
+	warmdIdx := strings.Index(cmd, "warmd run --manifest")
+	if mountIdx == -1 || warmdIdx == -1 {
+		t.Fatalf("missing expected markers in:\n%s", cmd)
+	}
+	if mountIdx > warmdIdx {
+		t.Errorf("cloud-bucket-mount lines must run BEFORE warmd; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandNoCloudBucketMountLinesUnchanged proves the default
+// (empty CloudBucketMountLines) reproduces prior behavior byte-for-byte: no
+// mount-s3 anything appears at all.
+func TestBootstrapCommandNoCloudBucketMountLinesUnchanged(t *testing.T) {
+	c := BootstrapConfig{BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json", Region: "us-west-2"}
+	cmd := c.Command()
+	if strings.Contains(cmd, "mount-s3") {
+		t.Errorf("no CloudBucketMountLines set — must not emit any mount-s3 reference; got:\n%s", cmd)
+	}
+}

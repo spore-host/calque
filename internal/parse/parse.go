@@ -819,12 +819,15 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 	// The function-config decorator is the one named "*.function" (or "*.method"
 	// for class methods); enter/method markers carry no gpu/volumes.
 	for _, d := range f.Decorators {
-		gpu, vols, timeout, cfg := readConfigKwargs(d.Kwargs, leak.PrimGPU, f.Name, script, d.Lineno, rep)
+		gpu, vols, cbm, timeout, cfg := readConfigKwargs(d.Kwargs, leak.PrimGPU, f.Name, script, d.Lineno, rep)
 		if gpu != "" {
 			fn.GPU = gpu
 		}
 		if vols != nil {
 			fn.Volumes = vols
+		}
+		if cbm != nil {
+			fn.CloudBucketMounts = cbm
 		}
 		if timeout != 0 {
 			fn.Timeout = timeout
@@ -836,8 +839,8 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 
 func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any, defaultVolumes map[string]string, defaultSecrets []string, out pyOut, appImage ir.Image) ir.Class {
 	cls := ir.Class{Name: c.Name, Line: c.Lineno}
-	gpu, vols, timeout, cfg := readConfigKwargs(c.ClsKwargs, leak.PrimGPU, c.Name, script, c.Lineno, rep)
-	cls.GPU, cls.Volumes, cls.Timeout, cls.Config = gpu, vols, timeout, cfg
+	gpu, vols, cbm, timeout, cfg := readConfigKwargs(c.ClsKwargs, leak.PrimGPU, c.Name, script, c.Lineno, rep)
+	cls.GPU, cls.Volumes, cls.CloudBucketMounts, cls.Timeout, cls.Config = gpu, vols, cbm, timeout, cfg
 	// calque#168: App-level volumes=/secrets= inherited if the CLASS itself
 	// declares none — before a method's own class->method fallback below.
 	applyAppDefaults(&cls.Volumes, &cls.Config.Secrets, defaultVolumes, defaultSecrets)
@@ -890,6 +893,9 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 		if method.Volumes == nil {
 			method.Volumes = cls.Volumes
 		}
+		if method.CloudBucketMounts == nil {
+			method.CloudBucketMounts = cls.CloudBucketMounts
+		}
 		if len(method.Config.Secrets) == 0 {
 			method.Config.Secrets = cls.Config.Secrets
 		}
@@ -922,8 +928,10 @@ var autoscalingKwargs = map[string]bool{
 // readConfigKwargs pulls gpu/volumes/timeout + the portable Config kwargs
 // (cpu/memory/retries/secrets/schedule/region, §B) out of a decorator's kwargs.
 // Autoscaling kwargs are recognized and leaked as deferred (§4/§1, M10/S1);
-// anything else it can't model becomes a generic leak (§10).
-func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner, script string, line int, rep *leak.Report) (gpu string, vols map[string]string, timeout int, cfg ir.Config) {
+// anything else it can't model becomes a generic leak (§10). cbm is calque#91
+// Workstream A's real CloudBucketMount->S3-mount resolution, alongside the
+// pre-existing plain-Volume vols map — see decodeVolumesAndCloudBucketMounts.
+func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner, script string, line int, rep *leak.Report) (gpu string, vols map[string]string, cbm map[string]ir.CloudBucketMount, timeout int, cfg ir.Config) {
 	for k, raw := range kwargs {
 		switch k {
 		case "gpu":
@@ -950,12 +958,7 @@ func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner
 				timeout = n
 			}
 		case "volumes":
-			if m, ok := decodeStringMap(raw); ok {
-				vols = m
-			} else {
-				rep.Addf(leak.PrimVolume, leak.KindUnsupportedArg, script, line,
-					"%s: volumes= not a {str:str} map (%s)", owner, string(raw))
-			}
+			vols, cbm = decodeVolumesAndCloudBucketMounts(raw, owner, script, line, rep)
 		case "cpu":
 			// cpu= is cores (int or float) in Modal; a [request, limit] list also
 			// occurs (mirrors memory=) — take the request (first) element and leak
@@ -1044,7 +1047,79 @@ func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner
 				"%s: unmodeled decorator arg %q=%s", owner, k, string(raw))
 		}
 	}
-	return gpu, vols, timeout, cfg
+	return gpu, vols, cbm, timeout, cfg
+}
+
+// decodeVolumesAndCloudBucketMounts decodes a volumes= kwarg's raw JSON into
+// its two disjoint per-mount-path shapes (calque#91 Workstream A): the
+// pre-existing plain-string {mount_path: volume_var_name} map (vols, an
+// ordinary modal.Volume.from_name(...) mount) and the new
+// {mount_path: {"__cloud_bucket_mount__": {...}}} shape pyast emits for a
+// modal.CloudBucketMount(...) call used inline as a volumes= value (cbm, a
+// real S3 mount). A raw value that's neither — including pyast's own
+// "recognized but not modeled" __unparsed__ fallback for a CloudBucketMount
+// whose bucket_name wasn't a string literal, or any OTHER unmodeled
+// construct — is silently absent from both maps; that specific case already
+// gets its own leak from pyast's helper_leaks (surfaced separately in
+// build(), see the "pyast helper flagged" leak), so no second, redundant
+// leak is emitted here. A volumes= value that isn't even a JSON object at
+// all (e.g. a bare unparseable expression) leaks exactly like before this
+// change.
+func decodeVolumesAndCloudBucketMounts(raw json.RawMessage, owner, script string, line int, rep *leak.Report) (map[string]string, map[string]ir.CloudBucketMount) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		rep.Addf(leak.PrimVolume, leak.KindUnsupportedArg, script, line,
+			"%s: volumes= not a {str:str} map (%s)", owner, string(raw))
+		return nil, nil
+	}
+	var vols map[string]string
+	var cbm map[string]ir.CloudBucketMount
+	for mountPath, rawVal := range m {
+		if s, ok := decodeString(rawVal); ok {
+			if vols == nil {
+				vols = map[string]string{}
+			}
+			vols[mountPath] = s
+			continue
+		}
+		if mount, ok := decodeCloudBucketMount(rawVal); ok {
+			if cbm == nil {
+				cbm = map[string]ir.CloudBucketMount{}
+			}
+			cbm[mountPath] = mount
+		}
+		// Neither shape: pyast's own helper_leaks already named this (see doc
+		// comment above) — no redundant leak here.
+	}
+	if vols == nil && cbm == nil {
+		rep.Addf(leak.PrimVolume, leak.KindUnsupportedArg, script, line,
+			"%s: volumes= not a {str:str} map (%s)", owner, string(raw))
+	}
+	return vols, cbm
+}
+
+// decodeCloudBucketMount decodes one volumes= dict value's
+// {"__cloud_bucket_mount__": {"bucket_name": ..., "key_prefix": ...,
+// "read_only": ...}} shape (calque#91 Workstream A; see pyast.py's
+// _cloud_bucket_mount) into ir.CloudBucketMount. Returns (_, false) for any
+// other shape, including a plain string (an ordinary Volume mount, handled
+// by the caller instead) and pyast's {"__unparsed__": ...} fallback marker.
+func decodeCloudBucketMount(raw json.RawMessage) (ir.CloudBucketMount, bool) {
+	var wrapper struct {
+		CBM *struct {
+			BucketName string `json:"bucket_name"`
+			KeyPrefix  string `json:"key_prefix"`
+			ReadOnly   bool   `json:"read_only"`
+		} `json:"__cloud_bucket_mount__"`
+	}
+	if err := json.Unmarshal(raw, &wrapper); err != nil || wrapper.CBM == nil || wrapper.CBM.BucketName == "" {
+		return ir.CloudBucketMount{}, false
+	}
+	return ir.CloudBucketMount{
+		BucketName: wrapper.CBM.BucketName,
+		KeyPrefix:  wrapper.CBM.KeyPrefix,
+		ReadOnly:   wrapper.CBM.ReadOnly,
+	}, true
 }
 
 // ---- small decode helpers (kwargs are heterogeneous JSON) ----
