@@ -598,6 +598,29 @@ func invocationKinds(out pyOut, script string, rep *leak.Report) (map[string]ir.
 			// still not EXECUTED (§18 keeps calque block-and-wait-only). The leak
 			// reflects that shift: "we know what this is" rather than "deferred,
 			// unclassified."
+			//
+			// calque#189 follow-up: an empty ic.Target (dict-of-functions
+			// Subscript receiver, e.g. SEASON_BUNDLE_FNS[key].spawn(...))
+			// must classify EVERY Candidate as ir.InvokeSpawn, not the
+			// empty string — SpawnCallSites already expands the CALL SITE
+			// side into one entry per candidate, but ResolveSpawnCallables
+			// (internal/exec/spawnshard.go) only ever finds a callable
+			// whose OWN ir.Function.Invoke is InvokeSpawn in the first
+			// place. Without this, a real end-to-end
+			// parse->ResolveSpawnCallables->BuildSpawnManifests run
+			// produces ZERO shards for a script using this idiom — found
+			// via a synthesized end-to-end test that actually wired the
+			// pieces together, not caught by testing SpawnCallSites in
+			// isolation (the bug this fixes is a gap BETWEEN two already-
+			// individually-tested layers, not inside either one).
+			if ic.Target == "" && len(ic.Candidates) > 0 {
+				for _, c := range ic.Candidates {
+					consider(ic.Entrypoint, c, ir.InvokeSpawn)
+				}
+				rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
+					"spawn(...) on a dict-of-functions Subscript selected by a runtime key; classifying every candidate (%v) as InvokeSpawn since the real runtime selection isn't statically resolvable (calque#189)", ic.Candidates)
+				continue
+			}
 			consider(ic.Entrypoint, ic.Target, ir.InvokeSpawn)
 			rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, ic.Lineno,
 				"%s.spawn(...): classified but not executed — block-and-wait fan-out over distinct spawned callables is deferred per §18 (calque#97 tracks the driver)", leafName(ic.Target))
