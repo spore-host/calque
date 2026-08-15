@@ -78,9 +78,21 @@ the census stays honest.
 
 ## spore.host integration threads (tracked under #2)
 
-- **spawn has no headless-container / ECR primitive** — flagged at
-  `internal/exec/bootstrap.go`; calque drives docker over SSM as a workaround
-  (upstream spawn#351 / spawn#353).
-- **`--detach`** is still stubbed (async detach not wired).
+- **spawn's headless-container primitive shipped (spawn#353,
+  `pkg/userdata.GenerateContainerUserData`), but calque can't reach it yet.**
+  calque's `Acquirer.Acquire` launches through `lagotto/pkg/snipe.Snipe`,
+  which calls `launcher.Provision` with a hardcoded empty
+  `launcher.Options{}` — `snipe.Options`/`snipe.Target` (the types calque's
+  Acquirer actually touches) have no field to forward
+  `ContainerScript`/`StorageScript` through. The blocker is one seam deeper
+  than spawn itself: it's lagotto's `snipe.Options` shape, not spawn's own
+  readiness. `internal/exec/bootstrap.go` still hand-rolls ECR login/pull/run
+  as a result. Adopting the real primitive (and, for the same reason,
+  spawn's `GenerateStorageUserData` for an EFS mount) needs a
+  `ContainerScript`/`StorageScript`-forwarding field added to
+  `snipe.Options` upstream first — a candidate future workstream, not
+  undertaken yet.
+- **`--detach`** — no flag, no code exists yet (not a half-built stub to
+  clean up, a genuinely unstarted thread).
 
 These live under the standing integration tracker (#2), not a milestone deliverable.
