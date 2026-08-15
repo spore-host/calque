@@ -74,7 +74,75 @@ def _decorator_name(node: ast.AST) -> str:
     return ".".join(_attr_chain(target))
 
 
-def _volumes_map(node: ast.AST, leaks: list[dict[str, Any]] | None = None) -> dict[str, str] | None:
+def _cloud_bucket_mount(node: ast.Call, leaks: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Extract a `CloudBucketMount(bucket_name, ...)` call's kwargs into the
+    `{"__cloud_bucket_mount__": {...}}` wire shape (calque#91 Workstream A) —
+    a REAL S3 mount, not an ordinary Volume. `bucket_name` is the constructor's
+    first positional arg or its own `bucket_name=` kwarg; `key_prefix=` and
+    `read_only=` are best-effort extracted alongside it.
+
+    Returns None (extraction genuinely failed) only when `bucket_name` isn't a
+    plain string literal — the caller falls back to the pre-existing
+    "recognized but not modeled" leak in that case, same posture as before this
+    construct was modeled at all.
+
+    `secret=` (a real Modal kwarg for non-AWS-role credential injection) and
+    `bucket_endpoint_url=`/`requester_pays=`/`force_path_style=` are each
+    separately, informationally leaked when present — calque mounts against
+    AWS S3 with the instance's own IAM role and default settings only, so a
+    script relying on any of these needs a distinct signal that its specific
+    request wasn't honored, even though the mount itself DID resolve.
+    """
+    bucket_name: str | None = None
+    if node.args:
+        bucket_name = _const_str(node.args[0])
+    key_prefix: str | None = None
+    read_only = False
+    saw_secret = False
+    saw_other_unhonored = False
+    for kw in node.keywords:
+        if kw.arg == "bucket_name":
+            bucket_name = _const_str(kw.value) or bucket_name
+        elif kw.arg == "key_prefix":
+            key_prefix = _const_str(kw.value)
+        elif kw.arg == "read_only":
+            try:
+                v = ast.literal_eval(kw.value)
+            except (ValueError, SyntaxError):
+                v = None
+            if isinstance(v, bool):
+                read_only = v
+        elif kw.arg == "secret" and not (isinstance(kw.value, ast.Constant) and kw.value.value is None):
+            saw_secret = True
+        elif kw.arg in ("bucket_endpoint_url", "requester_pays", "force_path_style"):
+            if not (isinstance(kw.value, ast.Constant) and kw.value.value in (None, False)):
+                saw_other_unhonored = True
+
+    if bucket_name is None:
+        return None
+
+    if leaks is not None:
+        if saw_secret:
+            leaks.append(
+                {
+                    "where": "modal.CloudBucketMount(secret=)",
+                    "detail": "CloudBucketMount(secret=...) credential is not honored — the instance's own IAM role is used instead (calque#91)",
+                    "lineno": getattr(node, "lineno", 0),
+                }
+            )
+        if saw_other_unhonored:
+            leaks.append(
+                {
+                    "where": "modal.CloudBucketMount(bucket_endpoint_url=/requester_pays=/force_path_style=)",
+                    "detail": "CloudBucketMount's bucket_endpoint_url=/requester_pays=/force_path_style= are not supported — mounting against AWS S3 with default settings only (calque#91)",
+                    "lineno": getattr(node, "lineno", 0),
+                }
+            )
+
+    return {"__cloud_bucket_mount__": {"bucket_name": bucket_name, "key_prefix": key_prefix, "read_only": read_only}}
+
+
+def _volumes_map(node: ast.AST, leaks: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """Extract `volumes={"/mount": vol_handle}` as {mount_path: volume_var_name}.
 
     The keys are string literals (mount paths); the values are Volume *variables*
@@ -82,21 +150,38 @@ def _volumes_map(node: ast.AST, leaks: list[dict[str, Any]] | None = None) -> di
     to match IR §14 `Volumes map[string]string // mount path -> volume name`.
     Returns None if this isn't a dict we can map.
 
-    calque#91: a value that's a direct `CloudBucketMount(...)`/`NetworkFileSystem(...)`
-    call (not a Volume.from_name()-derived variable) is a DIFFERENT, unmodeled
-    construct — before this check existed it fell into the generic `ast.unparse(v)`
-    branch below and was silently treated as an ordinary Volume mount, with no
-    leak distinguishing it at all. When leaks is supplied, tag it there instead.
+    calque#91 Workstream A: a value that's a direct `CloudBucketMount(...)` call
+    (not a Volume.from_name()-derived variable) is a DIFFERENT, now-MODELED
+    construct — a real S3 mount, not calque's own --bucket staging area the way
+    an ordinary Volume mount is. When it extracts cleanly, the mount path's value
+    is `{"__cloud_bucket_mount__": {...}}` (see _cloud_bucket_mount) instead of a
+    plain string, distinguishable from the ordinary `{mount_path: var_name}`
+    shape. When extraction genuinely fails (bucket_name isn't a string literal),
+    or the value is some OTHER unmodeled call (e.g. NetworkFileSystem(...) used
+    the same way), it falls back to the pre-existing "recognized but not
+    modeled" leak — before this construct was distinguished at all, it fell
+    into the generic `ast.unparse(v)` branch below and was silently treated as
+    an ordinary Volume mount with no leak whatsoever.
     """
     if not isinstance(node, ast.Dict):
         return None
-    out: dict[str, str] = {}
+    out: dict[str, Any] = {}
     for k, v in zip(node.keys, node.values):
         key = _const_str(k) if k is not None else None
         if key is None:
             continue
         if isinstance(v, ast.Name):
             out[key] = v.id
+        elif isinstance(v, ast.Call) and _attr_chain(v.func)[-1:] == ["CloudBucketMount"]:
+            cbm = _cloud_bucket_mount(v, leaks)
+            if cbm is not None:
+                out[key] = cbm
+                continue
+            if leaks is not None:
+                leaks.append(
+                    {"where": "modal.CloudBucketMount", "detail": "CloudBucketMount(...) used as a volumes= value, recognized but not modeled — bucket_name is not a plain string literal (calque#91)", "lineno": getattr(v, "lineno", 0)}
+                )
+            out[key] = ast.unparse(v)
         else:
             if leaks is not None and isinstance(v, ast.Call):
                 construct = _unsupported_construct_call(_attr_chain(v.func))

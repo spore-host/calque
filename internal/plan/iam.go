@@ -31,7 +31,15 @@ import (
 // actual image-layer read actions are scoped to account+region, not to
 // one specific repo, since the resolved registry ref varies per script
 // and isn't known when the role is created.
-func RealRunPolicy(account, region, bucket string) string {
+//
+// calque#91 Workstream A: extraBuckets grants read/write/list on every
+// DISTINCT bucket a --script real run's resolved modal.CloudBucketMount(...)
+// mounts reference — the SCRIPT'S OWN bucket, not calque's own --bucket
+// staging area (bucket above). Each distinct name in extraBuckets gets the
+// same S3 statement SHAPE as bucket's own grant above (GetObject/PutObject +
+// ListBucket/GetBucketLocation), scoped to that bucket only. nil/empty (the
+// default, every pre-#91 caller) reproduces prior behavior byte-for-byte.
+func RealRunPolicy(account, region, bucket string, extraBuckets []string) string {
 	obj := fmt.Sprintf("arn:aws:s3:::%s/*", bucket)
 	bkt := fmt.Sprintf("arn:aws:s3:::%s", bucket)
 	ecrRepos := fmt.Sprintf("arn:aws:ecr:%s:%s:repository/*", region, account)
@@ -40,6 +48,19 @@ func RealRunPolicy(account, region, bucket string) string {
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, bkt),
 		`{"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":["*"]}`,
 		fmt.Sprintf(`{"Effect":"Allow","Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],"Resource":[%q]}`, ecrRepos),
+	}
+	seen := map[string]bool{bucket: true}
+	for _, b := range extraBuckets {
+		if b == "" || seen[b] {
+			continue
+		}
+		seen[b] = true
+		extraObj := fmt.Sprintf("arn:aws:s3:::%s/*", b)
+		extraBkt := fmt.Sprintf("arn:aws:s3:::%s", b)
+		stmts = append(stmts,
+			fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":[%q]}`, extraObj),
+			fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, extraBkt),
+		)
 	}
 	return `{"Version":"2012-10-17","Statement":[` + strings.Join(stmts, ",") + `]}`
 }
@@ -72,7 +93,11 @@ func RealRunPolicy(account, region, bucket string) string {
 // IAM role per DISTINCT bucket ever passed to --bucket (bounded by how
 // many buckets a caller actually uses, not by run count: two runs against
 // the SAME bucket still correctly share one role, as before).
-func RealRunInstanceProfile(ctx context.Context, client *spawnaws.Client, region, bucket string) (string, error) {
+//
+// extraBuckets (calque#91 Workstream A) threads through to RealRunPolicy —
+// see its doc comment. nil/empty (the default, every pre-#91 caller)
+// reproduces prior behavior byte-for-byte.
+func RealRunInstanceProfile(ctx context.Context, client *spawnaws.Client, region, bucket string, extraBuckets ...string) (string, error) {
 	account, err := client.GetAccountID(ctx)
 	if err != nil {
 		return "", fmt.Errorf("resolve account id: %w", err)
@@ -80,7 +105,7 @@ func RealRunInstanceProfile(ctx context.Context, client *spawnaws.Client, region
 	profile, err := client.CreateOrGetInstanceProfile(ctx, spawnaws.IAMRoleConfig{
 		RoleName:         roleNameForBucket(bucket),
 		TrustServices:    []string{"ec2"},
-		InlinePolicyJSON: RealRunPolicy(account, region, bucket),
+		InlinePolicyJSON: RealRunPolicy(account, region, bucket, extraBuckets),
 	})
 	if err != nil {
 		return "", fmt.Errorf("set up real-run IAM instance profile: %w", err)

@@ -94,6 +94,16 @@ type BootstrapConfig struct {
 	// content-addressing property internal/image already documents for a
 	// future ECR push path). Ignored when BuildDockerfile is false.
 	BuildTag string
+	// CloudBucketMountLines are already-rendered shell lines (calque#91
+	// Workstream A) that mount every resolved modal.CloudBucketMount(...)
+	// via mountpoint-s3 — the caller (cmd/calque/realrun.go) builds these via
+	// plan.MountCommands(plan.ResolveCloudBucketMounts(app, rep)), so this
+	// package never needs to import internal/plan (no import-cycle risk).
+	// Spliced in right after the artifact sync, before either the HostMode
+	// or docker-mode run invocation — the mount must be live before @enter
+	// runs, in either mode. nil/empty (the default) is a no-op, reproducing
+	// prior behavior byte-for-byte for every script with no CloudBucketMount.
+	CloudBucketMountLines []string
 }
 
 // ecrHostname matches an ECR registry hostname, e.g.
@@ -170,6 +180,14 @@ func (b BootstrapConfig) Command() string {
 				fmt.Sprintf("sudo curl -LsSf %q -o %q", u, dest),
 			)
 		}
+	}
+
+	// calque#91 Workstream A: mount every resolved modal.CloudBucketMount(...)
+	// via mountpoint-s3 BEFORE either the HostMode or docker-mode run
+	// invocation below — the mount must be live before @enter runs, in
+	// either mode. Empty (the default) is a no-op.
+	if len(b.CloudBucketMountLines) > 0 {
+		lines = append(lines, b.CloudBucketMountLines...)
 	}
 
 	if b.HostMode {

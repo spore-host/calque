@@ -344,6 +344,14 @@ func realRun(o realOpts) (err error) {
 	// before calque#79) gets an empty slice both ways — byte-for-byte
 	// unchanged behavior.
 	volumeSync, volumeCommit := volumeSpecsForApp(app, o.bucket, rep)
+	// calque#91 Workstream A: a script's REAL modal.CloudBucketMount(...)
+	// mounts (its OWN S3 bucket, mounted live via mountpoint-s3 — NOT
+	// calque's --bucket staging area the way an ordinary Volume is) resolve
+	// into shell lines spliced into the bootstrap script, plus the distinct
+	// bucket names the instance's IAM role needs read/write/list access to.
+	// A script with no CloudBucketMounts (the vast majority) gets an empty
+	// slice both ways — byte-for-byte unchanged behavior.
+	cloudBucketMountLines, cloudBucketMountBuckets := cloudBucketMountSpecsForApp(app, rep)
 	// calque#148, widened: bootstrap.go's host-mode branch ALWAYS
 	// provisions a uv-managed venv now (not just when --pip supplies real
 	// deps), so warmd must ALWAYS invoke that SAME venv's interpreter for
@@ -384,6 +392,7 @@ func realRun(o realOpts) (err error) {
 		PipPackages: o.pipPackages, PythonVersion: o.pythonVersion,
 		StageFiles: o.stageFiles, RegistryRef: registryRef,
 		BuildDockerfile: buildDockerfile, BuildTag: buildTag,
+		CloudBucketMountLines: cloudBucketMountLines,
 	}
 
 	// calque#134/#178: when --script named a real parsed unit, carry its
@@ -423,8 +432,10 @@ func realRun(o realOpts) (err error) {
 	// its own bootstrap script makes — not even for uploading its OWN
 	// bootstrap log on failure, which is why a bootstrap failure on this
 	// path was previously totally silent (no log, no error, just a
-	// timeout at the deadline). Scoped to just this run's own bucket.
-	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket)
+	// timeout at the deadline). Scoped to just this run's own bucket, plus
+	// (calque#91 Workstream A) any distinct bucket(s) the script's own
+	// resolved CloudBucketMount(s) reference.
+	iamProfile, err := plan.RealRunInstanceProfile(ctx, spawnClient, o.region, o.bucket, cloudBucketMountBuckets...)
 	if err != nil {
 		return fmt.Errorf("set up IAM instance profile: %w", err)
 	}
@@ -558,6 +569,31 @@ func volumeSpecsForApp(app ir.App, bucket string, rep *leak.Report) (sync, commi
 		}
 	}
 	return sync, commit
+}
+
+// cloudBucketMountSpecsForApp resolves app's REAL modal.CloudBucketMount(...)
+// mounts (calque#91 Workstream A) into the already-rendered shell lines
+// spliced into BootstrapConfig.CloudBucketMountLines, plus the distinct S3
+// bucket names (the SCRIPT'S OWN buckets, not calque's --bucket staging
+// area) the instance's IAM role needs read/write/list access to — mirrors
+// volumeSpecsForApp's factoring (a pure function, no ctx/S3, so it's
+// unit-testable without a real script/S3 client). A script with no
+// CloudBucketMounts (the vast majority) returns (nil, nil) — byte-for-byte
+// the same as the hardcoded nil, nil this replaces.
+func cloudBucketMountSpecsForApp(app ir.App, rep *leak.Report) (lines []string, buckets []string) {
+	mounts := plan.ResolveCloudBucketMounts(app, rep)
+	if len(mounts) == 0 {
+		return nil, nil
+	}
+	lines = plan.MountCommands(mounts)
+	seen := map[string]bool{}
+	for _, m := range mounts {
+		if !seen[m.BucketName] {
+			seen[m.BucketName] = true
+			buckets = append(buckets, m.BucketName)
+		}
+	}
+	return lines, buckets
 }
 
 func emitK(o realOpts, inst string, perItem []float64, enterSec float64, occ calexec.OccupancyRaw, acq plan.Acquired, priceHr float64) error {

@@ -6,6 +6,10 @@ ports to AWS **unchanged**. This document is the single most direct
 answer to "does calque support my script."
 
 **Provenance:**
+- Updated the §E `modal.CloudBucketMount` row (2026-08-14, calque#91
+  Workstream A): moved from ⬜ (not modeled — leak only) to ✅ (a real
+  mountpoint-s3 mount against the script's own S3 bucket). See the row
+  itself for the file-by-file implementation summary.
 - Verified against calque v0.5.0 (2026-08-14) — updated the App-level
   defaults row for calque#174 (image= per-function resolution fix).
   Also fixed the §H `modal.Cron`/`modal.Period` rows (calque#149 doc
@@ -138,7 +142,7 @@ real gap — should not stay this way) · ⬜ not present at all.
 | `modal.Volume.from_name(...)` + `volumes={mount: vol}` | **Not a live shared filesystem** — snapshot-at-container-start, explicit `.commit()`/`.reload()` for cross-container visibility, last-write-wins on concurrent same-file writes (documented, expected data loss). | 🔥 | ✅ maps to a deterministic S3 prefix, real delta-sync before `@enter`, real end-of-run commit write-back. | calque's model (sync-before-run, commit-after-run) matches Modal's snapshot-at-start semantics reasonably well for the common case; **mid-run `.reload()`** (re-sync during execution) is correctly leaked as unreproduced. | — |
 | `.commit()` / `.reload()` call sites | End-of-run persistence / mid-run re-read. | 🔥 (wherever Volumes are used) | ✅ `.commit()` honored as real end-of-run write-back. 🟨 `.reload()` leaked as unreproduced. | — | — |
 | `modal.NetworkFileSystem` (deprecated, being removed) | **Live-shared** filesystem — no commit/reload cycle, closer to EFS/NFS than Volume's snapshot model. | 🧊 (deprecated, Modal steers users to Volume) | ⬜ | If a real script still uses this, calque's Volume→S3-prefix mapping is the WRONG model (S3 has no live-shared-write semantics) — this would need an EFS-shaped mapping instead, not a Volume-shaped one. | [#91](https://github.com/spore-host/calque/issues/91) |
-| `modal.CloudBucketMount` | Direct S3/R2/GCS mount via `mountpoint-s3` — no append writes, no seek+write, must open in truncate mode, no rename. | 🧊 | ⬜ | A script using this directly against real S3 is a DIFFERENT (and more restrictive) primitive than Volume — calque's Volume mapping doesn't cover it. | [#91](https://github.com/spore-host/calque/issues/91) |
+| `modal.CloudBucketMount` | Direct S3/R2/GCS mount via `mountpoint-s3` — no append writes, no seek+write, must open in truncate mode, no rename. | 🧊 | ✅ (calque#91 Workstream A) a real `CloudBucketMount(bucket_name, key_prefix=, read_only=)` used INLINE as a `volumes=` value (the real Modal idiom — constructed directly in the dict, not assigned to a variable first) resolves to a real mountpoint-s3 mount against the SCRIPT'S OWN S3 bucket: `tools/pyast/pyast.py`'s `_cloud_bucket_mount` extracts `bucket_name`/`key_prefix`/`read_only`, `internal/parse/parse.go` decodes them into `ir.Function`/`ir.Class.CloudBucketMounts`, and `internal/plan/cloudbucketmount.go`'s `MountCommands` renders the on-instance `mount-s3` invocation (spliced into the bootstrap script before `@enter` runs, via `internal/exec.BootstrapConfig.CloudBucketMountLines`); `internal/plan.RealRunPolicy`'s `extraBuckets` param grants the instance role read/write/list on that bucket, separate from calque's own `--bucket` staging area. `secret=` is recognized but NOT honored (the instance's own IAM role is used instead) — leaked distinctly. `bucket_endpoint_url=`/`requester_pays=`/`force_path_style=` are NOT supported — leaked distinctly; mounting is against AWS S3 with default settings only. A `bucket_name` that isn't a string literal still falls back to the pre-existing "recognized but not modeled" leak. | R2/GCS-backed CloudBucketMounts (`bucket_endpoint_url=`) are NOT reproduced — AWS S3 only. No live-Modal-managed credential rotation via `secret=`; the instance's own IAM role is the only credential path. | [#91](https://github.com/spore-host/calque/issues/91) (Workstream A closed; NetworkFileSystem is a separate, later workstream) |
 | `modal.Dict` | Distributed KV store, cloudpickle values, 7-day inactivity TTL, capped `.len()` at 100,000. | 🧊 | ⬜ not modeled, but [#151](https://github.com/spore-host/calque/issues/151) closed the failure mode: a bare reference to a module-level `Dict.from_name(...)` constant used to ship verbatim and crash at runtime with a confusing Modal SDK auth error — it's now refused with a clear leak naming the construct instead. | — | [#91](https://github.com/spore-host/calque/issues/91) |
 | `modal.Queue` | FIFO **per-partition only**, 24h partition auto-expiry. | 🧊 | ⬜ not modeled; same [#151](https://github.com/spore-host/calque/issues/151) honest-refusal fix applies to a bare reference to a `Queue.from_name(...)` constant. | — | [#91](https://github.com/spore-host/calque/issues/91) |
 
@@ -312,11 +316,14 @@ a generic "unmodeled arg" message.
     live-verified end-to-end — [#98](https://github.com/spore-host/calque/issues/98)
     (closed).
 12. Lower-priority/rare, still open: `modal.Dict`/`Queue`,
-    `@modal.batched`, `modal.NetworkFileSystem`, `modal.CloudBucketMount`,
+    `@modal.batched`, `modal.NetworkFileSystem`,
     `App.include`/`.deploy`/`.run` lifecycle nuances. (`cloud=` closed
     separately, calque#91's own §C fix; `modal.Cron`/`Period` object-form
     *recognition* also closed under calque#91 — see §H — though actually
-    executing on a schedule remains out of scope.)
+    executing on a schedule remains out of scope. `modal.CloudBucketMount`
+    is now REAL — see §E — closed as calque#91 Workstream A;
+    `modal.NetworkFileSystem` is a separate, larger workstream planned for
+    later, not attempted here.)
     [#91](https://github.com/spore-host/calque/issues/91)
 
 Not individually filed (genuinely low-priority/narrow; revisit if real usage
