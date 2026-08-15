@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -655,7 +656,7 @@ func dryRunWarm(ctx context.Context, app ir.App, unit warmUnit, n int, m *measur
 
 	sink := warm.NewMemSink()
 	sup := &warm.Supervisor{
-		Python: pythonBin(),
+		Python: uvPythonArgv(unit.class.Image.Pip),
 		Script: runnerScriptPath(),
 		Sink:   sink,
 		Leak:   leakAdapter{rep},
@@ -746,11 +747,41 @@ func bodyNeedsGPU(body string) bool {
 	return false
 }
 
-func pythonBin() string {
+// uvPythonArgv builds the full command dry-run uses to launch the picked
+// unit's body — ALWAYS through `uv run`, never the ambient shell's bare
+// python3/site-packages state, so dry-run's result doesn't depend on
+// whatever happens to already be installed locally. pip is the picked
+// unit's own resolved .image pip_install/uv_pip_install list (already in
+// scope at the call site via unit.class.Image.Pip) — each package is
+// injected into uv's ephemeral environment via --with, deduped and sorted
+// for a deterministic command line. "modal" is ALWAYS included: a real
+// script's body routinely references modal.Secret/modal.Volume/etc.
+// directly even though Modal's own SDK is never itself a pip_install(...)
+// entry in the script's OWN .image chain (confirmed live — this is
+// exactly the first failure a real AI-Almanac script's dry-run hit).
+//
+// CALQUE_PYTHON stays as an escape hatch: when set, it bypasses uv
+// entirely and is used as a literal interpreter path, exactly like before
+// this change — for anyone who already has a specific interpreter they
+// need dry-run to use instead.
+func uvPythonArgv(pip []string) []string {
 	if p := os.Getenv("CALQUE_PYTHON"); p != "" {
-		return p
+		return []string{p}
 	}
-	return "python3"
+	pkgs := map[string]bool{"modal": true}
+	for _, p := range pip {
+		pkgs[p] = true
+	}
+	names := make([]string, 0, len(pkgs))
+	for p := range pkgs {
+		names = append(names, p)
+	}
+	sort.Strings(names)
+	argv := []string{"uv", "run"}
+	for _, p := range names {
+		argv = append(argv, "--with", p)
+	}
+	return append(argv, "python3")
 }
 
 func runnerScriptPath() string {

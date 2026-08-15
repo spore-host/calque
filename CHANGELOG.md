@@ -35,6 +35,16 @@ per [semver.org](https://semver.org/#spec-item-4).
   function per (key, value) pair with the factory's own f-string
   substitution folded correctly per iteration, instead of every function
   silently falling back to the app-wide default image.
+- `calque run --dry-run` now ALWAYS executes the picked unit's body via
+  `uv run`, never the ambient shell's own `python3`/site-packages state —
+  the script's own resolved `.image` `pip_install(...)` packages (plus
+  `modal` itself, unconditionally) are injected into an ephemeral `uv`
+  environment per invocation, so a real script's dry-run no longer
+  depends on pre-installing its dependencies locally.
+  `CALQUE_PYTHON=/path/to/python3` bypasses `uv` entirely, same escape
+  hatch as before. `calque real`'s host-mode bootstrap similarly always
+  provisions a `uv`-managed venv now, even with no `--pip` packages —
+  the AMI's own `apt-get`/`dnf install python3` fallback is gone.
 
 ## [0.5.1] - 2026-08-14
 

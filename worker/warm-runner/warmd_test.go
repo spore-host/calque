@@ -19,15 +19,15 @@ type capturingLeaker struct{ msgs []string }
 
 func (c *capturingLeaker) Leak(kind, detail string) { c.msgs = append(c.msgs, kind+": "+detail) }
 
-func python(t *testing.T) string {
+func python(t *testing.T) []string {
 	t.Helper()
 	for _, p := range []string{"python3", "python"} {
 		if _, err := exec.LookPath(p); err == nil {
-			return p
+			return []string{p}
 		}
 	}
 	t.Skip("no python interpreter on PATH")
-	return ""
+	return nil
 }
 
 func runnerScript(t *testing.T) string {

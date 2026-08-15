@@ -64,7 +64,7 @@ func TestFreeRefsImportEndToEndDryRun(t *testing.T) {
 	}
 	sink := warm.NewMemSink()
 	sup := &warm.Supervisor{
-		Python: pythonBin(),
+		Python: uvPythonArgv(nil),
 		Script: runnerPy,
 		Sink:   sink,
 		Config: warm.Config{

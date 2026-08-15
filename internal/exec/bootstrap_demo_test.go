@@ -22,14 +22,24 @@ func TestBootstrapCommandShape(t *testing.T) {
 // AMI spawn auto-selects for non-GPU instance types) has dnf, not
 // apt-get. This is the path taken when the caller supplies no real
 // deps at all — matches the smoke test's own HostMode usage.
-func TestBootstrapCommandHostModeNoDepsUsesDnfFallbackToo(t *testing.T) {
+func TestBootstrapCommandHostModeNoDepsStillProvisionsUv(t *testing.T) {
 	c := BootstrapConfig{Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json", Region: "us-west-2", HostMode: true}
 	cmd := c.Command()
-	if !strings.Contains(cmd, "dnf install") {
-		t.Errorf("no-deps host-mode command should fall back to dnf (AL2023 has no apt-get) as well as apt-get; got:\n%s", cmd)
+	for _, w := range []string{
+		"curl -LsSf https://astral.sh/uv/install.sh",
+		"uv python install 3.12",
+		"uv venv --python 3.12",
+		`export PATH="/opt/calque/.venv/bin:$PATH"`,
+	} {
+		if !strings.Contains(cmd, w) {
+			t.Errorf("no-deps host-mode command should still provision a uv-managed venv (calque#148, widened — never depend on the AMI's distro package manager for Python); missing %q in:\n%s", w, cmd)
+		}
 	}
-	if strings.Contains(cmd, "uv") {
-		t.Errorf("no-deps host-mode command should NOT install uv at all (nothing to pip-install); got:\n%s", cmd)
+	if strings.Contains(cmd, "apt-get install -y python3") || strings.Contains(cmd, "dnf install -y python3") {
+		t.Errorf("no-deps host-mode command should NOT fall back to the AMI's own distro python3 anymore; got:\n%s", cmd)
+	}
+	if strings.Contains(cmd, "uv pip install") {
+		t.Errorf("no-deps host-mode command has nothing to pip-install; got:\n%s", cmd)
 	}
 }
 

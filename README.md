@@ -84,6 +84,16 @@ LEAKS: 1 emitted across 1 primitives
 LEAKS: 3 emitted across 3 primitives
 ```
 
+`calque run --dry-run` always executes the picked unit's body via `uv run`, never the
+ambient shell's own `python3`/site-packages — so you never need to `pip install` a
+script's own third-party dependencies (e.g. `modal`, `google-cloud-storage`,
+`earth2studio`) locally first. calque injects them into `uv`'s ephemeral environment
+per invocation, using the exact `pip_install(...)`/`uv_pip_install(...)` packages its
+own `.image` chain already declares (plus `modal` itself, unconditionally, since a real
+script's body routinely references `modal.Secret`/`modal.Volume` directly even when
+Modal's own SDK isn't itself a declared dependency). Set `CALQUE_PYTHON=/path/to/python3`
+to bypass `uv` entirely and point dry-run at a specific interpreter instead.
+
 That's the whole idea in two commands: a mechanical `gpu=` swap, then every pipeline stage
 running end to end against the unchanged script — parse, gate, plan, warm-execute, collect.
 See [`examples/`](examples/) for seven annotated journeys (analyze, dry-run, Bedrock

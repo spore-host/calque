@@ -15,15 +15,15 @@ import (
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
-func python(t *testing.T) string {
+func python(t *testing.T) []string {
 	t.Helper()
 	for _, p := range []string{"python3", "python"} {
 		if _, err := exec.LookPath(p); err == nil {
-			return p
+			return []string{p}
 		}
 	}
 	t.Skip("no python interpreter on PATH")
-	return ""
+	return nil
 }
 
 func runnerScript(t *testing.T) string {

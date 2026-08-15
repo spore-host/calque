@@ -203,7 +203,7 @@ func runPoolWorker(ctx context.Context, a poolWorkerArgs) error {
 		return fmt.Errorf("open pool queue for model %q: %w", a.model, err)
 	}
 
-	sup := &warm.Supervisor{Python: a.pythonBin, Script: a.runnerPath, Leak: stderrLeaker{}}
+	sup := &warm.Supervisor{Python: []string{a.pythonBin}, Script: a.runnerPath, Leak: stderrLeaker{}}
 	w := &calpool.Worker{
 		Queue:      q,
 		Fetcher:    &calpool.S3Manifests{Client: s3Client},
@@ -262,7 +262,7 @@ func runFleetWorker(ctx context.Context, a fleetWorkerArgs) error {
 		return fmt.Errorf("open run queue for run %q: %w", a.runID, err)
 	}
 
-	sup := &warm.Supervisor{Python: a.pythonBin, Script: a.runnerPath, Leak: stderrLeaker{}}
+	sup := &warm.Supervisor{Python: []string{a.pythonBin}, Script: a.runnerPath, Leak: stderrLeaker{}}
 	w := &calpool.Worker{
 		Queue:      q,
 		Fetcher:    &calpool.S3Manifests{Client: s3Client},
@@ -335,7 +335,7 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 	started := time.Now()
 	sink := &calexec.S3Sink{Client: s3c, Bucket: man.Bucket, Prefix: man.ResultPrefix}
 	sup := &warm.Supervisor{
-		Python: pyOr(man.PythonBin),
+		Python: []string{pyOr(man.PythonBin)},
 		Script: man.RunnerPath,
 		Sink:   sink,
 		Leak:   stderrLeaker{},

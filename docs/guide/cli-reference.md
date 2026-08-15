@@ -42,6 +42,14 @@ instance**; there is no way to make `run` spend money.
 | `--rates` | `config/rates.json` | Path to the dated rate table used for the cost verdict. |
 | `--entrypoint` | `""` | Which `@app.local_entrypoint()` to select when the script has more than one (mimics `modal run file.py::entrypoint`, calque#90). Required if the script has 2+ entrypoints and this is left unset — see [`which-verb.md`](which-verb.md) for how entrypoint selection interacts with `--function` on `real`. |
 
+The picked unit's body always runs via `uv run`, never the ambient shell's own
+`python3`/site-packages — `uv` injects the script's own resolved `.image`
+`pip_install(...)`/`uv_pip_install(...)` packages (plus `modal` itself,
+unconditionally) into an ephemeral environment per invocation, so you never need to
+pre-install a real script's third-party dependencies locally. Set
+`CALQUE_PYTHON=/path/to/python3` to bypass `uv` entirely and use a literal
+interpreter path instead (`cmd/calque/run.go`'s `uvPythonArgv`).
+
 ## `calque smoke [flags]` — billable
 
 Source: `cmd/calque/smoke.go`'s `parseSmokeArgs`. The **first billable

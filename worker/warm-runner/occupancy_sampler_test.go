@@ -34,7 +34,7 @@ func occupancyScript(t *testing.T) string {
 func runSampler(t *testing.T, interval string) (map[string]any, []string) {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "occ.jsonl")
-	cmd := exec.Command(python(t), occupancyScript(t), "sample", "--interval", interval, "--out", out)
+	cmd := exec.Command(python(t)[0], occupancyScript(t), "sample", "--interval", interval, "--out", out)
 	var stdout strings.Builder
 	cmd.Stdout = &stdout
 	if err := cmd.Start(); err != nil {

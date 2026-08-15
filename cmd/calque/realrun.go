@@ -344,13 +344,15 @@ func realRun(o realOpts) (err error) {
 	// before calque#79) gets an empty slice both ways — byte-for-byte
 	// unchanged behavior.
 	volumeSync, volumeCommit := volumeSpecsForApp(app, o.bucket, rep)
-	// calque#148 follow-up: when --pip supplies real deps, warmd must
-	// invoke the SAME uv-managed venv's interpreter the bootstrap command
-	// below creates (BootstrapConfig.PipPackages) — the manifest's
-	// PythonBin and the bootstrap's venv path MUST derive from the same
-	// hostWorkerDir or warmd falls back to a bare "python3" that was
-	// never pip-installed into.
-	if len(o.pipPackages) > 0 {
+	// calque#148, widened: bootstrap.go's host-mode branch ALWAYS
+	// provisions a uv-managed venv now (not just when --pip supplies real
+	// deps), so warmd must ALWAYS invoke that SAME venv's interpreter for
+	// a host-mode run — the manifest's PythonBin and the bootstrap's venv
+	// path MUST derive from the same hostWorkerDir, or warmd falls back
+	// to a bare "python3" outside the venv entirely. Docker-mode runs
+	// don't create this venv at all (the container has its own Python),
+	// so PythonBin stays unset there — unchanged from before.
+	if hostMode {
 		body.PythonBin = hostWorkerDir + "/.venv/bin/python3"
 	}
 	if err := calexec.WriteManifestBody(ctx, s3c, layout, body, hostWorkerDir, items, volumeSync, volumeCommit); err != nil {

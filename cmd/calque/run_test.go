@@ -263,3 +263,59 @@ func TestCollectLocalExtrasClassTransitiveThroughFreeRefs(t *testing.T) {
 		t.Fatalf("imports = %+v, want exactly [os] (reached transitively through _Adder's own FreeRefs)", imports)
 	}
 }
+
+// TestUvPythonArgvAlwaysIncludesUvAndModal proves dry-run's Python command
+// always goes through `uv run` — never the ambient shell's bare python3 —
+// and always injects "modal" even when the picked unit's own resolved
+// .image chain never itself pip_install()s Modal's SDK (a real script's
+// body routinely references modal.Secret/modal.Volume/etc. directly
+// without declaring modal as a dependency; found live against a real
+// AI-Almanac script's dry-run).
+func TestUvPythonArgvAlwaysIncludesUvAndModal(t *testing.T) {
+	argv := uvPythonArgv(nil)
+	if len(argv) < 2 || argv[0] != "uv" || argv[1] != "run" {
+		t.Fatalf("argv = %v, want to start with [uv run ...]", argv)
+	}
+	if argv[len(argv)-1] != "python3" {
+		t.Errorf("argv = %v, want to end with python3", argv)
+	}
+	foundModal := false
+	for i, a := range argv {
+		if a == "--with" && i+1 < len(argv) && argv[i+1] == "modal" {
+			foundModal = true
+		}
+	}
+	if !foundModal {
+		t.Errorf("argv = %v, want a --with modal pair even with no resolved pip deps", argv)
+	}
+}
+
+// TestUvPythonArgvInjectsResolvedPipDeps proves the picked unit's own
+// resolved .image pip_install(...) list is injected via --with alongside
+// modal, deduped (a package appearing in both the resolved Pip list and
+// the always-included "modal" set isn't repeated) and in a deterministic
+// (sorted) order so the command line is reproducible run to run.
+func TestUvPythonArgvInjectsResolvedPipDeps(t *testing.T) {
+	argv := uvPythonArgv([]string{"google-cloud-storage", "modal", "xarray"})
+	want := []string{"uv", "run", "--with", "google-cloud-storage", "--with", "modal", "--with", "xarray", "python3"}
+	if len(argv) != len(want) {
+		t.Fatalf("argv = %v, want %v", argv, want)
+	}
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("argv = %v, want %v", argv, want)
+		}
+	}
+}
+
+// TestUvPythonArgvCalquePythonOverrideBypassesUv proves the CALQUE_PYTHON
+// escape hatch still works exactly as before this change: when set, it's
+// used as a literal interpreter path, bypassing uv entirely.
+func TestUvPythonArgvCalquePythonOverrideBypassesUv(t *testing.T) {
+	t.Setenv("CALQUE_PYTHON", "/opt/custom/python3.11")
+	argv := uvPythonArgv([]string{"xarray"})
+	want := []string{"/opt/custom/python3.11"}
+	if len(argv) != 1 || argv[0] != want[0] {
+		t.Errorf("argv = %v, want %v (CALQUE_PYTHON must bypass uv entirely)", argv, want)
+	}
+}

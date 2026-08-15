@@ -178,79 +178,69 @@ func (b BootstrapConfig) Command() string {
 		// instance-role S3 + collect + terminate from the docker/GPU/model
 		// layer for the smoke test; for a real --script run, this is the
 		// path that drives a picked unit's OWN parsed body (calque#79).
-		if len(b.PipPackages) > 0 || b.PythonVersion != "" {
-			// calque#148 follow-up: install uv fresh every boot (its own
-			// installer script, NOT a distro package-manager assumption —
-			// works identically on AL2023/Ubuntu/Debian, unlike the
-			// apt-get-only python3 fallback this replaces) and use it to
-			// pin a Python version + install the picked unit's REAL
-			// third-party deps into a venv, instead of leaking "must
-			// already be on the AMI" and NameError-ing on execution.
-			pyVer := b.PythonVersion
-			if pyVer == "" {
-				pyVer = "3.12"
-			}
-			lines = append(lines,
-				"command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh",
-				`export PATH="$HOME/.local/bin:$PATH"`,
-				fmt.Sprintf("uv python install %s", pyVer),
-				fmt.Sprintf("uv venv --python %s %s/.venv", pyVer, wd),
-			)
-			if len(b.PipPackages) > 0 {
-				// A --pip package spec can be a git URL (e.g. "momp @
-				// git+https://github.com/hholb/ROMP.git@main", for a package
-				// with no PyPI release) — `uv pip install` shells out to a
-				// real `git` binary for that, which AL2023 (the AMI spawn
-				// auto-selects for non-GPU instance types like m6i.large)
-				// does NOT ship by default, unlike aws/dnf. Found live: a
-				// git-URL --pip spec failed fast with "Git executable not
-				// found" on an otherwise-correct uv/venv/pip-install
-				// sequence. apt-get-first/dnf-fallback mirrors this file's
-				// existing distro-detection pattern for the no-deps host-
-				// mode path below.
-				lines = append(lines,
-					"command -v git >/dev/null || (sudo apt-get update && sudo apt-get install -y git || sudo dnf install -y git)",
-				)
-				// `uv venv` creates a plain venv (python3/pip only) — it
-				// does NOT copy the uv binary itself in. Installing into
-				// that venv means invoking the TOP-LEVEL uv with
-				// --python pointed at the venv's interpreter, not
-				// expecting a uv binary inside .venv/bin.
-				quoted := make([]string, len(b.PipPackages))
-				for i, p := range b.PipPackages {
-					quoted[i] = fmt.Sprintf("%q", p)
-				}
-				lines = append(lines,
-					fmt.Sprintf("uv pip install --python %s/.venv/bin/python3 %s", wd, strings.Join(quoted, " ")),
-				)
-			}
-			// warmd itself reads the interpreter path from the MANIFEST's
-			// own PythonBin field (cmd/warmd/main.go's pyOr), not an env
-			// var — the caller building this ManifestBody MUST set
-			// PythonBin to this exact "<wd>/.venv/bin/python3" path
-			// (internal/exec.ManifestBody.PythonBin) or warmd falls back
-			// to plain "python3", which was never pip-installed into.
-			//
-			// The venv's bin/ is ALSO prepended to PATH before launching
-			// warmd — not for warmd itself, but for the picked unit's OWN
-			// body if it shells out to a BARE command name (e.g.
-			// subprocess.run(["momp-run", ...]), AI-Almanac's app.py) —
-			// warmd -> runner.py -> that subprocess call all inherit this
-			// same process environment/PATH, so a console-script entry
-			// point installed into the venv (via a package like `momp`,
-			// not just a plain pip package name) resolves correctly
-			// without the body needing to know the venv's absolute path.
-			lines = append(lines,
-				fmt.Sprintf(`export PATH="%s/.venv/bin:$PATH"`, wd),
-				fmt.Sprintf("AWS_REGION=%s %s/warmd run --manifest %s", b.Region, wd, manifest),
-			)
-			return strings.Join(lines, "\n")
+		//
+		// ALWAYS provisions a uv-managed venv (calque#148, widened): never
+		// depends on the AMI's own distro package manager for Python at
+		// all — an apt-get/dnf `python3` install was the pre-existing
+		// fallback for the no-deps case, replaced entirely so every
+		// host-mode run's interpreter is uv-managed regardless of whether
+		// --pip/--python-version were supplied.
+		pyVer := b.PythonVersion
+		if pyVer == "" {
+			pyVer = "3.12"
 		}
-		// No real deps needed (or none supplied) — unchanged pre-#148 path:
-		// runner.py needs only python3, which DL AMIs (and most Ubuntu
-		// AMIs) have.
 		lines = append(lines,
-			"command -v python3 >/dev/null || (sudo apt-get update && sudo apt-get install -y python3 || sudo dnf install -y python3)",
+			"command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh",
+			`export PATH="$HOME/.local/bin:$PATH"`,
+			fmt.Sprintf("uv python install %s", pyVer),
+			fmt.Sprintf("uv venv --python %s %s/.venv", pyVer, wd),
+		)
+		if len(b.PipPackages) > 0 {
+			// A --pip package spec can be a git URL (e.g. "momp @
+			// git+https://github.com/hholb/ROMP.git@main", for a package
+			// with no PyPI release) — `uv pip install` shells out to a
+			// real `git` binary for that, which AL2023 (the AMI spawn
+			// auto-selects for non-GPU instance types like m6i.large)
+			// does NOT ship by default, unlike aws/dnf. Found live: a
+			// git-URL --pip spec failed fast with "Git executable not
+			// found" on an otherwise-correct uv/venv/pip-install
+			// sequence.
+			lines = append(lines,
+				"command -v git >/dev/null || (sudo apt-get update && sudo apt-get install -y git || sudo dnf install -y git)",
+			)
+			// `uv venv` creates a plain venv (python3/pip only) — it
+			// does NOT copy the uv binary itself in. Installing into
+			// that venv means invoking the TOP-LEVEL uv with
+			// --python pointed at the venv's interpreter, not
+			// expecting a uv binary inside .venv/bin.
+			quoted := make([]string, len(b.PipPackages))
+			for i, p := range b.PipPackages {
+				quoted[i] = fmt.Sprintf("%q", p)
+			}
+			lines = append(lines,
+				fmt.Sprintf("uv pip install --python %s/.venv/bin/python3 %s", wd, strings.Join(quoted, " ")),
+			)
+		}
+		// warmd itself reads the interpreter path from the MANIFEST's
+		// own PythonBin field (cmd/warmd/main.go's pyOr), not an env
+		// var — the caller building this ManifestBody MUST set
+		// PythonBin to this exact "<wd>/.venv/bin/python3" path
+		// (internal/exec.ManifestBody.PythonBin) or warmd falls back
+		// to plain "python3", which was never provisioned by this venv.
+		// This is now UNCONDITIONAL (calque#148, widened) — the venv
+		// always exists, even with zero --pip packages.
+		//
+		// The venv's bin/ is ALSO prepended to PATH before launching
+		// warmd — not for warmd itself, but for the picked unit's OWN
+		// body if it shells out to a BARE command name (e.g.
+		// subprocess.run(["momp-run", ...]), AI-Almanac's app.py) —
+		// warmd -> runner.py -> that subprocess call all inherit this
+		// same process environment/PATH, so a console-script entry
+		// point installed into the venv (via a package like `momp`,
+		// not just a plain pip package name) resolves correctly
+		// without the body needing to know the venv's absolute path.
+		lines = append(lines,
+			fmt.Sprintf(`export PATH="%s/.venv/bin:$PATH"`, wd),
 			fmt.Sprintf("AWS_REGION=%s %s/warmd run --manifest %s", b.Region, wd, manifest),
 		)
 		return strings.Join(lines, "\n")

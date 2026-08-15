@@ -229,8 +229,12 @@ type batchRes struct {
 	Error   string  `json:"error"`
 }
 
-func startRunner(ctx context.Context, python string, script string) (*runner, error) {
-	cmd := exec.CommandContext(ctx, python, script)
+// startRunner launches the Python runner via pythonArgv (the FULL command —
+// e.g. ["uv","run","--with","modal","python3"] — never a bare interpreter
+// path; see cmd/calque/run.go's uvPythonArgv and cmd/warmd's pyOr for how
+// callers build this), with script appended as the final argument.
+func startRunner(ctx context.Context, pythonArgv []string, script string) (*runner, error) {
+	cmd := exec.CommandContext(ctx, pythonArgv[0], append(append([]string{}, pythonArgv[1:]...), script)...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -275,7 +279,13 @@ func (r *runner) close() {
 
 // Supervisor drives a warm runner over a set of items with crash-restart.
 type Supervisor struct {
-	Python      string // interpreter, e.g. "python3"
+	// Python is the FULL command that launches the interpreter — e.g.
+	// ["uv","run","--with","modal","python3"] — never a bare interpreter
+	// path. Calque never depends on the ambient shell's own python3/site-
+	// packages state; see cmd/calque/run.go's uvPythonArgv (dry-run) and
+	// cmd/warmd/main.go's pyOr (real-run manifest path) for how callers
+	// build this.
+	Python      []string
 	Script      string // path to runner.py
 	Config      Config
 	Sink        Sink
