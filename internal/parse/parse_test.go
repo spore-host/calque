@@ -1158,6 +1158,38 @@ func TestParseRareConstructsAreTaggedNotSilent(t *testing.T) {
 	}
 }
 
+// TestParseModalBatchedDecoratorLeaks (calque#91): @modal.batched(...) had
+// ZERO recognition at all before this fix — unlike its four from_name/
+// CloudBucketMount siblings tested above (TestParseRareConstructsAreTaggedNotSilent),
+// it fell through completely unnoticed, no leak, no tag. Proves it now gets
+// the SAME distinguishable leak treatment, AND that the leak is purely
+// additive: the decorated function still resolves normally (still findable,
+// still runnable) — batching itself is out of scope, only the leak is new.
+func TestParseModalBatchedDecoratorLeaks(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/batched_function.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "modal.batched") && (strings.Contains(l.Detail, "batching") || strings.Contains(l.Detail, "coalescing")) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a leak mentioning modal.batched + batching/coalescing; leaks=%+v", rep.Leaks)
+	}
+
+	if _, ok := app.FindFunction("process"); !ok {
+		t.Error(`function "process" not found in parsed app — the @modal.batched leak must be additive, not a refusal to parse the function`)
+	}
+}
+
 // TestParseMapIterables (calque#136): a real .map()/.starmap() iterable that
 // pyast could statically resolve (a literal list, a literal list of tuples,
 // or a range()) must land in ir.Function.Items; an unresolvable one (a
