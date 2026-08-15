@@ -651,6 +651,28 @@ def _describe_fn(
                 "lineno": getattr(d, "lineno", node.lineno),
             }
         )
+    # calque#91: @modal.batched(...) requests automatic request-coalescing —
+    # it's a MODIFIER stacked on top of whatever shape the function already
+    # has (a plain @app.function, an @app.cls method, etc.), not a new
+    # entry_kind value (unlike _SERVE_DECOS/_entry_kind above). Before this,
+    # it fell through completely unnoticed — zero leak at all, unlike its
+    # four from_name/CloudBucketMount siblings above, which already get a
+    # distinguishable "where" tag. Matched by trailing decorator name, same
+    # style as the @app.function check in _try_expand_decorated_loop.
+    if leaks is not None:
+        for d in node.decorator_list:
+            if _decorator_name(d).rsplit(".", 1)[-1] == "batched":
+                leaks.append(
+                    {
+                        "where": "modal.batched",
+                        "detail": (
+                            "@modal.batched(...) requests automatic request-coalescing/batching of concurrent "
+                            "calls into one call with list-valued args; calque does not reproduce this -- the "
+                            "function still runs, just without Modal's batching behavior"
+                        ),
+                        "lineno": getattr(d, "lineno", node.lineno),
+                    }
+                )
     return {
         "name": node.name,
         "lineno": node.lineno,
