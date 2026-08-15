@@ -104,6 +104,21 @@ type BootstrapConfig struct {
 	// runs, in either mode. nil/empty (the default) is a no-op, reproducing
 	// prior behavior byte-for-byte for every script with no CloudBucketMount.
 	CloudBucketMountLines []string
+	// NFSMountLines are already-rendered shell lines (calque#91 Workstream B)
+	// that mount every resolved modal.NetworkFileSystem.from_name(...) via
+	// NFS against a pre-provisioned (bring-your-own) EFS filesystem — the
+	// caller (cmd/calque/realrun.go) builds these after resolving the real
+	// EFS filesystem ID/DNS name via internal/plan/efs.go's
+	// DiscoverEFSFilesystem/ResolveMountTargetsForAZs, so this package never
+	// needs to import internal/plan (no import-cycle risk) or make any AWS
+	// call itself — same posture as CloudBucketMountLines above. Spliced in
+	// at the SAME point as CloudBucketMountLines (order between the two
+	// doesn't matter; both must land after artifact sync, before either the
+	// HostMode or docker-mode run invocation — the mount must be live before
+	// @enter runs, in either mode). nil/empty (the default) is a no-op,
+	// reproducing prior behavior byte-for-byte for every script with no
+	// NetworkFileSystem.
+	NFSMountLines []string
 }
 
 // ecrHostname matches an ECR registry hostname, e.g.
@@ -188,6 +203,13 @@ func (b BootstrapConfig) Command() string {
 	// either mode. Empty (the default) is a no-op.
 	if len(b.CloudBucketMountLines) > 0 {
 		lines = append(lines, b.CloudBucketMountLines...)
+	}
+	// calque#91 Workstream B: mount every resolved
+	// modal.NetworkFileSystem.from_name(...) via NFS against a
+	// pre-provisioned EFS filesystem, same splice point/rationale as
+	// CloudBucketMountLines above. Empty (the default) is a no-op.
+	if len(b.NFSMountLines) > 0 {
+		lines = append(lines, b.NFSMountLines...)
 	}
 
 	if b.HostMode {

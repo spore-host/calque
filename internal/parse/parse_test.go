@@ -2,6 +2,7 @@ package parse
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -1122,11 +1123,12 @@ func TestParseScheduleObjectForms(t *testing.T) {
 	}
 }
 
-// TestParseRareConstructsAreTaggedNotSilent (calque#91): modal.Dict/Queue/
-// NetworkFileSystem.from_name(...) and App.include(...) must each fire a
-// DISTINCT, named leak — before this fix, all three vanished entirely (no
-// visit_Assign branch matched them). None of these are modeled; this only
-// proves each is now a clean grep hit instead of silence.
+// TestParseRareConstructsAreTaggedNotSilent (calque#91): modal.Dict/Queue.
+// from_name(...) and App.include(...) must each fire a DISTINCT, named leak
+// — before this fix, all four (Dict/Queue/NetworkFileSystem/App.include)
+// vanished entirely (no visit_Assign branch matched them). None of Dict/
+// Queue/App.include are modeled; this only proves each is now a clean grep
+// hit instead of silence.
 //
 // modal.CloudBucketMount is NOT asserted here anymore (calque#91 Workstream
 // A): it moved from "recognized but not modeled" to a REAL, resolved S3
@@ -1136,6 +1138,13 @@ func TestParseScheduleObjectForms(t *testing.T) {
 // the same as an ordinary Volume mount. See
 // TestParseCloudBucketMountResolves for the positive (modeled) case, using
 // testdata/scripts/cloud_bucket_mount.py instead.
+//
+// modal.NetworkFileSystem is likewise NOT asserted here anymore (calque#91
+// Workstream B): its from_name(...) binding is now structurally tracked
+// (mirroring Volume's own zero-leak-on-just-the-binding posture), so
+// rare_constructs.py's unused shared_fs var emits no leak at all. See
+// TestParseNetworkFileSystemResolves for the positive (real EFS mount) case,
+// using testdata/scripts/network_file_system.py instead.
 func TestParseRareConstructsAreTaggedNotSilent(t *testing.T) {
 	r, args := runner(t)
 	rep := &leak.Report{}
@@ -1146,16 +1155,18 @@ func TestParseRareConstructsAreTaggedNotSilent(t *testing.T) {
 	}
 
 	wantTag := map[string]bool{
-		"modal.Dict":              true,
-		"modal.Queue":             true,
-		"modal.NetworkFileSystem": true,
-		"App.include":             true,
+		"modal.Dict":  true,
+		"modal.Queue": true,
+		"App.include": true,
 	}
 	for _, l := range rep.Leaks {
 		for tag := range wantTag {
 			if strings.Contains(l.Detail, `flagged "`+tag+`"`) {
 				delete(wantTag, tag)
 			}
+		}
+		if strings.Contains(l.Detail, `flagged "modal.NetworkFileSystem"`) {
+			t.Errorf("modal.NetworkFileSystem.from_name(...) binding alone must not leak anymore (calque#91 Workstream B: structurally tracked, same posture as Volume) — got: %+v", l)
 		}
 	}
 	if len(wantTag) != 0 {
@@ -1202,6 +1213,123 @@ func TestParseCloudBucketMountResolves(t *testing.T) {
 		if strings.Contains(l.Detail, "CloudBucketMount") {
 			t.Errorf("unexpected CloudBucketMount leak for a fully-resolved literal mount: %+v", l)
 		}
+	}
+}
+
+// TestParseNetworkFileSystemResolves (calque#91 Workstream B) proves the
+// POSITIVE case: a real modal.NetworkFileSystem.from_name(...) used as a
+// network_file_systems= value resolves to ir.Function.NetworkFileSystems —
+// a real (bring-your-own) EFS mount — not a leak.
+// testdata/scripts/network_file_system.py is the fixture.
+func TestParseNetworkFileSystemResolves(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/network_file_system.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	fn, ok := app.FindFunction("use_shared_fs")
+	if !ok {
+		t.Fatalf("function %q not found in parsed app", "use_shared_fs")
+	}
+	mount, ok := fn.NetworkFileSystems["/shared"]
+	if !ok {
+		t.Fatalf("NetworkFileSystems[%q] missing; got %+v", "/shared", fn.NetworkFileSystems)
+	}
+	if mount.Name != "shared-fs" {
+		t.Errorf("Name = %q, want %q", mount.Name, "shared-fs")
+	}
+	if fn.Volumes != nil {
+		t.Errorf("Volumes = %+v, want nil (this mount is a NetworkFileSystem, not an ordinary Volume)", fn.Volumes)
+	}
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "NetworkFileSystem") || strings.Contains(l.Detail, "network_file_systems") {
+			t.Errorf("unexpected NetworkFileSystem leak for a fully-resolved mount: %+v", l)
+		}
+	}
+}
+
+// TestParseNetworkFileSystemClassAndMethodInherit (calque#91 Workstream B)
+// proves a @cls's own network_file_systems= is inherited by a @method
+// declaring none of its own — mirrors the existing CloudBucketMounts/Volumes
+// class->method inheritance in buildClass.
+func TestParseNetworkFileSystemClassAndMethodInherit(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	dir := t.TempDir()
+	script := dir + "/nfs_class.py"
+	src := `
+import modal
+
+app = modal.App("nfs-class")
+
+shared_fs = modal.NetworkFileSystem.from_name("shared-fs")
+
+
+@app.cls(network_file_systems={"/shared": shared_fs})
+class Worker:
+    @modal.method()
+    def run(self, x):
+        return x
+`
+	if err := os.WriteFile(script, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(app.Classes) != 1 {
+		t.Fatalf("classes = %d, want 1", len(app.Classes))
+	}
+	cls := app.Classes[0]
+	if cls.NetworkFileSystems["/shared"].Name != "shared-fs" {
+		t.Errorf("class NetworkFileSystems = %+v, want /shared->shared-fs", cls.NetworkFileSystems)
+	}
+	if len(cls.Methods) != 1 {
+		t.Fatalf("methods = %d, want 1", len(cls.Methods))
+	}
+	if cls.Methods[0].NetworkFileSystems["/shared"].Name != "shared-fs" {
+		t.Errorf("method should inherit class's NetworkFileSystems, got %+v", cls.Methods[0].NetworkFileSystems)
+	}
+}
+
+// TestParseNetworkFileSystemCreateIfMissingLeaks (calque#91 Workstream B)
+// proves create_if_missing=True leaks distinctly (calque never auto-creates
+// an EFS filesystem — bring-your-own only), while the mount itself still
+// resolves normally (the leak is purely additive, mirroring
+// TestParseModalBatchedDecoratorLeaks' "leak is additive, not a blocker"
+// shape).
+func TestParseNetworkFileSystemCreateIfMissingLeaks(t *testing.T) {
+	r, args := runner(t)
+	rep := &leak.Report{}
+	script, _ := filepath.Abs("../../testdata/scripts/network_file_system_create_if_missing.py")
+
+	app, err := Parse(context.Background(), script, rep, r, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	fn, ok := app.FindFunction("use_shared_fs")
+	if !ok {
+		t.Fatalf("function %q not found in parsed app", "use_shared_fs")
+	}
+	if fn.NetworkFileSystems["/shared"].Name != "shared-fs" {
+		t.Errorf("mount should still resolve despite create_if_missing=True, got %+v", fn.NetworkFileSystems)
+	}
+
+	found := false
+	for _, l := range rep.Leaks {
+		if strings.Contains(l.Detail, "create_if_missing=True") && strings.Contains(l.Detail, "bring-your-own EFS") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a create_if_missing=True leak naming bring-your-own EFS; leaks=%+v", rep.Leaks)
 	}
 }
 

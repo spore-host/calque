@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/efs"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 
@@ -423,6 +424,26 @@ func realRun(o realOpts) (err error) {
 		}
 	}
 
+	// calque#91 Workstream B: a script's REAL modal.NetworkFileSystem.
+	// from_name(...) mounts (a pre-provisioned, bring-your-own EFS
+	// filesystem — NOT auto-created) resolve into shell lines spliced into
+	// the bootstrap script, a security group ID the launched instance needs
+	// attached (NFS/2049 ingress), and a NARROWED places list (only AZs
+	// with a live mount target for every required mount). Must run BEFORE
+	// the Acquirer is built, since it can genuinely narrow (or, if no AZ
+	// has coverage, error out) the placements the acquirer sweeps. A script
+	// with no NetworkFileSystems (the vast majority) leaves places
+	// unchanged and returns no lines/security groups.
+	nfsMountLines, nfsSecurityGroupIDs, narrowedPlaces, err := networkFileSystemSpecsForApp(ctx, efs.NewFromConfig(cfg), ec2.NewFromConfig(cfg), app, o.region, places, rep)
+	if err != nil {
+		return fmt.Errorf("resolve network_file_systems: %w", err)
+	}
+	places = narrowedPlaces
+	// boot was already constructed above (before this AZ-narrowing step, to
+	// keep boot's own field-init block a single literal); splice the
+	// resolved NFS mount lines in now — nil/empty (the default) is a no-op.
+	boot.NFSMountLines = nfsMountLines
+
 	spawnClient, err := spawnaws.NewClientWithRegion(ctx, o.region)
 	if err != nil {
 		return fmt.Errorf("spawn client: %w", err)
@@ -446,6 +467,7 @@ func realRun(o realOpts) (err error) {
 		RootVolumeGiB:  200, // vLLM image + weights blow past spawn's 20 GiB default
 		Spot:           o.spot, SpotMaxPrice: o.spotMaxPrice,
 		IamInstanceProfile: iamProfile,
+		SecurityGroupIDs:   nfsSecurityGroupIDs, // calque#91 Workstream B: nil unless the script has a real network_file_systems= mount
 		RunID:              o.runID, Command: "real",
 	}.Build()
 	if o.spot {
@@ -569,6 +591,106 @@ func volumeSpecsForApp(app ir.App, bucket string, rep *leak.Report) (sync, commi
 		}
 	}
 	return sync, commit
+}
+
+// networkFileSystemSpecsForApp resolves app's REAL modal.NetworkFileSystem.
+// from_name(...) mounts (calque#91 Workstream B) into the already-rendered
+// shell lines spliced into BootstrapConfig.NFSMountLines, the security
+// group ID(s) the launched instance needs attached (for NFS/2049 ingress),
+// and a NARROWED placement list — unlike cloudBucketMountSpecsForApp, this
+// one genuinely makes AWS calls (DiscoverEFSFilesystem/
+// ResolveMountTargetsForAZs/EnsureNFSSecurityGroup, all real
+// DescribeFileSystems/DescribeMountTargets/DescribeSecurityGroups/
+// CreateSecurityGroup/AuthorizeSecurityGroupIngress round-trips), so it
+// takes ctx + AWS clients and can genuinely error (a missing/ambiguous EFS
+// filesystem tag, or an AZ sweep with NO coverage at all for a required
+// mount, is a hard failure — not a leak: there is no placement the acquirer
+// could land in that would make the mount work). places is the AZ-sweep
+// result BEFORE narrowing (calexec.AZsForInstance's own output, translated
+// to plan.Placement); the returned narrowed slice is the intersection of
+// places with "has a live EFS mount target for EVERY required
+// NetworkFileSystem" — narrowing to zero when the app DOES declare
+// network_file_systems is treated as a hard error (no AZ the acquirer could
+// land in would let the mount succeed), never a silent full-open sweep. A
+// script with no NetworkFileSystems (the vast majority) returns (nil, nil,
+// places, nil) — the SAME places slice the caller already had, unchanged.
+func networkFileSystemSpecsForApp(ctx context.Context, efsClient *efs.Client, ec2Client *ec2.Client, app ir.App, region string, places []plan.Placement, rep *leak.Report) (lines []string, securityGroupIDs []string, narrowed []plan.Placement, err error) {
+	mounts := plan.ResolveNetworkFileSystems(app, rep)
+	if len(mounts) == 0 {
+		return nil, nil, places, nil
+	}
+
+	azs := make([]string, 0, len(places))
+	seenAZ := map[string]bool{}
+	for _, p := range places {
+		if !seenAZ[p.AZ] {
+			seenAZ[p.AZ] = true
+			azs = append(azs, p.AZ)
+		}
+	}
+
+	// dnsByName is keyed by Modal NetworkFileSystem name (distinct mounts can
+	// resolve to distinct EFS filesystems, each with its own DNS name); az
+	// coverage is the INTERSECTION across every distinct filesystem — an AZ
+	// only counts if EVERY required mount has a live mount target there.
+	dnsByName := map[string]string{}
+	var azCoverage map[string]bool
+	seenName := map[string]bool{}
+	for _, m := range mounts {
+		if seenName[m.Name] {
+			continue
+		}
+		seenName[m.Name] = true
+
+		fsID, derr := plan.DiscoverEFSFilesystem(ctx, efsClient, m.Name)
+		if derr != nil {
+			return nil, nil, nil, derr
+		}
+		dnsByName[m.Name] = spawnaws.GetEFSDNSName(fsID, region)
+
+		dnsPerAZ, missingAZs, rerr := plan.ResolveMountTargetsForAZs(ctx, efsClient, fsID, region, azs)
+		if rerr != nil {
+			return nil, nil, nil, rerr
+		}
+		if len(missingAZs) > 0 {
+			rep.Addf(leak.PrimVolume, leak.KindIntegrationEdge, app.Script, 0,
+				"NetworkFileSystem %q (EFS filesystem %s): no mount target in AZ(s) %v — placement narrowed away from them", m.Name, fsID, missingAZs)
+		}
+		thisCoverage := map[string]bool{}
+		for az := range dnsPerAZ {
+			thisCoverage[az] = true
+		}
+		if azCoverage == nil {
+			azCoverage = thisCoverage
+		} else {
+			for az := range azCoverage {
+				if !thisCoverage[az] {
+					delete(azCoverage, az)
+				}
+			}
+		}
+	}
+
+	for _, p := range places {
+		if azCoverage[p.AZ] {
+			narrowed = append(narrowed, p)
+		}
+	}
+	if len(narrowed) == 0 {
+		return nil, nil, nil, fmt.Errorf("network_file_systems declared, but no offered AZ has a live EFS mount target for every required mount — no placement the acquirer could land in would let the mount succeed")
+	}
+
+	vpcID, verr := plan.DefaultVPCID(ctx, ec2Client)
+	if verr != nil {
+		return nil, nil, nil, fmt.Errorf("resolve default VPC for NFS security group: %w", verr)
+	}
+	sgID, serr := plan.EnsureNFSSecurityGroup(ctx, ec2Client, vpcID)
+	if serr != nil {
+		return nil, nil, nil, fmt.Errorf("ensure NFS security group: %w", serr)
+	}
+
+	lines = plan.NFSMountCommands(mounts, dnsByName)
+	return lines, []string{sgID}, narrowed, nil
 }
 
 // cloudBucketMountSpecsForApp resolves app's REAL modal.CloudBucketMount(...)

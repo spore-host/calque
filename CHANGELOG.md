@@ -11,6 +11,22 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Added
 
+- Real `modal.NetworkFileSystem` → EFS mount support (calque#91 Workstream
+  B), the second real-mapping workstream calque#91 was tracking (Workstream
+  A, `modal.CloudBucketMount` → S3, shipped in v0.5.1). A real
+  `NetworkFileSystem.from_name(name)` used as a
+  `network_file_systems={mount: nfs}` value (a SEPARATE decorator kwarg
+  from `volumes=`, never nested inside it) now resolves to a real EFS-over-
+  NFS mount — bring-your-own only: calque never auto-creates an EFS
+  filesystem (`create_if_missing=True` is a distinct leak, not a blocker),
+  discovering the pre-provisioned filesystem via a `calque:nfs-name=<name>`
+  tag convention. A `calque real`/`fleetrun` narrows its AZ sweep to only
+  AZs with a live EFS mount target for every required mount (a hard error,
+  not a leak, if that narrows to zero) and attaches a self-referential
+  NFS/2049-ingress security group to the launched instance. IAM
+  (`elasticfilesystem:ClientMount`/`ClientWrite`) is explicitly out of
+  scope for this pass. `modal.Dict`/`Queue`/`App.include` remain
+  deliberately leak-only, out of scope.
 - New `calque ami bake`/`ami list`/`ami delete` subcommands (calque#144)
   pre-bake a custom AMI with a docker image's layers already pulled, so
   `real`/`ramp`/`fleetrun`/`spawn-run`'s bootstrap no longer pays a fresh

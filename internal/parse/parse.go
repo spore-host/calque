@@ -29,16 +29,20 @@ type pyOut struct {
 	// — a function/class declaring neither inherits from here. image= is
 	// deliberately absent: real per-function image RESOLUTION (not just an
 	// app-level fallback) is a separately-tracked gap, see resolveImage.
-	AppKwargs    map[string]json.RawMessage `json:"app_kwargs"`
-	Images       map[string]pyImage         `json:"images"`
-	Volumes      map[string]pyVolume        `json:"volumes"`
-	Functions    []pyFunc                   `json:"functions"`
-	Classes      []pyClass                  `json:"classes"`
-	Entrypoints  []pyFunc                   `json:"entrypoints"`
-	MapCalls     []pyMapCall                `json:"map_calls"`
-	InvokeCalls  []pyInvokeCall             `json:"invoke_calls"`
-	VolumeWrites []pyVolumeWrite            `json:"volume_writes"`
-	HelperLeaks  []map[string]any           `json:"helper_leaks"`
+	AppKwargs map[string]json.RawMessage `json:"app_kwargs"`
+	Images    map[string]pyImage         `json:"images"`
+	Volumes   map[string]pyVolume        `json:"volumes"`
+	// NetworkFileSystems is every module-level modal.NetworkFileSystem.
+	// from_name(...) var, keyed by var name (calque#91 Workstream B) —
+	// mirrors Volumes' own wire shape exactly.
+	NetworkFileSystems map[string]pyVolume `json:"network_file_systems"`
+	Functions          []pyFunc            `json:"functions"`
+	Classes            []pyClass           `json:"classes"`
+	Entrypoints        []pyFunc            `json:"entrypoints"`
+	MapCalls           []pyMapCall         `json:"map_calls"`
+	InvokeCalls        []pyInvokeCall      `json:"invoke_calls"`
+	VolumeWrites       []pyVolumeWrite     `json:"volume_writes"`
+	HelperLeaks        []map[string]any    `json:"helper_leaks"`
 	// ModuleConsts is every module-level `NAME = <literal-or-expression>`
 	// assignment, keyed by name (calque#139) — the shippable half of
 	// free-variable resolution besides Functions itself (a FreeRefs name may
@@ -306,6 +310,14 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	for name, v := range out.Volumes {
 		app.Volumes[name] = v.FromName
 	}
+	// calque#91 Workstream B: module-level NetworkFileSystem.from_name(...)
+	// vars, keyed by var name — mirrors app.Volumes' own population exactly.
+	if len(out.NetworkFileSystems) > 0 {
+		app.NetworkFileSystems = make(map[string]string, len(out.NetworkFileSystems))
+		for name, v := range out.NetworkFileSystems {
+			app.NetworkFileSystems[name] = v.FromName
+		}
+	}
 
 	// calque#139: module-level constants + module-level functions (incl.
 	// plain, undecorated helpers absent from out.Functions), the two
@@ -379,19 +391,19 @@ func build(out pyOut, rep *leak.Report) ir.App {
 	items := mapItems(out)
 
 	for _, f := range out.Functions {
-		fn := buildFn(f, script, rep, invokes, items)
+		fn := buildFn(f, script, rep, invokes, items, app.NetworkFileSystems)
 		applyAppDefaults(&fn.Volumes, &fn.Config.Secrets, app.DefaultVolumes, app.DefaultSecrets)
 		fn.Image = resolveCallableImage(f.Decorators, out, app.Image, script, rep)
 		app.Functions = append(app.Functions, fn)
 	}
 	for _, c := range out.Classes {
-		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items, app.DefaultVolumes, app.DefaultSecrets, out, app.Image))
+		app.Classes = append(app.Classes, buildClass(c, script, rep, invokes, items, app.DefaultVolumes, app.DefaultSecrets, out, app.Image, app.NetworkFileSystems))
 	}
 	for _, ep := range out.Entrypoints {
 		// @app.local_entrypoint() runs LOCALLY, not in a container — App-level
 		// volumes=/secrets=/image= inheritance doesn't apply here (nothing to
 		// mount/inject/build for).
-		app.Entrypoints = append(app.Entrypoints, buildFn(ep, script, rep, invokes, items))
+		app.Entrypoints = append(app.Entrypoints, buildFn(ep, script, rep, invokes, items, app.NetworkFileSystems))
 	}
 
 	// E3: volume.commit()/reload() call sites. A volume that's WRITTEN (not just
@@ -797,7 +809,23 @@ func resolveCallableImage(decos []pyDecorator, out pyOut, appImage ir.Image, scr
 	return appImage
 }
 
-func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any) ir.Function {
+// nfsVarNames is app.NetworkFileSystems (var name -> from_name string) —
+// threaded through buildFn/buildClass so a callable's own mount-path -> var
+// name map (from readConfigKwargs' nfs return) can resolve through to the
+// real Modal name, the same two-step indirection volumeSpecsForApp
+// (cmd/calque/realrun.go) already reverses for Volumes.
+func resolveNFSVarNames(mountToVar map[string]string, nfsVarNames map[string]string) map[string]ir.NetworkFileSystemMount {
+	if len(mountToVar) == 0 {
+		return nil
+	}
+	out := make(map[string]ir.NetworkFileSystemMount, len(mountToVar))
+	for mountPath, varName := range mountToVar {
+		out[mountPath] = ir.NetworkFileSystemMount{Name: nfsVarNames[varName]}
+	}
+	return out
+}
+
+func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any, nfsVarNames map[string]string) ir.Function {
 	fn := ir.Function{
 		Name:        f.Name,
 		Body:        f.Body,
@@ -819,7 +847,7 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 	// The function-config decorator is the one named "*.function" (or "*.method"
 	// for class methods); enter/method markers carry no gpu/volumes.
 	for _, d := range f.Decorators {
-		gpu, vols, cbm, timeout, cfg := readConfigKwargs(d.Kwargs, leak.PrimGPU, f.Name, script, d.Lineno, rep)
+		gpu, vols, cbm, nfs, timeout, cfg := readConfigKwargs(d.Kwargs, leak.PrimGPU, f.Name, script, d.Lineno, rep)
 		if gpu != "" {
 			fn.GPU = gpu
 		}
@@ -829,6 +857,9 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 		if cbm != nil {
 			fn.CloudBucketMounts = cbm
 		}
+		if nfs != nil {
+			fn.NetworkFileSystems = resolveNFSVarNames(nfs, nfsVarNames)
+		}
 		if timeout != 0 {
 			fn.Timeout = timeout
 		}
@@ -837,10 +868,11 @@ func buildFn(f pyFunc, script string, rep *leak.Report, invokes map[string]ir.In
 	return fn
 }
 
-func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any, defaultVolumes map[string]string, defaultSecrets []string, out pyOut, appImage ir.Image) ir.Class {
+func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]ir.InvokeKind, items map[string][]any, defaultVolumes map[string]string, defaultSecrets []string, out pyOut, appImage ir.Image, nfsVarNames map[string]string) ir.Class {
 	cls := ir.Class{Name: c.Name, Line: c.Lineno}
-	gpu, vols, cbm, timeout, cfg := readConfigKwargs(c.ClsKwargs, leak.PrimGPU, c.Name, script, c.Lineno, rep)
+	gpu, vols, cbm, nfs, timeout, cfg := readConfigKwargs(c.ClsKwargs, leak.PrimGPU, c.Name, script, c.Lineno, rep)
 	cls.GPU, cls.Volumes, cls.CloudBucketMounts, cls.Timeout, cls.Config = gpu, vols, cbm, timeout, cfg
+	cls.NetworkFileSystems = resolveNFSVarNames(nfs, nfsVarNames)
 	// calque#168: App-level volumes=/secrets= inherited if the CLASS itself
 	// declares none — before a method's own class->method fallback below.
 	applyAppDefaults(&cls.Volumes, &cls.Config.Secrets, defaultVolumes, defaultSecrets)
@@ -879,7 +911,7 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 		}
 	}
 	for _, m := range c.Methods {
-		method := buildFn(m, script, rep, invokes, items)
+		method := buildFn(m, script, rep, invokes, items, nfsVarNames)
 		// A class method inherits the class's gpu/volumes/secrets/image if it
 		// declares none of its own (calque#168/#174 extend this existing
 		// pattern one level up: the class itself may have already inherited
@@ -895,6 +927,9 @@ func buildClass(c pyClass, script string, rep *leak.Report, invokes map[string]i
 		}
 		if method.CloudBucketMounts == nil {
 			method.CloudBucketMounts = cls.CloudBucketMounts
+		}
+		if method.NetworkFileSystems == nil {
+			method.NetworkFileSystems = cls.NetworkFileSystems
 		}
 		if len(method.Config.Secrets) == 0 {
 			method.Config.Secrets = cls.Config.Secrets
@@ -931,7 +966,11 @@ var autoscalingKwargs = map[string]bool{
 // anything else it can't model becomes a generic leak (§10). cbm is calque#91
 // Workstream A's real CloudBucketMount->S3-mount resolution, alongside the
 // pre-existing plain-Volume vols map — see decodeVolumesAndCloudBucketMounts.
-func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner, script string, line int, rep *leak.Report) (gpu string, vols map[string]string, cbm map[string]ir.CloudBucketMount, timeout int, cfg ir.Config) {
+// nfs is calque#91 Workstream B's mount-path -> NetworkFileSystem VAR NAME map
+// (mirroring vols' own mount-path -> Volume var name shape exactly) — see
+// decodeNetworkFileSystems; the caller (buildFn/buildClass) resolves the var
+// name through app.NetworkFileSystems to the real from_name string.
+func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner, script string, line int, rep *leak.Report) (gpu string, vols map[string]string, cbm map[string]ir.CloudBucketMount, nfs map[string]string, timeout int, cfg ir.Config) {
 	for k, raw := range kwargs {
 		switch k {
 		case "gpu":
@@ -959,6 +998,11 @@ func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner
 			}
 		case "volumes":
 			vols, cbm = decodeVolumesAndCloudBucketMounts(raw, owner, script, line, rep)
+		case "network_file_systems":
+			// calque#91 Workstream B: a SEPARATE decorator kwarg from volumes=
+			// (never nested inside it, unlike CloudBucketMount) — see
+			// decodeNetworkFileSystems.
+			nfs = decodeNetworkFileSystems(raw, owner, script, line, rep)
 		case "cpu":
 			// cpu= is cores (int or float) in Modal; a [request, limit] list also
 			// occurs (mirrors memory=) — take the request (first) element and leak
@@ -1047,7 +1091,7 @@ func readConfigKwargs(kwargs map[string]json.RawMessage, _ leak.Primitive, owner
 				"%s: unmodeled decorator arg %q=%s", owner, k, string(raw))
 		}
 	}
-	return gpu, vols, cbm, timeout, cfg
+	return gpu, vols, cbm, nfs, timeout, cfg
 }
 
 // decodeVolumesAndCloudBucketMounts decodes a volumes= kwarg's raw JSON into
@@ -1120,6 +1164,42 @@ func decodeCloudBucketMount(raw json.RawMessage) (ir.CloudBucketMount, bool) {
 		KeyPrefix:  wrapper.CBM.KeyPrefix,
 		ReadOnly:   wrapper.CBM.ReadOnly,
 	}, true
+}
+
+// decodeNetworkFileSystems decodes a network_file_systems= kwarg's raw JSON
+// into the {mount_path: nfs_var_name} map (calque#91 Workstream B) — mirrors
+// decodeVolumesAndCloudBucketMounts' plain-string vols half exactly, since
+// pyast's _network_file_systems_map emits the identical
+// {mount_path: var_name} shape _volumes_map already emits for an ordinary
+// Volume mount (a NetworkFileSystem is always assigned to a variable first,
+// never constructed inline the way CloudBucketMount is, so there is no
+// second, distinguishable wire shape to decode here). A raw value that isn't
+// even a JSON object at all leaks; an individual mount path whose value isn't
+// a plain string (pyast's own ast.unparse(...) fallback for an unresolvable
+// expression) is silently absent from the returned map — pyast's own
+// helper_leaks already named that case when it recognized the construct (see
+// _network_file_systems_map), so no second, redundant leak is emitted here.
+func decodeNetworkFileSystems(raw json.RawMessage, owner, script string, line int, rep *leak.Report) map[string]string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		rep.Addf(leak.PrimVolume, leak.KindUnsupportedArg, script, line,
+			"%s: network_file_systems= not a {str:str} map (%s)", owner, string(raw))
+		return nil
+	}
+	var nfs map[string]string
+	for mountPath, rawVal := range m {
+		if s, ok := decodeString(rawVal); ok {
+			if nfs == nil {
+				nfs = map[string]string{}
+			}
+			nfs[mountPath] = s
+		}
+	}
+	if nfs == nil {
+		rep.Addf(leak.PrimVolume, leak.KindUnsupportedArg, script, line,
+			"%s: network_file_systems= not a {str:str} map (%s)", owner, string(raw))
+	}
+	return nfs
 }
 
 // ---- small decode helpers (kwargs are heterogeneous JSON) ----

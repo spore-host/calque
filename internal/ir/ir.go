@@ -19,6 +19,16 @@ type App struct {
 	// before @enter, never written back — matches Modal, where an
 	// uncommitted local write is never visible to another container).
 	CommittedVolumes map[string]bool
+	// NetworkFileSystems is every module-level modal.NetworkFileSystem.
+	// from_name(...) var, keyed by its own var name (calque#91 Workstream
+	// B) — the SAME var-name-indirection App.Volumes already carries for
+	// Volume.from_name(...): the value is from_name's own string arg. A
+	// Function/Class's own NetworkFileSystems map (below) is keyed by
+	// MOUNT PATH -> this var name, needing this table to resolve through to
+	// the real Modal name, exactly the two-step indirection
+	// volumeSpecsForApp (cmd/calque/realrun.go) already reverses for
+	// Volumes.
+	NetworkFileSystems map[string]string
 	// DefaultVolumes/DefaultSecrets are App(volumes=..., secrets=...)'s own
 	// kwargs (calque#168) — a Function/Class declaring neither inherits
 	// from here, the same fallback-if-own-is-empty shape buildClass already
@@ -197,6 +207,15 @@ type CloudBucketMount struct {
 	ReadOnly   bool
 }
 
+// NetworkFileSystemMount is one modal.NetworkFileSystem.from_name(...)
+// used as a network_file_systems= value (calque#91 Workstream B) — mounts
+// a pre-provisioned EFS filesystem (discovered via a calque:nfs-name=<name>
+// tag) at the given path, live-shared across the run (unlike Volume's
+// snapshot-and-sync S3 model).
+type NetworkFileSystemMount struct {
+	Name string // from_name's own string arg
+}
+
 // Function is an @app.function (or, when embedded in a Class, an @method).
 type Function struct {
 	Name string
@@ -217,14 +236,23 @@ type Function struct {
 	// mount path, disjoint from Volumes above (a given mount path is either
 	// an ordinary Volume or a CloudBucketMount, never both).
 	CloudBucketMounts map[string]CloudBucketMount
-	Timeout           int        // seconds; 0 if unset
-	Config            Config     // portable decorator config (cpu/memory/retries/secrets/schedule/region)
-	IsMap             bool       // is this callable's .map() invoked anywhere in the script?
-	Invoke            InvokeKind // how the callable is invoked (map/starmap/for_each/remote); §C
-	EntryKind         EntryKind  // execution shape: batch (default) or serve (§F)
-	Body              string     // verbatim payload, shipped to the worker
-	Args              []string   // verbatim parameter names, incl. self/cls (calque#92: needed to reconstruct a .local()-referenced sibling's call signature)
-	ItemArg           string     // first non-self parameter name — the per-item arg the warm runner binds
+	// NetworkFileSystems is every modal.NetworkFileSystem.from_name(...) used
+	// as a network_file_systems= value on this callable (calque#91 Workstream
+	// B) — a real EFS mount, bring-your-own (never auto-created). Keyed by
+	// mount path; independent of Volumes/CloudBucketMounts above — a mount
+	// path belongs to exactly one of the three maps, but NFS's own key space
+	// carries no disjointness risk worth calling out the way CloudBucketMounts
+	// did (network_file_systems= is Modal's own separate decorator kwarg, not
+	// nested inside volumes= the way CloudBucketMount is).
+	NetworkFileSystems map[string]NetworkFileSystemMount
+	Timeout            int        // seconds; 0 if unset
+	Config             Config     // portable decorator config (cpu/memory/retries/secrets/schedule/region)
+	IsMap              bool       // is this callable's .map() invoked anywhere in the script?
+	Invoke             InvokeKind // how the callable is invoked (map/starmap/for_each/remote); §C
+	EntryKind          EntryKind  // execution shape: batch (default) or serve (§F)
+	Body               string     // verbatim payload, shipped to the worker
+	Args               []string   // verbatim parameter names, incl. self/cls (calque#92: needed to reconstruct a .local()-referenced sibling's call signature)
+	ItemArg            string     // first non-self parameter name — the per-item arg the warm runner binds
 	// LocalCalls are the leaf names of sibling callables THIS function's own
 	// body references via .local() (calque#92) — a property of the body, not
 	// of how this function itself is invoked (distinct from Invoke/IsMap).
@@ -294,11 +322,14 @@ type Class struct {
 	// CloudBucketMounts mirrors Function.CloudBucketMounts (calque#91
 	// Workstream A) — see its doc comment.
 	CloudBucketMounts map[string]CloudBucketMount
-	Timeout           int
-	Config            Config     // portable decorator config (§B)
-	EnterBody         string     // @modal.enter body — runs ONCE in the warm runner (§6)
-	HasExit           bool       // @modal.exit() present (calque#86); teardown is not reproduced
-	Methods           []Function // @modal.method bodies
+	// NetworkFileSystems mirrors Function.NetworkFileSystems (calque#91
+	// Workstream B) — see its doc comment.
+	NetworkFileSystems map[string]NetworkFileSystemMount
+	Timeout            int
+	Config             Config     // portable decorator config (§B)
+	EnterBody          string     // @modal.enter body — runs ONCE in the warm runner (§6)
+	HasExit            bool       // @modal.exit() present (calque#86); teardown is not reproduced
+	Methods            []Function // @modal.method bodies
 	// EnterLocalCalls are sibling callables the @enter body itself references
 	// via .local() (calque#92) — EnterBody is a bare string with no other Function
 	// to carry this on.

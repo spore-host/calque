@@ -326,3 +326,86 @@ func TestBootstrapCommandNoCloudBucketMountLinesUnchanged(t *testing.T) {
 		t.Errorf("no CloudBucketMountLines set — must not emit any mount-s3 reference; got:\n%s", cmd)
 	}
 }
+
+// TestBootstrapCommandSplicesNFSMountLinesDockerMode (calque#91 Workstream
+// B) proves NFSMountLines are spliced into Command()'s output AFTER the
+// artifact sync but BEFORE the docker run invocation — mirrors
+// TestBootstrapCommandSplicesCloudBucketMountLinesDockerMode exactly.
+func TestBootstrapCommandSplicesNFSMountLinesDockerMode(t *testing.T) {
+	c := BootstrapConfig{
+		BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art",
+		ManifestKey: "runs/x/manifest.json", Region: "us-west-2",
+		NFSMountLines: []string{"mkdir -p /shared", "mount -t nfs4 fs-abc123.efs.us-west-2.amazonaws.com:/ /shared"},
+	}
+	cmd := c.Command()
+	for _, w := range []string{"mkdir -p /shared", "mount -t nfs4 fs-abc123.efs.us-west-2.amazonaws.com:/ /shared"} {
+		if !strings.Contains(cmd, w) {
+			t.Errorf("missing %q in:\n%s", w, cmd)
+		}
+	}
+	syncIdx := strings.Index(cmd, "aws s3 cp --recursive")
+	mountIdx := strings.Index(cmd, "mount -t nfs4")
+	runIdx := strings.Index(cmd, "docker run")
+	if syncIdx == -1 || mountIdx == -1 || runIdx == -1 {
+		t.Fatalf("missing expected markers in:\n%s", cmd)
+	}
+	if syncIdx >= mountIdx || mountIdx >= runIdx {
+		t.Errorf("expected order artifact-sync < nfs-mount < docker-run; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandSplicesNFSMountLinesHostMode is the HostMode sibling:
+// the mount must be live before warmd itself runs.
+func TestBootstrapCommandSplicesNFSMountLinesHostMode(t *testing.T) {
+	c := BootstrapConfig{
+		Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json",
+		Region: "us-west-2", HostMode: true,
+		NFSMountLines: []string{"mkdir -p /shared", "mount -t nfs4 fs-abc123.efs.us-west-2.amazonaws.com:/ /shared"},
+	}
+	cmd := c.Command()
+	mountIdx := strings.Index(cmd, "mount -t nfs4")
+	warmdIdx := strings.Index(cmd, "warmd run --manifest")
+	if mountIdx == -1 || warmdIdx == -1 {
+		t.Fatalf("missing expected markers in:\n%s", cmd)
+	}
+	if mountIdx > warmdIdx {
+		t.Errorf("nfs-mount lines must run BEFORE warmd; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandNoNFSMountLinesUnchanged proves the default (empty
+// NFSMountLines) reproduces prior behavior byte-for-byte: no NFS mount
+// reference appears at all.
+func TestBootstrapCommandNoNFSMountLinesUnchanged(t *testing.T) {
+	c := BootstrapConfig{BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json", Region: "us-west-2"}
+	cmd := c.Command()
+	if strings.Contains(cmd, "mount -t nfs4") {
+		t.Errorf("no NFSMountLines set — must not emit any nfs4 mount reference; got:\n%s", cmd)
+	}
+}
+
+// TestBootstrapCommandSplicesBothCloudBucketMountAndNFSMountLines proves
+// both mount kinds can coexist in one run — order between them doesn't
+// matter (per doc comment), but both must land after artifact sync and
+// before docker run.
+func TestBootstrapCommandSplicesBothCloudBucketMountAndNFSMountLines(t *testing.T) {
+	c := BootstrapConfig{
+		BaseImage: "vllm/vllm-openai:latest", Bucket: "b", ArtifactPrefix: "runs/x/art",
+		ManifestKey: "runs/x/manifest.json", Region: "us-west-2",
+		CloudBucketMountLines: []string{"mount-s3 my-bucket /data"},
+		NFSMountLines:         []string{"mount -t nfs4 fs-abc123.efs.us-west-2.amazonaws.com:/ /shared"},
+	}
+	cmd := c.Command()
+	for _, w := range []string{"mount-s3 my-bucket /data", "mount -t nfs4 fs-abc123.efs.us-west-2.amazonaws.com:/ /shared"} {
+		if !strings.Contains(cmd, w) {
+			t.Errorf("missing %q in:\n%s", w, cmd)
+		}
+	}
+	syncIdx := strings.Index(cmd, "aws s3 cp --recursive")
+	runIdx := strings.Index(cmd, "docker run")
+	s3MountIdx := strings.Index(cmd, "mount-s3 my-bucket /data")
+	nfsMountIdx := strings.Index(cmd, "mount -t nfs4")
+	if syncIdx >= s3MountIdx || s3MountIdx >= runIdx || syncIdx >= nfsMountIdx || nfsMountIdx >= runIdx {
+		t.Errorf("both mount kinds must land after artifact-sync and before docker-run; got:\n%s", cmd)
+	}
+}
