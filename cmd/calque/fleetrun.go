@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -367,9 +368,16 @@ func fleetRun(o realOpts, shards int) (err error) {
 	if len(failedIdx) > 0 {
 		runWaves(ceiling, len(failedIdx), func(j int) {
 			i := failedIdx[j]
-			if wait := redriveBackoff(shardErrs[i]); wait > 0 {
-				fmt.Fprintf(os.Stderr, "[fleet] shard %d failed with a quota-exceeded error; backing off %s before re-drive so OTHER shards' instances have time to terminate (calque#141)\n", shs[i].ID, wait)
-				fleetSleep(wait)
+			if redriveBackoff(shardErrs[i]) > 0 {
+				// calque#142: poll the account's REAL quota headroom instead of
+				// blindly sleeping a fixed 3 minutes — wave-1 shards may still be
+				// mid-flight (slow bootstrap, long-running work) when that fixed
+				// sleep would have ended, re-colliding with the same
+				// MaxSpotInstanceCountExceeded wall. Falls back to the fixed
+				// sleep if the poll itself fails (consistent with #141's own
+				// "don't block on a failed quota check" principle).
+				fmt.Fprintf(os.Stderr, "[fleet] shard %d failed with a quota-exceeded error; waiting for quota headroom before re-drive so OTHER shards' instances have time to terminate (calque#141/#142)\n", shs[i].ID)
+				waitForQuotaHeadroom(ctx, cfg, inst, o.region, o.spot, safeRep)
 			}
 			fmt.Fprintf(os.Stderr, "[fleet] shard %d failed (%v); re-driving once on a fresh instance\n", shs[i].ID, shardErrs[i])
 			m, serr := runShard(ctx, s3c, ec2c, spawnClient, o, shs[i], places, pricePerHr, tgt, shardBody, shardHostMode, safeRep, shardVolumeSync, shardVolumeCommit)
@@ -500,6 +508,61 @@ func redriveBackoff(err error) time.Duration {
 // and internal/pool/pool.go's heartbeatInterval package-var-for-testability
 // pattern already used elsewhere in this codebase.
 var fleetSleep = time.Sleep
+
+// quotaPollInterval/quotaPollMaxWait bound waitForQuotaHeadroom's poll loop
+// (calque#142) — quotaPollMaxWait matches quotaExceededBackoff's own total
+// budget (the fixed sleep this replaces), just spent polling in shorter
+// increments instead of one blind sleep. Package vars so tests can shrink
+// both without waiting minutes, mirroring fleetSleep's own pattern.
+var (
+	quotaPollInterval = 15 * time.Second
+	quotaPollMaxWait  = quotaExceededBackoff
+)
+
+// waitForQuotaHeadroom polls the account's REAL quota headroom for
+// instanceType/region/spot (calque#142) instead of blindly sleeping a fixed
+// duration — a quota wall clears when OTHER instances actually terminate,
+// which a fixed 3-minute sleep has no way to confirm happened: if wave-1's
+// shards are still mid-flight (slow bootstrap, long-running work) when the
+// sleep ends, the re-drive just re-collides with the same
+// MaxSpotInstanceCountExceeded wall (found live re-verifying calque#141's
+// fix with a real fleet run, calque#142).
+func waitForQuotaHeadroom(ctx context.Context, cfg aws.Config, instanceType, region string, spot bool, rep *syncReport) {
+	waitForQuotaHeadroomFn(func() (int, error) {
+		return plan.QuotaCeiling(ctx, cfg, instanceType, region, spot)
+	}, instanceType, rep)
+}
+
+// waitForQuotaHeadroomFn is waitForQuotaHeadroom's testable core: ceilingFn
+// stands in for plan.QuotaCeiling (a fake in tests, the real live-AWS query
+// in production — mirrors resolveFleetCeiling's own "inject the query
+// result, not the query" testability pattern). Returns as soon as ceilingFn
+// reports at least 1 concurrent slot free, or once quotaPollMaxWait elapses
+// (whichever first) — never blocks indefinitely.
+//
+// Falls back to ONE quotaExceededBackoff sleep if ceilingFn itself errors
+// (e.g. a transient AWS API failure) — consistent with #141's own "don't
+// block indefinitely on a failed quota check" principle; a poll failure is
+// not evidence there's no headroom, just that we can't currently tell.
+func waitForQuotaHeadroomFn(ceilingFn func() (int, error), instanceType string, rep *syncReport) {
+	deadline := time.Now().Add(quotaPollMaxWait)
+	for {
+		ceiling, err := ceilingFn()
+		if err != nil {
+			rep.Addf(leak.PrimAcquire, leak.KindIntegrationEdge, instanceType, 0,
+				"quota headroom poll failed (%v); falling back to a fixed %s backoff before re-drive (calque#142)", err, quotaExceededBackoff)
+			fleetSleep(quotaExceededBackoff)
+			return
+		}
+		if ceiling >= 1 {
+			return
+		}
+		if time.Now().Add(quotaPollInterval).After(deadline) {
+			return // out of budget — re-drive anyway rather than block indefinitely
+		}
+		fleetSleep(quotaPollInterval)
+	}
+}
 
 // fleetWorkerIdleTimeout (calque#145 slice 2) is short, like warmd fleet's
 // own default (cmd/warmd/main.go's fleetWorkerDefaultIdleTimeout) — a fleet

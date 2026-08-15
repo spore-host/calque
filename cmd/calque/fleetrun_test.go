@@ -216,6 +216,119 @@ func TestRedriveBackoff_UnwrapsThroughRunShardAndAcquireWrapping(t *testing.T) {
 	}
 }
 
+// TestWaitForQuotaHeadroomFn_ReturnsAssoonAsHeadroomExists (calque#142)
+// proves the poll loop stops the moment ceilingFn reports >=1 concurrent
+// slot free — no fixed 3-minute wait when headroom is ALREADY there (e.g.
+// wave-1's shards already terminated by the time D4's re-drive checks).
+func TestWaitForQuotaHeadroomFn_ReturnsAssoonAsHeadroomExists(t *testing.T) {
+	var slept []time.Duration
+	restore := fleetSleep
+	fleetSleep = func(d time.Duration) { slept = append(slept, d) }
+	defer func() { fleetSleep = restore }()
+
+	sr, _ := newTestSyncReport()
+	waitForQuotaHeadroomFn(func() (int, error) { return 1, nil }, "g7e.2xlarge", sr)
+
+	if len(slept) != 0 {
+		t.Errorf("slept %v, want no sleep at all — headroom existed on the FIRST poll", slept)
+	}
+}
+
+// TestWaitForQuotaHeadroomFn_PollsUntilHeadroomAppears proves the poll loop
+// sleeps quotaPollInterval between checks and returns as soon as a LATER
+// poll reports headroom — the exact case calque#142 exists for: wave-1
+// shards terminate WHILE the re-drive pass is waiting, not necessarily
+// before it starts checking.
+func TestWaitForQuotaHeadroomFn_PollsUntilHeadroomAppears(t *testing.T) {
+	var slept []time.Duration
+	restore := fleetSleep
+	fleetSleep = func(d time.Duration) { slept = append(slept, d) }
+	defer func() { fleetSleep = restore }()
+
+	calls := 0
+	sr, _ := newTestSyncReport()
+	waitForQuotaHeadroomFn(func() (int, error) {
+		calls++
+		if calls < 3 {
+			return 0, nil // no headroom yet
+		}
+		return 1, nil // headroom appeared on the 3rd poll
+	}, "g7e.2xlarge", sr)
+
+	if calls != 3 {
+		t.Errorf("ceilingFn called %d times, want exactly 3 (2 no-headroom polls + 1 success)", calls)
+	}
+	if len(slept) != 2 {
+		t.Fatalf("slept %d times, want exactly 2 (between polls 1-2 and 2-3): %v", len(slept), slept)
+	}
+	for _, d := range slept {
+		if d != quotaPollInterval {
+			t.Errorf("slept %v, want quotaPollInterval (%v) between polls", d, quotaPollInterval)
+		}
+	}
+}
+
+// TestWaitForQuotaHeadroomFn_GivesUpAfterMaxWait proves the poll loop does
+// NOT block forever if headroom never appears — it returns once
+// quotaPollMaxWait's budget is exhausted, same total wait ceiling as the
+// fixed sleep it replaces, just spent polling instead of blind-sleeping.
+func TestWaitForQuotaHeadroomFn_GivesUpAfterMaxWait(t *testing.T) {
+	restoreSleep := fleetSleep
+	fleetSleep = func(time.Duration) {} // don't actually wait in the test
+	defer func() { fleetSleep = restoreSleep }()
+
+	// Both bounds shrunk to real-microseconds: the deadline check uses
+	// actual wall-clock time.Now(), so a tiny quotaPollMaxWait ALONE isn't
+	// enough to keep this test fast — quotaPollInterval must shrink too, or
+	// the loop busy-spins for the full real-world quotaPollMaxWait before
+	// the deadline check can ever trip.
+	restoreInterval := quotaPollInterval
+	quotaPollInterval = time.Microsecond
+	defer func() { quotaPollInterval = restoreInterval }()
+	restoreMaxWait := quotaPollMaxWait
+	quotaPollMaxWait = 3 * time.Microsecond
+	defer func() { quotaPollMaxWait = restoreMaxWait }()
+
+	calls := 0
+	sr, _ := newTestSyncReport()
+	waitForQuotaHeadroomFn(func() (int, error) {
+		calls++
+		return 0, nil // headroom NEVER appears
+	}, "g7e.2xlarge", sr)
+
+	if calls < 1 {
+		t.Error("ceilingFn was never called")
+	}
+	// The key property: it returned at all (no timeout/deadlock) despite
+	// headroom never appearing — proven by reaching this line.
+}
+
+// TestWaitForQuotaHeadroomFn_QueryFailureFallsBackToFixedSleep proves a
+// poll failure (e.g. a transient AWS API error) does NOT block the re-drive
+// indefinitely — it leaks the failure and falls back to ONE
+// quotaExceededBackoff sleep, matching calque#141's "don't block on a
+// failed quota check" principle.
+func TestWaitForQuotaHeadroomFn_QueryFailureFallsBackToFixedSleep(t *testing.T) {
+	var slept []time.Duration
+	restore := fleetSleep
+	fleetSleep = func(d time.Duration) { slept = append(slept, d) }
+	defer func() { fleetSleep = restore }()
+
+	sr, rep := newTestSyncReport()
+	qerr := fmt.Errorf("quota lookup: throttled")
+	waitForQuotaHeadroomFn(func() (int, error) { return 0, qerr }, "g7e.2xlarge", sr)
+
+	if len(slept) != 1 || slept[0] != quotaExceededBackoff {
+		t.Errorf("slept %v, want exactly [%v] (the fixed fallback)", slept, quotaExceededBackoff)
+	}
+	if rep.Len() != 1 {
+		t.Fatalf("expected exactly 1 leak, got %d: %+v", rep.Len(), rep.Leaks)
+	}
+	if !strings.Contains(rep.Leaks[0].Detail, "throttled") {
+		t.Errorf("leak detail %q should mention the underlying query error", rep.Leaks[0].Detail)
+	}
+}
+
 // TestMeasurementFromPoolSummaryFields_WarmHitReportsZeroEnter is the core
 // calque#145 D5 fix, proven directly: a warm-hit claim (this worker was
 // already loaded when it claimed the shard) must report EnterSeconds=0,

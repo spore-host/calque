@@ -46,6 +46,20 @@ per [semver.org](https://semver.org/#spec-item-4).
   provisions a `uv`-managed venv now, even with no `--pip` packages —
   the AMI's own `apt-get`/`dnf install python3` fallback is gone.
 
+### Fixed
+
+- A fleet run's D4 re-drive (calque#141) no longer blindly sleeps a fixed
+  3 minutes before re-driving a quota-exceeded shard (calque#142) — it now
+  polls the account's real quota headroom (`plan.QuotaCeiling`) and
+  proceeds as soon as headroom actually exists, instead of assuming other
+  shards terminated by the time a fixed sleep ends. Found live
+  re-verifying calque#141's own fix: wave-1 shards still mid-flight (slow
+  bootstrap, long-running work) when the fixed sleep ended caused the
+  re-drive to re-collide with the same `MaxSpotInstanceCountExceeded`
+  wall. Falls back to one fixed-duration sleep if the quota poll itself
+  fails, matching #141's own "don't block on a failed quota check"
+  principle.
+
 ## [0.5.1] - 2026-08-14
 
 ### Documentation
