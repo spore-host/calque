@@ -99,7 +99,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	shardBody := calexec.ManifestBody{EnterBody: realEnterBody, MethodBody: realMethodBody, MethodArg: "prompt"}
 	shardHostMode := false
 	if scriptBody, ok := manifestBodyForUnit(app, unit, rep); ok {
-		if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
+		if err := checkInvokeSupport(app.Script, unit.method, rep, false); err != nil {
 			return err
 		}
 		// GPU guard parity with dry-run (run.go's swapLegal check, §7): refuse

@@ -108,7 +108,7 @@ func run(o runOpts) error {
 	// protocol) and always collects+returns a result. .starmap/.for_each are
 	// classified at the IR layer but were silently run as if .map'd — check
 	// explicitly rather than let the mismatch surface as a mystery failure.
-	if err := checkInvokeSupport(app.Script, unit.method, rep); err != nil {
+	if err := checkInvokeSupport(app.Script, unit.method, rep, false); err != nil {
 		return err
 	}
 
@@ -556,7 +556,18 @@ func swapLegal(glog *gpu.Log, owner string) bool {
 // .starmap'd unit with no statically-resolvable iterable" — the one case
 // realOrSyntheticItems (items.go) can't make splat-safe on its own, because
 // there is no real per-item shape to consult.
-func checkInvokeSupport(script string, fn ir.Function, rep *leak.Report) error {
+// hasRealArgTuple is true only at realrun.go's own call site, when the
+// caller already resolved a REAL per-position argument tuple via
+// --arg-file/--arg-json (forceStarmap) — that path splats every position
+// from real, caller-supplied data regardless of what static parsing
+// detected, so the generic arity guard below would wrongly refuse an
+// already-solved case (e.g. AI-Almanac's app.py: run_benchmark_local takes
+// 4 positional args, invoked via .remote() not .starmap(), but calque#178
+// verified it running for real on real hardware precisely BECAUSE
+// --arg-file/--arg-json supplied the real tuple). Every other caller
+// (dry-run, fleetrun, and realrun.go itself when --arg-file/--arg-json
+// weren't given) passes false.
+func checkInvokeSupport(script string, fn ir.Function, rep *leak.Report, hasRealArgTuple bool) error {
 	switch fn.Invoke {
 	case ir.InvokeStarmap:
 		if len(fn.Items) == 0 {
@@ -567,6 +578,25 @@ func checkInvokeSupport(script string, fn ir.Function, rep *leak.Report) error {
 	case ir.InvokeForEach:
 		rep.Addf(leak.PrimMap, leak.KindSemanticGap, script, fn.Line,
 			"%s is .for_each()'d (side-effects only, no result collection in real Modal); calque collects+reports a result per item anyway — harmless but not a faithful .for_each", fn.Name)
+	default:
+		// calque#187: outside .starmap() (which already knows how to splat a
+		// real tuple across every positional arg) and outside
+		// --arg-file/--arg-json's own real-tuple path (hasRealArgTuple), the
+		// warm runner binds exactly ONE positional value per item
+		// (unit.method.ItemArg, the first non-self/cls param) —
+		// dryRunWarm/manifestBodyForUnit never populate the rest. A picked
+		// unit with 2+ non-self/cls positional args or (e.g. a
+		// .spawn()-invoked function like
+		// `run_forecast_inference(job_id, model_id, config)`, real-world
+		// case: AI-Almanac's forecasts_app.py) silently NameErrors on every
+		// item instead of refusing with an honest message — found live via
+		// calque#79's re-verification.
+		if hasRealArgTuple {
+			break
+		}
+		if args := nonSelfArgs(fn.Args); len(args) > 1 {
+			return fmt.Errorf("%s takes %d positional args (%s) but isn't .starmap()'d — the warm runner only binds the first (%q) per item; the rest would be undefined. This function's real invocation shape (multiple positional args, likely via .spawn() fan-out) isn't reproduced by calque's single-arg warm-unit model unless driven via --arg-file/--arg-json (a real, caller-supplied tuple) — see calque#187", fn.Name, len(args), strings.Join(args, ", "), args[0])
+		}
 	}
 	return nil
 }

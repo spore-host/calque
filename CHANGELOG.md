@@ -9,6 +9,22 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+### Fixed
+
+- A picked warm unit with 2+ non-self/cls positional args that ISN'T
+  `.starmap()`'d (e.g. a `.spawn()`-invoked function like AI-Almanac's
+  `forecasts_app.py`'s `run_forecast_inference(job_id, model_id, config)`)
+  now refuses loudly instead of silently `NameError`-ing on every synthetic
+  item (calque#187) — the warm runner only ever bound the FIRST positional
+  arg outside the `.starmap()` splat path, leaving the rest undefined.
+  Found while re-verifying calque#79's closing claim that AI-Almanac's
+  three real scripts run end-to-end: `forecasts_app.py`'s and
+  `blending_app.py`'s picked units both hit this unannounced. Does NOT
+  affect `calque real --arg-file`/`--arg-json` (a real, caller-supplied
+  positional tuple, e.g. `app.py`'s `run_benchmark_local` — calque#178's
+  real-hardware verification) — that path explicitly bypasses the new
+  arity guard, since it already supplies real per-position data.
+
 ## [0.6.0] - 2026-08-15
 
 22 commits since v0.5.0 (folding in the changes originally staged under an

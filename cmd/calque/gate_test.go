@@ -178,7 +178,7 @@ func TestPickWarmUnitUnscopedWhenNotAmbiguous(t *testing.T) {
 func TestCheckInvokeSupportStarmapRefusesWithoutRealItems(t *testing.T) {
 	rep := &leak.Report{}
 	fn := ir.Function{Name: "combine", Invoke: ir.InvokeStarmap}
-	if err := checkInvokeSupport("script.py", fn, rep); err == nil {
+	if err := checkInvokeSupport("script.py", fn, rep, false); err == nil {
 		t.Fatal("expected an error refusing a .starmap'd warm unit with no real Items, got nil")
 	}
 }
@@ -193,7 +193,7 @@ func TestCheckInvokeSupportStarmapRunsWithRealItems(t *testing.T) {
 		Name: "combine", Invoke: ir.InvokeStarmap, Line: 12,
 		Items: []any{[]any{float64(1), float64(2)}, []any{float64(3), float64(4)}},
 	}
-	if err := checkInvokeSupport("script.py", fn, rep); err != nil {
+	if err := checkInvokeSupport("script.py", fn, rep, false); err != nil {
 		t.Fatalf("checkInvokeSupport(.starmap with real Items) must not error, got: %v", err)
 	}
 	found := false
@@ -214,7 +214,7 @@ func TestCheckInvokeSupportStarmapRunsWithRealItems(t *testing.T) {
 func TestCheckInvokeSupportForEachLeaksNotRefuses(t *testing.T) {
 	rep := &leak.Report{}
 	fn := ir.Function{Name: "notify", Invoke: ir.InvokeForEach, Line: 7}
-	if err := checkInvokeSupport("script.py", fn, rep); err != nil {
+	if err := checkInvokeSupport("script.py", fn, rep, false); err != nil {
 		t.Fatalf("checkInvokeSupport(.for_each) must not error, got: %v", err)
 	}
 	found := false
@@ -234,12 +234,64 @@ func TestCheckInvokeSupportMapAndRemoteAreFine(t *testing.T) {
 	rep := &leak.Report{}
 	for _, kind := range []ir.InvokeKind{ir.InvokeMap, ir.InvokeRemote, ir.InvokeNone} {
 		fn := ir.Function{Name: "f", Invoke: kind}
-		if err := checkInvokeSupport("script.py", fn, rep); err != nil {
+		if err := checkInvokeSupport("script.py", fn, rep, false); err != nil {
 			t.Errorf("checkInvokeSupport(%q) must not error, got: %v", kind, err)
 		}
 	}
 	if len(rep.Leaks) != 0 {
 		t.Errorf("map/remote/none must not leak; leaks=%+v", rep.Leaks)
+	}
+}
+
+// TestCheckInvokeSupportMultiArgNonStarmapRefuses (calque#187): a picked
+// unit with 2+ non-self/cls positional args that ISN'T .starmap()'d (e.g. a
+// .spawn()-invoked function like AI-Almanac's forecasts_app.py's
+// `run_forecast_inference(job_id, model_id, config)`) must refuse loudly
+// instead of silently NameError'ing — the warm runner only ever binds the
+// FIRST positional arg per item outside the .starmap() splat path (both
+// dryRunWarm and manifestBodyForUnit), so the rest would be undefined.
+// hasRealArgTuple=false: no --arg-file/--arg-json supplied a real tuple.
+func TestCheckInvokeSupportMultiArgNonStarmapRefuses(t *testing.T) {
+	rep := &leak.Report{}
+	fn := ir.Function{Name: "run_forecast_inference", Invoke: ir.InvokeSpawn, Args: []string{"job_id", "model_id", "config"}}
+	err := checkInvokeSupport("script.py", fn, rep, false)
+	if err == nil {
+		t.Fatal("expected an error refusing a multi-arg non-starmap unit, got nil")
+	}
+	for _, want := range []string{"run_forecast_inference", "job_id", "model_id", "config", "3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing expected substring %q", err.Error(), want)
+		}
+	}
+}
+
+// TestCheckInvokeSupportMultiArgWithRealArgTupleFine (calque#187) is the
+// regression guard for the exact case that made a blanket arity refusal
+// wrong: AI-Almanac's app.py's run_benchmark_local(job_id, config, bundle,
+// runtime_env) takes 4 positional args, is invoked via .remote() (not
+// .starmap()), yet calque#178 verified it running for real on real
+// hardware — because `calque real --arg-file`/`--arg-json` supplies a REAL
+// per-position tuple, bypassing the single-item-arg synthetic path
+// entirely. hasRealArgTuple=true must never refuse, regardless of arity.
+func TestCheckInvokeSupportMultiArgWithRealArgTupleFine(t *testing.T) {
+	rep := &leak.Report{}
+	fn := ir.Function{Name: "run_benchmark_local", Invoke: ir.InvokeRemote, Args: []string{"job_id", "config", "bundle", "runtime_env"}}
+	if err := checkInvokeSupport("script.py", fn, rep, true); err != nil {
+		t.Fatalf("checkInvokeSupport(hasRealArgTuple=true) must not refuse a multi-arg unit, got: %v", err)
+	}
+}
+
+// TestCheckInvokeSupportSingleArgNonStarmapFine proves the arity guard only
+// fires on 2+ args — the overwhelmingly common single-arg case (every
+// existing .map()/.remote()/plain-function corpus script) must stay
+// unaffected, byte-for-byte unchanged from before calque#187.
+func TestCheckInvokeSupportSingleArgNonStarmapFine(t *testing.T) {
+	rep := &leak.Report{}
+	for _, kind := range []ir.InvokeKind{ir.InvokeMap, ir.InvokeRemote, ir.InvokeNone, ir.InvokeSpawn} {
+		fn := ir.Function{Name: "f", Invoke: kind, Args: []string{"self", "item"}}
+		if err := checkInvokeSupport("script.py", fn, rep, false); err != nil {
+			t.Errorf("checkInvokeSupport(%q, 1 non-self arg) must not error, got: %v", kind, err)
+		}
 	}
 }
 
