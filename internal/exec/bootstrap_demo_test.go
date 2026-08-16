@@ -38,8 +38,16 @@ func TestBootstrapCommandHostModeNoDepsStillProvisionsUv(t *testing.T) {
 	if strings.Contains(cmd, "apt-get install -y python3") || strings.Contains(cmd, "dnf install -y python3") {
 		t.Errorf("no-deps host-mode command should NOT fall back to the AMI's own distro python3 anymore; got:\n%s", cmd)
 	}
-	if strings.Contains(cmd, "uv pip install") {
-		t.Errorf("no-deps host-mode command has nothing to pip-install; got:\n%s", cmd)
+	// calque#200: "modal" is ALWAYS installed now, mirroring uvPythonArgv's
+	// (run.go, dry-run's own mechanism) explicit design decision — even
+	// the "no real --pip packages supplied" case has a real Python
+	// package to install, since a real script's body routinely
+	// references modal.Secret/modal.Volume/etc. directly.
+	if !strings.Contains(cmd, `uv pip install --python /opt/calque/.venv/bin/python3 "modal"`) {
+		t.Errorf("no-deps host-mode command must still install \"modal\" itself (calque#200); got:\n%s", cmd)
+	}
+	if strings.Contains(cmd, "command -v git") {
+		t.Errorf("no real --pip package (git-URL or otherwise) was supplied, so the git-availability check should be skipped; got:\n%s", cmd)
 	}
 }
 
@@ -75,6 +83,27 @@ func TestBootstrapCommandHostModeWithPipInstallsUvAndPackages(t *testing.T) {
 	// to the SAME venv path this command creates.
 	if strings.Contains(cmd, "command -v python3") {
 		t.Errorf("the uv-managed-venv path should not also probe for a system python3; got:\n%s", cmd)
+	}
+	// calque#200: "modal" is always merged in alongside real --pip
+	// packages, deduped/sorted (matching uvPythonArgv's exact discipline).
+	if !strings.Contains(cmd, `"h5netcdf" "modal" "xarray"`) {
+		t.Errorf(`expected the deduped/sorted package list "h5netcdf" "modal" "xarray" in:%s`, cmd)
+	}
+}
+
+// TestBootstrapCommandHostModeModalNotDuplicatedIfExplicitlyRequested
+// (calque#200) proves passing --pip modal explicitly doesn't produce a
+// duplicate "modal" "modal" entry — the same map-based dedup uvPythonArgv
+// already relies on.
+func TestBootstrapCommandHostModeModalNotDuplicatedIfExplicitlyRequested(t *testing.T) {
+	c := BootstrapConfig{
+		Bucket: "b", ArtifactPrefix: "runs/x/art", ManifestKey: "runs/x/manifest.json",
+		Region: "us-west-2", HostMode: true, WorkerDir: "/tmp/calque",
+		PipPackages: []string{"modal", "xarray"},
+	}
+	cmd := c.Command()
+	if strings.Count(cmd, `"modal"`) != 1 {
+		t.Errorf(`expected exactly one "modal" entry, got %d in:%s`, strings.Count(cmd, `"modal"`), cmd)
 	}
 }
 

@@ -235,7 +235,29 @@ func (b BootstrapConfig) Command() string {
 			fmt.Sprintf("uv python install %s", pyVer),
 			fmt.Sprintf("uv venv --python %s %s/.venv", pyVer, wd),
 		)
-		if len(b.PipPackages) > 0 {
+		{
+			// calque#200: "modal" is ALWAYS installed, mirroring
+			// uvPythonArgv's (run.go, dry-run's own mechanism) explicit
+			// design decision — a real script's body routinely
+			// references modal.Secret/modal.Volume/etc. directly (often
+			// transitively, through a shipped sibling function/extra,
+			// calque#146) even though Modal's own SDK is never itself a
+			// pip_install(...) entry in the script's OWN .image chain.
+			// Before this, HostMode's uv pip install step was entirely
+			// gated behind len(b.PipPackages) > 0 — with --pip unset (the
+			// common case; spawn-run has no --pip flag AT ALL), ZERO
+			// packages installed, not even modal itself. Found live via
+			// a real calque spawn-run run against AI-Almanac's
+			// forecasts_app.py: "@enter failed: No module named 'modal'".
+			pkgs := map[string]bool{"modal": true}
+			for _, p := range b.PipPackages {
+				pkgs[p] = true
+			}
+			names := make([]string, 0, len(pkgs))
+			for p := range pkgs {
+				names = append(names, p)
+			}
+			sort.Strings(names)
 			// A --pip package spec can be a git URL (e.g. "momp @
 			// git+https://github.com/hholb/ROMP.git@main", for a package
 			// with no PyPI release) — `uv pip install` shells out to a
@@ -244,17 +266,20 @@ func (b BootstrapConfig) Command() string {
 			// does NOT ship by default, unlike aws/dnf. Found live: a
 			// git-URL --pip spec failed fast with "Git executable not
 			// found" on an otherwise-correct uv/venv/pip-install
-			// sequence.
-			lines = append(lines,
-				"command -v git >/dev/null || (sudo apt-get update && sudo apt-get install -y git || sudo dnf install -y git)",
-			)
+			// sequence. Only relevant when a real --pip package was
+			// supplied; "modal" itself is always a plain PyPI package.
+			if len(b.PipPackages) > 0 {
+				lines = append(lines,
+					"command -v git >/dev/null || (sudo apt-get update && sudo apt-get install -y git || sudo dnf install -y git)",
+				)
+			}
 			// `uv venv` creates a plain venv (python3/pip only) — it
 			// does NOT copy the uv binary itself in. Installing into
 			// that venv means invoking the TOP-LEVEL uv with
 			// --python pointed at the venv's interpreter, not
 			// expecting a uv binary inside .venv/bin.
-			quoted := make([]string, len(b.PipPackages))
-			for i, p := range b.PipPackages {
+			quoted := make([]string, len(names))
+			for i, p := range names {
 				quoted[i] = fmt.Sprintf("%q", p)
 			}
 			lines = append(lines,
