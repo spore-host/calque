@@ -11,6 +11,19 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Fixed
 
+- `calque real --script`'s Dockerfile-build path (calque#177) now honors
+  `--pip` (calque#196) — before this, `--pip` was consumed ONLY by
+  `bootstrap.go`'s HostMode branch; a picked unit whose resolved image
+  needed an on-instance build (e.g. AI-Almanac's `blending_app.py`'s
+  git-cloned `requirements.txt`, which calque correctly can't statically
+  resolve into a `.pip_install(...)` layer) silently dropped `--pip`
+  entirely — found live via a real `calque real --script blending_app.py
+  --pip xarray` run that built successfully, then failed immediately with
+  `No module named 'xarray'`. New `image.Spec.PipPackages` renders an
+  extra `RUN pip3 install` layer after the resolved chain's own steps.
+  The separate bare-pull path (calque#176, no Dockerfile at all) now
+  leaks loudly instead of silently dropping `--pip` when it's supplied
+  there too, since there's genuinely no layer to add it to.
 - `calque spawn-run` now binds EVERY real positional arg of a spawned
   callable, not just the first (calque#191) — `SpawnCallable.MethodArg`
   only ever carried the FIRST non-self/cls parameter name, so a callable
