@@ -145,7 +145,7 @@ func TestSpawnDictDispatchMultiArgBindingEndToEnd(t *testing.T) {
 	}
 	callable := callables[0]
 
-	body := spawnManifestBody(callable)
+	body := spawnManifestBody(callable, nil, nil, nil, nil)
 	if !body.Starmap || len(body.MethodArgs) != 2 {
 		t.Fatalf("spawnManifestBody(%+v) = %+v, want Starmap=true with 2 MethodArgs", callable, body)
 	}
@@ -187,5 +187,94 @@ func TestSpawnDictDispatchMultiArgBindingEndToEnd(t *testing.T) {
 	}
 	if got["config"] != "cfg-abc" {
 		t.Errorf(`result["config"] = %v, want "cfg-abc" — THIS is the calque#191 regression: before the fix, config was never bound at all`, got["config"])
+	}
+}
+
+// TestSpawnSiblingHelperEndToEnd (calque#198) is the strongest available
+// proof for the sibling-function-resolution fix: it drives
+// spawn_sibling_helper.py's run_bundle(job_id, tag) — which delegates to
+// a private module-level _bundle_impl(job_id, tag), mirroring AI-
+// Almanac's forecasts_app.py's EXACT real shape
+// (run_season_forecast_bundle -> _season_bundle_impl) — through the REAL
+// pipeline: Parse -> ResolveSpawnCallables -> warmUnitForSpawnCallable ->
+// collectLocalExtras -> spawnManifestBody -> the real warm.Supervisor +
+// runner.py subprocess. Asserts the ACTUAL RETURNED VALUE, not just that
+// the manifest carries an Extras field. Before #198, this failed with a
+// real `NameError: name '_bundle_impl' is not defined` — confirmed live
+// against forecasts_app.py's own run_season_forecast_bundle/
+// _season_bundle_impl pair on real AWS hardware.
+func TestSpawnSiblingHelperEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Skip("uv not on PATH; skipping pyast contract test")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; skipping warm-runner subprocess test")
+	}
+	setPyastDirEnv(t)
+	script, err := filepath.Abs("../../testdata/scripts/spawn_sibling_helper.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	rep := &leak.Report{}
+	runner, args := parse.DefaultRunner(pyastDir())
+
+	app, err := parse.Parse(ctx, script, rep, runner, args...)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	callables := calexec.ResolveSpawnCallables(app)
+	if len(callables) != 1 || callables[0].Key != "run_bundle" {
+		t.Fatalf("callables = %+v, want exactly one keyed \"run_bundle\"", callables)
+	}
+	callable := callables[0]
+
+	unit, ok := warmUnitForSpawnCallable(app, callable)
+	if !ok {
+		t.Fatal("warmUnitForSpawnCallable: ok = false, want true")
+	}
+	extras, extraConsts, extraImports, extraClasses := collectLocalExtras(app, unit, rep)
+	if len(extras) != 1 || extras[0].Name != "_bundle_impl" {
+		t.Fatalf("extras = %+v, want exactly one named \"_bundle_impl\"", extras)
+	}
+
+	body := spawnManifestBody(callable, extras, extraConsts, extraImports, extraClasses)
+
+	runnerPy, err := filepath.Abs("../../worker/warm-runner/runner.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := warm.NewMemSink()
+	sup := &warm.Supervisor{
+		Python: uvPythonArgv(nil),
+		Script: runnerPy,
+		Sink:   sink,
+		Config: warm.Config{
+			EnterBody: body.EnterBody, MethodBody: body.MethodBody, MethodArg: body.MethodArg,
+			MethodArgs: body.MethodArgs, Starmap: body.Starmap, Extras: body.Extras,
+		},
+	}
+	items := []warm.Item{{Index: 0, Payload: []any{"real-job-99", "season-2025"}}}
+	failed, err := sup.Run(ctx, items)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %v, want none — run_bundle delegates to _bundle_impl, which must now be shipped and resolvable", failed)
+	}
+	results := sink.Results()
+	r, ok := results[0]
+	if !ok {
+		t.Fatal("missing result for index 0")
+	}
+	got, ok := r.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("result = %v (%T), want a dict with job_id/tag", r.Result, r.Result)
+	}
+	if got["job_id"] != "real-job-99" {
+		t.Errorf(`result["job_id"] = %v, want "real-job-99"`, got["job_id"])
+	}
+	if got["tag"] != "season-2025" {
+		t.Errorf(`result["tag"] = %v, want "season-2025"`, got["tag"])
 	}
 }
