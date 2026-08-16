@@ -11,6 +11,23 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Fixed
 
+- `calque spawn-run` now resolves and ships sibling functions/constants/
+  imports/classes a spawned callable's body bare-references (calque#198)
+  — before this, a spawned callable's `MethodBody` was shipped 100%
+  verbatim with NO sibling-function resolution at all, unlike `real`/
+  `fleetrun` (which already resolve this via `collectLocalExtras`).
+  Found live via a real `calque spawn-run` run against AI-Almanac's
+  `forecasts_app.py`: `run_season_forecast_bundle`'s real body just
+  delegates to a private module-level `_season_bundle_impl` helper — an
+  entirely ordinary Python pattern (thin `@app.function` wrapper, real
+  logic in a plain helper) — and failed with `name '_season_bundle_impl'
+  is not defined`. New `warmUnitForSpawnCallable` (`cmd/calque/
+  spawnrun.go`) resolves a `SpawnCallable` back to its own `ir.Function`/
+  `ir.Class`, feeding the same `collectLocalExtras` transitive-closure
+  walk `real`/`fleetrun` already use. Verified with a real subprocess
+  execution test (`TestSpawnSiblingHelperEndToEnd`) mirroring
+  `forecasts_app.py`'s exact delegation shape, confirmed to fail without
+  the fix and pass with it.
 - `calque real --script`'s Dockerfile-build path (calque#177) now honors
   `--pip` (calque#196) — before this, `--pip` was consumed ONLY by
   `bootstrap.go`'s HostMode branch; a picked unit whose resolved image

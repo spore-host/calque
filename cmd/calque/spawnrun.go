@@ -20,6 +20,7 @@ import (
 	"github.com/spore-host/calque/internal/parse"
 	"github.com/spore-host/calque/internal/plan"
 	"github.com/spore-host/calque/internal/target"
+	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
 // spawnOpts controls a spawnRun invocation: block-and-wait fan-out over every
@@ -117,7 +118,7 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			shardErrs[i] = runSpawnShard(ctx, s3c, ec2c, spawnClient, o, shs[i], byKey[shs[i].Key], places, safeRep)
+			shardErrs[i] = runSpawnShard(ctx, app, s3c, ec2c, spawnClient, o, shs[i], byKey[shs[i].Key], places, safeRep)
 		}(i)
 	}
 	wg.Wait()
@@ -126,7 +127,7 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 	for i := range shs {
 		if shardErrs[i] != nil {
 			fmt.Fprintf(os.Stderr, "[spawn] shard %q failed (%v); re-driving once on a fresh instance\n", shs[i].Key, shardErrs[i])
-			serr := runSpawnShard(ctx, s3c, ec2c, spawnClient, o, shs[i], byKey[shs[i].Key], places, safeRep)
+			serr := runSpawnShard(ctx, app, s3c, ec2c, spawnClient, o, shs[i], byKey[shs[i].Key], places, safeRep)
 			shardErrs[i] = serr
 			if serr != nil {
 				safeRep.Addf(leak.PrimAcquire, leak.KindSemanticGap, app.Script, 0,
@@ -167,17 +168,57 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 // the first stayed undefined on real hardware. len(callable.MethodArgs)
 // <= 1 (the overwhelmingly common case — a plain single-arg spawned
 // callable) reproduces the pre-#191 manifest byte-for-byte.
-func spawnManifestBody(callable calexec.SpawnCallable) calexec.ManifestBody {
+//
+// calque#198: extras/extraConsts/extraImports/extraClasses (resolved by
+// warmUnitForSpawnCallable + collectLocalExtras, the SAME transitive-
+// closure resolution manifestBodyForUnit already uses for real/fleetrun)
+// ship every sibling function/constant/import/class the callable's body
+// bare-references — e.g. AI-Almanac's forecasts_app.py's
+// run_season_forecast_bundle delegating to a private module-level
+// _season_bundle_impl helper. Before this, SpawnCallable.MethodBody was
+// shipped 100% verbatim with NO sibling resolution at all — a NameError
+// on real hardware for any spawned callable using this completely
+// ordinary Python pattern (thin @app.function wrapper, real logic in a
+// plain helper).
+func spawnManifestBody(callable calexec.SpawnCallable, extras []warm.ExtraFunc, extraConsts []warm.ExtraConst, extraImports []warm.ExtraImport, extraClasses []warm.ExtraClass) calexec.ManifestBody {
 	arg := callable.MethodArg
 	if arg == "" {
 		arg = "item"
 	}
-	body := calexec.ManifestBody{EnterBody: callable.EnterBody, MethodBody: callable.MethodBody, MethodArg: arg}
+	body := calexec.ManifestBody{
+		EnterBody: callable.EnterBody, MethodBody: callable.MethodBody, MethodArg: arg,
+		Extras: extras, ExtraConsts: extraConsts, ExtraImports: extraImports, ExtraClasses: extraClasses,
+	}
 	if len(callable.MethodArgs) > 1 {
 		body.MethodArgs = callable.MethodArgs
 		body.Starmap = true
 	}
 	return body
+}
+
+// warmUnitForSpawnCallable resolves callable's OWN ir.Function/ir.Class
+// back out of app (calque#198) — SpawnCallable only carries the flattened
+// fields ResolveSpawnCallables already extracted; collectLocalExtras
+// needs the full warmUnit shape (LocalCalls/FreeRefs live on ir.Function/
+// ir.Class, not on SpawnCallable). false if callable.Key names neither a
+// Function nor a Class method in app — should not normally happen, since
+// callable came from ResolveSpawnCallables(app) in the first place, but
+// handled defensively rather than assumed.
+func warmUnitForSpawnCallable(app ir.App, callable calexec.SpawnCallable) (warmUnit, bool) {
+	if !callable.IsClass {
+		if f, ok := app.FindFunction(callable.Key); ok {
+			return warmUnit{method: f, plainFunction: true}, true
+		}
+		return warmUnit{}, false
+	}
+	for _, c := range app.Classes {
+		for _, m := range c.Methods {
+			if m.Name == callable.Key {
+				return warmUnit{class: c, method: m}, true
+			}
+		}
+	}
+	return warmUnit{}, false
 }
 
 // runSpawnShard acquires ONE instance for one named shard, writes its
@@ -188,13 +229,27 @@ func spawnManifestBody(callable calexec.SpawnCallable) calexec.ManifestBody {
 // like testdata/scripts/spawn_fanout.py's worker_a/worker_b, not
 // necessarily a vLLM inference call), waits for the summary, and
 // terminates. Mirrors fleetRun's runShard structurally.
-func runSpawnShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o spawnOpts,
+func runSpawnShard(ctx context.Context, app ir.App, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o spawnOpts,
 	sh calexec.NamedShard, callable calexec.SpawnCallable, places []plan.Placement, rep *syncReport) error {
 	shardLayout := calexec.RunLayout{
 		Bucket: o.bucket, ArtifactPfx: "spawn/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
 	}
-	body := spawnManifestBody(callable)
+	// calque#198: resolve this callable's own sibling functions/constants/
+	// imports/classes the same way manifestBodyForUnit already does for
+	// real/fleetrun — MethodBody is shipped verbatim, so any bare
+	// reference to a module-level helper (e.g. a thin @app.function
+	// wrapper delegating to a private _impl function, AI-Almanac's exact
+	// forecasts_app.py shape) must be resolved here or it NameErrors on
+	// real hardware.
+	var extras []warm.ExtraFunc
+	var extraConsts []warm.ExtraConst
+	var extraImports []warm.ExtraImport
+	var extraClasses []warm.ExtraClass
+	if unit, ok := warmUnitForSpawnCallable(app, callable); ok {
+		extras, extraConsts, extraImports, extraClasses = collectLocalExtras(app, unit, rep.rep)
+	}
+	body := spawnManifestBody(callable, extras, extraConsts, extraImports, extraClasses)
 	if err := calexec.WriteManifestBody(ctx, s3c, shardLayout, body, hostWorkerDir, sh.Items, nil, nil); err != nil {
 		return fmt.Errorf("shard %q write manifest: %w", sh.Key, err)
 	}
