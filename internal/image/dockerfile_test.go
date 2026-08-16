@@ -43,6 +43,64 @@ func TestRenderBasic(t *testing.T) {
 	}
 }
 
+// runCommandsOnlyImage mirrors AI-Almanac's blending_app.py's real image
+// chain shape (calque#196): a base + apt_install + a git-clone/requirements
+// install done ENTIRELY via .run_commands(...) — no .pip_install(...) step
+// at all, so the resolved chain has no way to express a real dependency
+// (e.g. xarray, installed transitively via the cloned repo's own
+// requirements.txt) as a Dockerfile layer calque itself renders.
+func runCommandsOnlyImage() ir.Image {
+	return ir.Image{
+		Base: "debian_slim",
+		Steps: []ir.ImageStep{
+			{Method: "debian_slim"},
+			{Method: "apt_install", Args: []string{"git"}},
+			{Method: "run_commands", Args: []string{"git clone --depth 1 https://example.com/repo.git /opt/repo"}},
+		},
+	}
+}
+
+// TestRenderPipPackagesAddsExtraLayer (calque#196) is the actual fix under
+// test: Spec.PipPackages must render as an extra RUN pip3 install layer,
+// placed AFTER the image chain's own steps (so it can supplement/override
+// anything the chain's own pip_install already laid down) and BEFORE the
+// worker-glue COPY lines. Found live: a real calque real --script
+// blending_app.py --pip xarray run built successfully but then failed
+// with "No module named 'xarray'" because this layer never existed.
+func TestRenderPipPackagesAddsExtraLayer(t *testing.T) {
+	rep := &leak.Report{}
+	df, err := Render(Spec{Image: runCommandsOnlyImage(), WorkerDir: "/opt/calque", PipPackages: []string{"xarray", "netCDF4"}}, "s.py", rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// quoteJoin sorts package lists for a reproducible digest, so assert
+	// membership rather than a specific order ("netCDF4" sorts before
+	// "xarray").
+	if !strings.Contains(df, "RUN pip3 install --no-cache-dir netCDF4 xarray") {
+		t.Errorf("Dockerfile missing the --pip extra layer\n---\n%s", df)
+	}
+	pipIdx := strings.Index(df, "RUN pip3 install --no-cache-dir netCDF4")
+	cloneIdx := strings.Index(df, "git clone")
+	copyIdx := strings.Index(df, "COPY runner.py")
+	if pipIdx == -1 || cloneIdx == -1 || copyIdx == -1 || cloneIdx >= pipIdx || pipIdx >= copyIdx {
+		t.Errorf("--pip layer must land AFTER the chain's own steps and BEFORE the worker-glue COPY; positions: clone=%d pip=%d copy=%d\n---\n%s", cloneIdx, pipIdx, copyIdx, df)
+	}
+}
+
+// TestRenderNoPipPackagesUnchanged proves the empty/default case (the
+// overwhelmingly common one) renders byte-for-byte the same Dockerfile as
+// before Spec.PipPackages existed — no stray empty RUN line.
+func TestRenderNoPipPackagesUnchanged(t *testing.T) {
+	rep := &leak.Report{}
+	df, err := Render(Spec{Image: runCommandsOnlyImage(), WorkerDir: "/opt/calque"}, "s.py", rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(df, "pip3 install --no-cache-dir \n") || strings.Contains(df, "pip3 install --no-cache-dir\n") {
+		t.Errorf("empty PipPackages must not render a stray pip3 install line\n---\n%s", df)
+	}
+}
+
 // TestDigestStable is the cache-hit property (§10): the SAME image chain must
 // produce the SAME digest, so a rebuild-on-no-change is a cache hit, not a rebuild.
 func TestDigestStable(t *testing.T) {

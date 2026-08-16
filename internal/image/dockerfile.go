@@ -39,6 +39,19 @@ type Spec struct {
 	PythonVer string // e.g. "3.11"; empty => image default
 	WorkerDir string // in-image path where runner.py + warmd land, e.g. "/opt/calque"
 	EntryCmd  string // container entrypoint (warmd invocation); set by exec wiring
+	// PipPackages (calque#196) are third-party Python packages `calque real
+	// --pip PACKAGE` supplies for a picked unit whose REAL dependency (e.g.
+	// AI-Almanac's blending_app.py's `xarray`, installed via a git-cloned
+	// requirements.txt inside a `.run_commands(...)` step calque can't
+	// statically resolve into a `.pip_install(...)` layer) isn't otherwise
+	// captured by the image chain calque DID resolve. Before this field
+	// existed, `--pip` was consumed ONLY by bootstrap.go's HostMode branch —
+	// a script whose image resolved to THIS build path (NeedsBuild) silently
+	// dropped `--pip` on the floor, discovered live via a real `No module
+	// named 'xarray'` failure despite `--pip xarray` being passed. Empty
+	// (the default) renders byte-for-byte the same Dockerfile as before
+	// this field existed.
+	PipPackages []string
 }
 
 // Render turns an image chain into Dockerfile text. It walks the DSL steps in
@@ -146,6 +159,16 @@ func Render(spec Spec, script string, rep *leak.Report) (string, error) {
 			rep.Addf(leak.PrimImage, leak.KindUnsupportedArg, script, 0,
 				"image DSL verb .%s(...) not translated to Dockerfile; environment may differ from Modal", step.Method)
 		}
+	}
+
+	// calque#196: --pip packages the resolved image chain itself doesn't
+	// capture (see Spec.PipPackages' own doc comment) — rendered as one
+	// extra layer AFTER the chain's own steps (so a later --pip package
+	// can override/supplement anything the chain's own pip_install already
+	// laid down) and BEFORE the worker-glue COPY below (the payload needs
+	// these importable when warmd/runner.py invoke it).
+	if len(spec.PipPackages) > 0 {
+		fmt.Fprintf(&b, "RUN pip3 install --no-cache-dir %s\n", quoteJoin(spec.PipPackages))
 	}
 
 	// Worker glue: the warm runner + warmd supervisor. Copied into the image so

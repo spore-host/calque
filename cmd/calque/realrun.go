@@ -271,7 +271,14 @@ func realRun(o realOpts) (err error) {
 			// of falling back to a hand-typed --pip/--stage-file
 			// substitute. internal/image.Render is the same, already
 			// unit-tested Dockerfile renderer --dry-run already uses.
-			df, rerr := image.Render(image.Spec{Image: img, WorkerDir: hostWorkerDir}, app.Script, rep)
+			//
+			// calque#196: o.pipPackages is threaded through here too — the
+			// resolved chain building on THIS path doesn't mean --pip has
+			// nothing left to do (e.g. a real dependency only ever
+			// installed via a git-cloned requirements.txt calque can't
+			// statically resolve into a .pip_install(...) layer, found
+			// live via blending_app.py's xarray).
+			df, rerr := image.Render(image.Spec{Image: img, WorkerDir: hostWorkerDir, PipPackages: o.pipPackages}, app.Script, rep)
 			if rerr != nil {
 				return fmt.Errorf("render Dockerfile for %s's resolved image: %w", unit.method.Name, rerr)
 			}
@@ -295,6 +302,13 @@ func realRun(o realOpts) (err error) {
 			registryRef = bareRef
 			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
 				"real run driving %s's OWN parsed body against its OWN resolved image %q (calque#176)", unit.method.Name, registryRef)
+			// calque#196: --pip has nowhere to go here — a bare pull has no
+			// Dockerfile to layer onto. Leak loudly rather than silently
+			// drop it the way this exact path did before #196.
+			if len(o.pipPackages) > 0 {
+				rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
+					"--pip packages %v ignored: %s's resolved image is a bare pull with nothing layered on top, so there's no Dockerfile to add a pip layer to — supply the dependency via the script's OWN .pip_install(...) chain, or restructure so it needs a build (calque#196)", o.pipPackages, unit.method.Name)
+			}
 		default:
 			hostMode = true // no resolved image at all — a parsed script's own body is typically not a vLLM/docker workload
 			rep.Addf(leak.PrimEnter, leak.KindSemanticGap, app.Script, unit.method.Line,
