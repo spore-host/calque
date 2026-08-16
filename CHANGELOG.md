@@ -11,6 +11,21 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Fixed
 
+- HostMode real runs (`real`/`fleetrun`/`spawn-run`) now always install
+  `modal` itself into the provisioned `uv` venv (calque#200) — before
+  this, only dry-run's `uvPythonArgv` had this guarantee; HostMode's own
+  `uv pip install` step was entirely gated behind `len(PipPackages) > 0`,
+  so a run with no `--pip` flags (the common case; `spawn-run` has no
+  `--pip` flag at all) installed ZERO packages, not even `modal`. Found
+  live via a real `calque spawn-run` run against AI-Almanac's
+  `forecasts_app.py`, right after calque#198's sibling-function fix
+  correctly shipped an extra that bare-references `modal` — failed with
+  `@enter failed: No module named 'modal'`. `internal/exec/bootstrap.go`'s
+  HostMode branch now always merges `modal` into the installed package
+  set (deduped/sorted, mirroring `uvPythonArgv`'s exact discipline) —
+  the git-availability check (for a `--pip` git-URL spec) now only runs
+  when a REAL `--pip` package was supplied, since `modal` alone needs no
+  git.
 - `calque spawn-run` now resolves and ships sibling functions/constants/
   imports/classes a spawned callable's body bare-references (calque#198)
   — before this, a spawned callable's `MethodBody` was shipped 100%
