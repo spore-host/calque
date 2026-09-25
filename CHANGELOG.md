@@ -9,6 +9,23 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+### Security
+
+- Bumped `google.golang.org/grpc` v1.82.1 → v1.83.2 (indirect), closing
+  **GO-2026-6348**. The stale pin also had an outsized side effect: because
+  `govulncheck` is a required check, this one dependency made **every** pull
+  request in the repo fail its security gate — including unrelated one-line
+  GitHub Actions bumps — so the vulnerability was simultaneously a correctness
+  risk and a repo-wide merge block.
+
+### Changed
+
+- Dependabot now manages **Go modules**, not just GitHub Actions. calque is a Go
+  module, but `.github/dependabot.yml` only declared `github-actions`, so nothing
+  ever bumped its Go dependencies — which is why it sat on a known-vulnerable grpc
+  long after every sibling repo had moved. Pinning actions without managing modules
+  just relocates the staleness somewhere quieter.
+
 ### Fixed
 
 - HostMode real runs (`real`/`fleetrun`/`spawn-run`) now always install
