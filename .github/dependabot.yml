@@ -4,3 +4,34 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+
+  # Go modules. calque is a Go module, but this file covered only github-actions —
+  # so its Go dependencies were never bumped by anything. The cost was not
+  # hypothetical: it sat on google.golang.org/grpc v1.82.1 with GO-2026-6348 long
+  # after every sibling repo had moved to v1.83.2, and because govulncheck is a
+  # required check, that one stale indirect dependency blocked EVERY pull request
+  # in the repo — including unrelated one-line action bumps. Pinning actions
+  # without also managing modules just moves the staleness somewhere quieter.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Don't propose a release the day it ships; a fresh version is exactly when a
+    # broken or compromised one is still unnoticed.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      # The AWS SDK releases constantly and in lockstep; one PR, not thirty.
+      aws-sdk:
+        patterns:
+          - "github.com/aws/aws-sdk-go-v2*"
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
