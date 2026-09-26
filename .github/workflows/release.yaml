@@ -42,7 +42,7 @@ jobs:
       # yet (push and tag can race), so re-run the same checks here rather
       # than trusting the tag's commit already passed CI.
       - name: install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: sync pyast deps
         working-directory: tools/pyast
