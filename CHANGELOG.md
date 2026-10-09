@@ -11,6 +11,18 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Security
 
+- **Rebuilt against Go 1.26.9 and `golang.org/x/net` v0.60.0** for the Go
+  vulnerabilities disclosed 2026-10-09: GO-2026-6605, 6607, 6608, 6610, 6611,
+  6612, 6613 and 6617, across `net/http`, `crypto/tls`, `mime/multipart`,
+  `net/http/httputil`, `net/textproto` and x/net's HTTP/2 implementation. The CI
+  Go pin moves 1.26.8 → 1.26.9 in all workflows.
+
+- **`go.opentelemetry.io/otel/sdk` 1.44.0 → 1.45.0** for GO-2026-6505, found in
+  the same sweep and unrelated to the Go batch: OTLP exporter config logging can
+  leak endpoint URLs into info logs. Reachable here via `pool.init` → `aws.init`.
+
+### Security
+
 - Bumped `google.golang.org/grpc` v1.82.1 → v1.83.2 (indirect), closing
   **GO-2026-6348**. The stale pin also had an outsized side effect: because
   `govulncheck` is a required check, this one dependency made **every** pull
