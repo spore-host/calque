@@ -3,7 +3,6 @@ package plan
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/aws/smithy-go"
@@ -274,13 +273,4 @@ func TestResolveRefusesAGPUMemoryNoVariantHas(t *testing.T) {
 	if !errors.Is(err, find.ErrNoMatch) {
 		t.Errorf("Resolve(A100-160GB) error = %v, want find.ErrNoMatch", err)
 	}
-}
-
-func containsAll(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if !strings.Contains(s, sub) {
-			return false
-		}
-	}
-	return true
 }
