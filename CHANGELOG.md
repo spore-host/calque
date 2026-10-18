@@ -9,28 +9,12 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
-### Security
-
-- **Rebuilt against Go 1.26.9 and `golang.org/x/net` v0.60.0** for the Go
-  vulnerabilities disclosed 2026-10-09: GO-2026-6605, 6607, 6608, 6610, 6611,
-  6612, 6613 and 6617, across `net/http`, `crypto/tls`, `mime/multipart`,
-  `net/http/httputil`, `net/textproto` and x/net's HTTP/2 implementation. The CI
-  Go pin moves 1.26.8 → 1.26.9 in all workflows.
-
-- **`go.opentelemetry.io/otel/sdk` 1.44.0 → 1.45.0** for GO-2026-6505, found in
-  the same sweep and unrelated to the Go batch: OTLP exporter config logging can
-  leak endpoint URLs into info logs. Reachable here via `pool.init` → `aws.init`.
-
-### Security
-
-- Bumped `google.golang.org/grpc` v1.82.1 → v1.83.2 (indirect), closing
-  **GO-2026-6348**. The stale pin also had an outsized side effect: because
-  `govulncheck` is a required check, this one dependency made **every** pull
-  request in the repo fail its security gate — including unrelated one-line
-  GitHub Actions bumps — so the vulnerability was simultaneously a correctness
-  risk and a repo-wide merge block.
-
 ### Changed
+
+- **Go dependencies:** truffle v0.49.0 → v0.60.0, spawn v0.100.0 → v0.106.0,
+  lagotto v0.53.0 → v0.63.0, and the AWS SDK modules and smithy-go to the
+  versions those require. This is calque#208's minor-and-patch group, with
+  truffle taken to the release that fixes #245.
 
 - Dependabot now manages **Go modules**, not just GitHub Actions. calque is a Go
   module, but `.github/dependabot.yml` only declared `github-actions`, so nothing
@@ -39,6 +23,15 @@ per [semver.org](https://semver.org/#spec-item-4).
   just relocates the staleness somewhere quieter.
 
 ### Fixed
+
+- **`gpu="A100-80GB"` gets 80 GB GPUs** (truffle#245). Resolving a card with a
+  memory size returned p4d.24xlarge (8× A100 **40 GB**) as well as
+  p4de.24xlarge (80 GB), so an 80 GB job could be placed on GPUs too small for
+  it. truffle v0.60.0 applies the size as per-GPU memory, and calque now
+  resolves `A100-80GB` to p4de.24xlarge only. calque's own suffix-stripping
+  fallback (calque#134) is removed. Against current truffle it would have
+  answered a size no variant has (`A100-160GB`) by dropping the size, putting the
+  job on smaller GPUs with only a leak note. That is now an error.
 
 - HostMode real runs (`real`/`fleetrun`/`spawn-run`) now always install
   `modal` itself into the provisioned `uv` venv (calque#200) — before
@@ -151,6 +144,25 @@ per [semver.org](https://semver.org/#spec-item-4).
   positional tuple, e.g. `app.py`'s `run_benchmark_local` — calque#178's
   real-hardware verification) — that path explicitly bypasses the new
   arity guard, since it already supplies real per-position data.
+
+### Security
+
+- **Rebuilt against Go 1.26.9 and `golang.org/x/net` v0.60.0** for the Go
+  vulnerabilities disclosed 2026-10-09: GO-2026-6605, 6607, 6608, 6610, 6611,
+  6612, 6613 and 6617, across `net/http`, `crypto/tls`, `mime/multipart`,
+  `net/http/httputil`, `net/textproto` and x/net's HTTP/2 implementation. The CI
+  Go pin moves 1.26.8 → 1.26.9 in all workflows.
+
+- **`go.opentelemetry.io/otel/sdk` 1.44.0 → 1.45.0** for GO-2026-6505, found in
+  the same sweep and unrelated to the Go batch: OTLP exporter config logging can
+  leak endpoint URLs into info logs. Reachable here via `pool.init` → `aws.init`.
+
+- Bumped `google.golang.org/grpc` v1.82.1 → v1.83.2 (indirect), closing
+  **GO-2026-6348**. The stale pin also had an outsized side effect: because
+  `govulncheck` is a required check, this one dependency made **every** pull
+  request in the repo fail its security gate — including unrelated one-line
+  GitHub Actions bumps — so the vulnerability was simultaneously a correctness
+  risk and a repo-wide merge block.
 
 ## [0.6.0] - 2026-08-15
 

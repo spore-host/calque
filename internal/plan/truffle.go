@@ -12,7 +12,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	truffleaws "github.com/spore-host/truffle/pkg/aws"
@@ -57,27 +56,15 @@ func NewTruffleResolver(rep *leak.Report) *TruffleResolver { return &TruffleReso
 // a `.*` match-all pattern (truffle#90). ResolveCard is card-oriented and
 // never match-all by construction, so no separate guard is needed here.
 //
-// Before giving up on an ErrNoMatch, it tries normalizeMemorySuffix (calque#134):
-// Modal's documented gpu="A100-80GB"/"A100-40GB" spelling doesn't resolve via
-// truffle today (truffle#130 tracks the upstream fix), but the bare card name
-// without the suffix does. This is calque's own translation responsibility —
-// "how Modal spells a GPU name" — not truffle's, so the normalization lives
-// here rather than waiting on truffle's resolver to grow Modal-specific
-// vocabulary.
+// Modal's gpu="A100-80GB" spelling goes to truffle as written. Since
+// truffle v0.60.0 it resolves the memory size as per-GPU memory, so A100-80GB is
+// p4de.24xlarge only, not also the 40 GB p4d.24xlarge (truffle#245). calque
+// used to strip the suffix itself (calque#134) when truffle couldn't parse it.
+// That fallback is gone, because against today's truffle it would be wrong:
+// truffle's ErrNoMatch for a size no variant has (A100-160GB) would be
+// "fixed" by dropping the size and placing the job on GPUs too small for it.
 func (r *TruffleResolver) Resolve(card string) ([]Candidate, error) {
 	instances, err := find.ResolveCard(card)
-	if err != nil && errors.Is(err, find.ErrNoMatch) {
-		if bare, ok := normalizeMemorySuffix(card); ok {
-			if bareInstances, bareErr := find.ResolveCard(bare); bareErr == nil {
-				if r.rep != nil {
-					r.rep.Addf(leak.PrimGPU, leak.KindIntegrationEdge, card, 0,
-						"gpu=%q doesn't resolve via truffle as spelled (truffle#130); normalized to %q, which does — using %q",
-						card, bare, bare)
-				}
-				instances, err = bareInstances, nil
-			}
-		}
-	}
 	if err != nil {
 		if errors.Is(err, find.ErrNoMatch) {
 			if r.rep != nil {
@@ -94,25 +81,6 @@ func (r *TruffleResolver) Resolve(card string) ([]Candidate, error) {
 		out = append(out, Candidate{Instance: it, Family: instanceFamily(it)})
 	}
 	return out, nil
-}
-
-// memorySuffixRe matches a trailing hyphenated memory-size spelling Modal's
-// gpu= strings document (e.g. "-80GB", "-40gb") — calque#134/truffle#130.
-// Anchored at the end so it only strips a genuine suffix, not a memory token
-// that happens to appear mid-string.
-var memorySuffixRe = regexp.MustCompile(`(?i)-\d+gb$`)
-
-// normalizeMemorySuffix strips a trailing "-80GB"/"-40GB"-shaped memory
-// suffix from card, returning the bare form and true if a suffix was found —
-// it does NOT itself check whether the bare form resolves; the caller tries
-// that and only uses the normalization on success, keeping this a narrow,
-// specific fix for the one confirmed-real gap (truffle#130's memory-suffix
-// spelling) rather than a general fuzzy-matching layer.
-func normalizeMemorySuffix(card string) (bare string, ok bool) {
-	if !memorySuffixRe.MatchString(card) {
-		return "", false
-	}
-	return memorySuffixRe.ReplaceAllString(card, ""), true
 }
 
 // instanceFamily extracts the family prefix from an instance type string, e.g.
