@@ -9,6 +9,7 @@ import (
 	"github.com/aws/smithy-go"
 
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
+	"github.com/spore-host/truffle/pkg/find"
 
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/target"
@@ -248,29 +249,30 @@ func TestFillTargetVerifiedFamilyDoesNotLeak(t *testing.T) {
 	}
 }
 
-// TestResolveNormalizesMemorySuffix (calque#134/truffle#130): gpu="A100-80GB"
-// doesn't resolve via truffle as spelled — Modal's documented memory-suffix
-// form isn't in truffle's alias table yet — but the bare "A100" form does.
-// Resolve must normalize and succeed, and leak that the normalization fired
-// (visible, not silent).
-func TestResolveNormalizesMemorySuffix(t *testing.T) {
-	rep := &leak.Report{}
-	r := NewTruffleResolver(rep)
-	cands, err := r.Resolve("A100-80GB")
+// TestResolveHonoursGPUMemorySuffix (truffle#245): Modal's gpu="A100-80GB"
+// names the 80 GB variant, so it must resolve to p4de.24xlarge only. Including
+// p4d.24xlarge (40 GB A100s) would place an 80 GB job on GPUs too small for it.
+func TestResolveHonoursGPUMemorySuffix(t *testing.T) {
+	cands, err := NewTruffleResolver(&leak.Report{}).Resolve("A100-80GB")
 	if err != nil {
-		t.Fatalf("Resolve(A100-80GB): %v (want success via memory-suffix normalization)", err)
+		t.Fatalf("Resolve(A100-80GB): %v", err)
 	}
-	if len(cands) == 0 {
-		t.Fatal("no candidates for A100-80GB after normalization")
+	if len(cands) != 1 || cands[0].Instance != "p4de.24xlarge" {
+		t.Errorf("Resolve(A100-80GB) = %+v, want only p4de.24xlarge (80 GB A100s)", cands)
 	}
-	found := false
-	for _, c := range rep.Leaks {
-		if c.Detail != "" && containsAll(c.Detail, "A100-80GB", "A100") {
-			found = true
-		}
+}
+
+// TestResolveRefusesAGPUMemoryNoVariantHas: a size no variant has must fail,
+// not resolve to the bare card with the size dropped. That is what calque's
+// old suffix-stripping fallback (calque#134) would do against today's truffle.
+func TestResolveRefusesAGPUMemoryNoVariantHas(t *testing.T) {
+	rep := &leak.Report{}
+	cands, err := NewTruffleResolver(rep).Resolve("A100-160GB")
+	if err == nil {
+		t.Fatalf("Resolve(A100-160GB) = %+v; want an error, since no A100 has 160 GB", cands)
 	}
-	if !found {
-		t.Errorf("expected a leak noting the A100-80GB -> A100 normalization, got: %+v", rep.Leaks)
+	if !errors.Is(err, find.ErrNoMatch) {
+		t.Errorf("Resolve(A100-160GB) error = %v, want find.ErrNoMatch", err)
 	}
 }
 
