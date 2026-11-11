@@ -147,6 +147,8 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Security
 
+- Build and test with Go 1.26.11 / 1.27.4: GO-2026-6859 (net/http: an HTTP/1 server crash from a `MaxBytesReader` header race), published 2026-11-11.
+
 - **`golang.org/x/net` v0.60.0 → v0.62.0** for CVE-2026-78661 (HIGH,
   GO-2026-6860 / GO-2026-6866) in `golang.org/x/net/html`: quadratic-time text
   node coalescing and missing ancestor-namespace checks when rendering raw text.
