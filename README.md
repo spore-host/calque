@@ -45,6 +45,7 @@ only for real (billable) runs, not for anything below.
 automatically):
 
 ```bash
+brew tap spore-host/tap && brew trust spore-host/tap
 brew install spore-host/tap/calque
 ```
 ```powershell
