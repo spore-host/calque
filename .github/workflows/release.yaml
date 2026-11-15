@@ -58,6 +58,21 @@ jobs:
       - name: ruff check
         run: uvx ruff check .
 
+      # A one-hour token from the spore-host-release GitHub App, scoped to the
+      # tap and the bucket with contents: write only. It replaces two classic
+      # PATs, whose expiry left releases half-published, and which could reach
+      # every repo their owner can. Real releases only, like the step it feeds.
+      - name: Mint the tap and bucket token
+        id: tap-token
+        if: github.event_name == 'push' && inputs.dry_run != true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: spore-host
+          repositories: homebrew-tap,scoop-bucket
+          permission-contents: write
+
       # Real release ONLY on a `v*` tag push where dry_run wasn't explicitly
       # requested. A workflow_dispatch run defaults dry_run=true and this
       # condition is false for it either way (github.event_name != 'push'),
@@ -71,8 +86,8 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
-          SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ steps.tap-token.outputs.token }}
+          SCOOP_BUCKET_GITHUB_TOKEN: ${{ steps.tap-token.outputs.token }}
 
       # Dry run (workflow_dispatch, or a manual re-run with dry_run=true):
       # build + archive + checksum only. --snapshot skips every git-tag
