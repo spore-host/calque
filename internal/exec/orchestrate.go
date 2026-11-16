@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
@@ -56,18 +57,23 @@ type Manifest struct {
 	// (calque real --arg-file IDX=PATH) — which positions of a Starmap
 	// payload tuple arrived as base64 strings and need decoding back to
 	// bytes before the splat call binds them.
-	Base64ArgIndices []int            `json:"base64_arg_indices,omitempty"`
-	Items            []warm.Item      `json:"items"`
-	Bucket           string           `json:"bucket"`
-	ResultPrefix     string           `json:"result_prefix"`
-	SummaryKey       string           `json:"summary_key"`
-	PythonBin        string           `json:"python_bin"`
-	RunnerPath       string           `json:"runner_path"`
-	Occupancy        string           `json:"occupancy_path"`
-	VolumeSync       []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
-	VolumeCommit     []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
-	Concurrency      int              `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
-	BatchSize        int              `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
+	Base64ArgIndices []int       `json:"base64_arg_indices,omitempty"`
+	Items            []warm.Item `json:"items"`
+	// RunID is the run this manifest belongs to (calque#227). warmd tags the
+	// results and summary it writes with it (calquetags.ObjectTagging). Empty
+	// in a manifest from an older calque, whose objects then carry
+	// managed-by=calque without a run id.
+	RunID        string           `json:"run_id,omitempty"`
+	Bucket       string           `json:"bucket"`
+	ResultPrefix string           `json:"result_prefix"`
+	SummaryKey   string           `json:"summary_key"`
+	PythonBin    string           `json:"python_bin"`
+	RunnerPath   string           `json:"runner_path"`
+	Occupancy    string           `json:"occupancy_path"`
+	VolumeSync   []VolumeSyncSpec `json:"volume_sync,omitempty"`   // staged before @enter (§3/§15)
+	VolumeCommit []VolumeSyncSpec `json:"volume_commit,omitempty"` // written back after @method drains (§E)
+	Concurrency  int              `json:"concurrency,omitempty"`   // items in flight; 0/1 => serial (occupancy knob)
+	BatchSize    int              `json:"batch_size,omitempty"`    // items per micro-batch (one generate(list) call)
 }
 
 // VolumeSyncSpec tells warmd to `aws s3 sync <URI> <MountPath>` before @enter, so
@@ -80,6 +86,11 @@ type VolumeSyncSpec struct {
 
 // RunLayout is the S3 key layout for one run, derived from a runID.
 type RunLayout struct {
+	// RunID tags every object written under this layout (calque#227:
+	// spore-host:managed-by=calque, calque:run-id) and rides the manifest so
+	// warmd tags what it writes too. Set by NewLayout; a hand-built layout
+	// sets it itself.
+	RunID        string
 	Bucket       string
 	ArtifactPfx  string // warmd + *.py live here
 	ManifestKey  string
@@ -93,6 +104,7 @@ type RunLayout struct {
 func NewLayout(bucket, runID string) RunLayout {
 	base := "runs/" + runID
 	return RunLayout{
+		RunID:        runID,
 		Bucket:       bucket,
 		ArtifactPfx:  base + "/artifacts",
 		ManifestKey:  base + "/manifest.json",
@@ -114,11 +126,11 @@ func UploadArtifacts(ctx context.Context, c *s3.Client, l RunLayout, warmdBin, r
 		if err != nil {
 			return fmt.Errorf("open %s: %w", path, err)
 		}
-		_, err = c.PutObject(ctx, &s3.PutObjectInput{
+		_, err = calquetags.PutObject(ctx, c, &s3.PutObjectInput{
 			Bucket: aws.String(l.Bucket),
 			Key:    aws.String(l.ArtifactPfx + "/" + name),
 			Body:   f,
-		})
+		}, calquetags.ObjectTagging(l.RunID))
 		_ = f.Close()
 		if err != nil {
 			return fmt.Errorf("put %s: %w", name, err)
@@ -134,11 +146,11 @@ func UploadArtifacts(ctx context.Context, c *s3.Client, l RunLayout, warmdBin, r
 // "Dockerfile" so `docker build -f Dockerfile .` on the instance needs no
 // extra flag beyond the filename convention.
 func UploadDockerfile(ctx context.Context, c *s3.Client, l RunLayout, dockerfile string) error {
-	_, err := c.PutObject(ctx, &s3.PutObjectInput{
+	_, err := calquetags.PutObject(ctx, c, &s3.PutObjectInput{
 		Bucket: aws.String(l.Bucket),
 		Key:    aws.String(l.ArtifactPfx + "/Dockerfile"),
 		Body:   strings.NewReader(dockerfile),
-	})
+	}, calquetags.ObjectTagging(l.RunID))
 	if err != nil {
 		return fmt.Errorf("put Dockerfile: %w", err)
 	}
@@ -215,7 +227,7 @@ func writeManifest(ctx context.Context, c *s3.Client, l RunLayout, body Manifest
 		MethodArgs: body.MethodArgs, Starmap: body.Starmap, Extras: body.Extras, ExtraConsts: body.ExtraConsts,
 		ExtraImports: body.ExtraImports, ExtraClasses: body.ExtraClasses, Secrets: body.Secrets,
 		PayloadIsBase64Bytes: body.PayloadIsBase64Bytes, Base64ArgIndices: body.Base64ArgIndices,
-		Items: items, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
+		Items: items, RunID: l.RunID, Bucket: l.Bucket, ResultPrefix: l.ResultPrefix, SummaryKey: l.SummaryKey,
 		PythonBin: pythonBin, RunnerPath: workerDir + "/runner.py", Occupancy: workerDir + "/occupancy.py",
 		VolumeSync: volumeSync, VolumeCommit: volumeCommit, Concurrency: l.Concurrency, BatchSize: l.BatchSize,
 	}
@@ -223,9 +235,9 @@ func writeManifest(ctx context.Context, c *s3.Client, l RunLayout, body Manifest
 	if err != nil {
 		return err
 	}
-	_, err = c.PutObject(ctx, &s3.PutObjectInput{
+	_, err = calquetags.PutObject(ctx, c, &s3.PutObjectInput{
 		Bucket: aws.String(l.Bucket), Key: aws.String(l.ManifestKey), Body: bytes.NewReader(buf),
-	})
+	}, calquetags.ObjectTagging(l.RunID))
 	return err
 }
 

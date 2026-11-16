@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -166,6 +167,7 @@ type fakeQueueState struct {
 	deleted    bool
 	visible    int
 	notVisible int
+	tags       map[string]string // calque#227
 }
 
 func newFakeSQS() *fakeSQS {
@@ -184,8 +186,54 @@ func (f *fakeSQS) CreateQueue(_ context.Context, in *sqs.CreateQueueInput, _ ...
 	name := aws.ToString(in.QueueName)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.queues[name] = &fakeQueueState{url: "mem://" + name}
+	// Like SQS: an existing queue is returned as is, its tags untouched.
+	if q, ok := f.queues[name]; !ok || q.deleted {
+		f.queues[name] = &fakeQueueState{url: "mem://" + name, tags: maps.Clone(in.Tags)}
+	}
 	return &sqs.CreateQueueOutput{QueueUrl: aws.String("mem://" + name)}, nil
+}
+
+func (f *fakeSQS) queueByURL(url string) *fakeQueueState {
+	for _, q := range f.queues {
+		if q.url == url && !q.deleted {
+			return q
+		}
+	}
+	return nil
+}
+
+func (f *fakeSQS) ListQueueTags(_ context.Context, in *sqs.ListQueueTagsInput, _ ...func(*sqs.Options)) (*sqs.ListQueueTagsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	q := f.queueByURL(aws.ToString(in.QueueUrl))
+	if q == nil {
+		return nil, &types.QueueDoesNotExist{}
+	}
+	return &sqs.ListQueueTagsOutput{Tags: maps.Clone(q.tags)}, nil
+}
+
+func (f *fakeSQS) TagQueue(_ context.Context, in *sqs.TagQueueInput, _ ...func(*sqs.Options)) (*sqs.TagQueueOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	q := f.queueByURL(aws.ToString(in.QueueUrl))
+	if q == nil {
+		return nil, &types.QueueDoesNotExist{}
+	}
+	if q.tags == nil {
+		q.tags = map[string]string{}
+	}
+	maps.Copy(q.tags, in.Tags)
+	return &sqs.TagQueueOutput{}, nil
+}
+
+// tagsOf returns the named queue's tags.
+func (f *fakeSQS) tagsOf(name string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if q, ok := f.queues[name]; ok {
+		return maps.Clone(q.tags)
+	}
+	return nil
 }
 
 func (f *fakeSQS) GetQueueUrl(_ context.Context, in *sqs.GetQueueUrlInput, _ ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error) {

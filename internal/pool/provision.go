@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	"github.com/spore-host/cohort"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 	"github.com/spore-host/spawn/pkg/launcher"
@@ -27,6 +28,10 @@ import (
 // calque#226: this document is written as the pool's OWN inline policy on the
 // shared calque-pool-worker role, named QueueGrantPolicyName(queue ARN), not
 // as the role's single shared policy. See iam.go.
+//
+// calque#227: the results statement also grants s3:PutObjectTagging, which
+// S3 requires for the tagged PutObject a worker writes results and summaries
+// with.
 func WorkerPolicy(account, region, model, manifestBucket, resultsBucket string) string {
 	queueARN := poolQueueARN(account, region, model)
 	manifestObj := fmt.Sprintf("arn:aws:s3:::%s/*", manifestBucket)
@@ -38,7 +43,7 @@ func WorkerPolicy(account, region, model, manifestBucket, resultsBucket string) 
 		fmt.Sprintf(`{"Effect":"Allow","Action":["sqs:GetQueueUrl","sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueAttributes"],"Resource":[%q]}`, queueARN),
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject"],"Resource":[%q]}`, manifestObj),
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, manifestBkt),
-		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":[%q]}`, resultsObj),
+		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:PutObjectTagging"],"Resource":[%q]}`, resultsObj),
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, resultsBkt),
 	}
 	return `{"Version":"2012-10-17","Statement":[` + strings.Join(stmts, ",") + `]}`
@@ -52,6 +57,19 @@ func poolWorkerGrant(account string, cfg CreateConfig) workerGrant {
 		QueueARN:  poolQueueARN(account, cfg.Region, cfg.Model),
 		PolicyDoc: WorkerPolicy(account, cfg.Region, cfg.Model, cfg.ManifestBucket, cfg.ResultsBucket),
 	}
+}
+
+// poolWorkerTags is the tag set of a pool worker instance: calque:* plus the
+// spore-host:* set with managed-by=calque and scope pool:<model> (calque#227;
+// see plan.SpawnLauncher.tags for why managed-by is calque on an instance
+// spawn launches for calque).
+func poolWorkerTags(model string, now time.Time) map[string]string {
+	m := calquetags.For(calquetags.PoolScope(model), now)
+	m[poolModelTag] = model
+	m["calque:role"] = "pool-worker"
+	m["calque:command"] = "pool"
+	m["calque:created-at"] = now.UTC().Format(time.RFC3339)
+	return m
 }
 
 // defaultVisibilityTimeout mirrors cmd/calque/pool.go's own
@@ -165,13 +183,7 @@ func ProvisionWorkers(ctx context.Context, client *spawnaws.Client, cfg CreateCo
 		IdleTimeout:        cfg.IdleTimeout,
 		OnComplete:         "terminate",
 		UserData:           launcher.EncodeLinuxUserData(userData),
-		Tags: map[string]string{
-			"calque:pool-model": cfg.Model,
-			"calque:role":       "pool-worker",
-			"calque:managed":    "true",
-			"calque:command":    "pool",
-			"calque:created-at": time.Now().UTC().Format(time.RFC3339),
-		},
+		Tags:               poolWorkerTags(cfg.Model, time.Now()),
 	}
 
 	act := &taskcohort.Actuator{Client: client, Region: cfg.Region, BaseConfig: base}
@@ -335,10 +347,10 @@ func ScaleWorkers(ctx context.Context, client *spawnaws.Client, cfg CreateConfig
 		IdleTimeout:        cfg.IdleTimeout,
 		OnComplete:         "terminate",
 		UserData:           launcher.EncodeLinuxUserData(userData),
-		Tags: map[string]string{
-			"calque:pool-model": cfg.Model,
-			"calque:role":       "pool-worker",
-		},
+		// calque#227: the same full tag set ProvisionWorkers uses. This used
+		// to carry only calque:pool-model and calque:role, so a scaled-up
+		// worker lacked even calque:managed.
+		Tags: poolWorkerTags(cfg.Model, time.Now()),
 	}
 
 	act := &taskcohort.Actuator{Client: client, Region: cfg.Region, BaseConfig: base}

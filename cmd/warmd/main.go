@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	calexec "github.com/spore-host/calque/internal/exec"
 	calpool "github.com/spore-host/calque/internal/pool"
 	warm "github.com/spore-host/calque/worker/warm-runner"
@@ -65,6 +66,7 @@ type Manifest struct {
 	// PayloadIsBase64Bytes.
 	Base64ArgIndices []int                    `json:"base64_arg_indices,omitempty"`
 	Items            []warm.Item              `json:"items"`
+	RunID            string                   `json:"run_id,omitempty"` // calque#227: tags the objects warmd writes
 	Bucket           string                   `json:"bucket"`
 	ResultPrefix     string                   `json:"result_prefix"`
 	SummaryKey       string                   `json:"summary_key"`
@@ -333,7 +335,7 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 	go pollSpotInterruption(interruptCtx, stderrLeaker{})
 
 	started := time.Now()
-	sink := &calexec.S3Sink{Client: s3c, Bucket: man.Bucket, Prefix: man.ResultPrefix}
+	sink := &calexec.S3Sink{Client: s3c, Bucket: man.Bucket, Prefix: man.ResultPrefix, RunID: man.RunID}
 	sup := &warm.Supervisor{
 		Python: []string{pyOr(man.PythonBin)},
 		Script: man.RunnerPath,
@@ -413,7 +415,7 @@ func runOnInstance(ctx context.Context, manifestURI string) error {
 		InferenceSpans: sup.InferenceSpans, InferenceSeconds: inferSecs,
 		StartedUnix: started.Unix(), EndedUnix: ended.Unix(),
 	}
-	if err := putJSON(ctx, s3c, man.Bucket, man.SummaryKey, summary); err != nil {
+	if err := putJSON(ctx, s3c, man.Bucket, man.SummaryKey, calquetags.ObjectTagging(man.RunID), summary); err != nil {
 		return fmt.Errorf("write summary: %w", err)
 	}
 	return runErr
@@ -453,12 +455,14 @@ func getJSON(ctx context.Context, c *s3.Client, bucket, key string, v any) error
 	return json.NewDecoder(out.Body).Decode(v)
 }
 
-func putJSON(ctx context.Context, c *s3.Client, bucket, key string, v any) error {
+// putJSON writes v as JSON, tagged with tagging (calquetags.ObjectTagging;
+// calque#227).
+func putJSON(ctx context.Context, c *s3.Client, bucket, key, tagging string, v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	_, err = c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), Body: strings.NewReader(string(b))})
+	_, err = calquetags.PutObject(ctx, c, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), Body: strings.NewReader(string(b))}, tagging)
 	return err
 }
 

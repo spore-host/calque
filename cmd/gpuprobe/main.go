@@ -114,6 +114,7 @@ func probe(instanceType, region, ami, ttl string, deadline time.Duration, spot b
 	launchCfg := plan.SpawnLauncher{
 		TTL: ttl, OnComplete: "terminate",
 		Username: "ubuntu", AMI: ami, Spot: spot,
+		Command: "gpuprobe", // calque#227: tagged as calque's even without a run id
 		// No RunCmd: boot plain, no docker/GPU job — this probe runs over SSM
 		// after the instance is up, not via user-data.
 	}.Build()

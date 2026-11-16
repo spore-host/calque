@@ -87,7 +87,7 @@ func runRamp(o rampOpts) (err error) {
 	// Artifacts live under the session prefix; each rung gets its own sub-layout.
 	sessBase := "sessions/" + o.runID
 	artifactPfx := sessBase + "/artifacts"
-	if err := calexec.UploadArtifacts(ctx, s3c, calexec.RunLayout{Bucket: o.bucket, ArtifactPfx: artifactPfx},
+	if err := calexec.UploadArtifacts(ctx, s3c, calexec.RunLayout{RunID: o.runID, Bucket: o.bucket, ArtifactPfx: artifactPfx},
 		warmdBin, "worker/warm-runner/runner.py", "worker/warm-runner/occupancy.py"); err != nil {
 		return fmt.Errorf("upload artifacts: %w", err)
 	}
@@ -261,7 +261,7 @@ func runRung(ctx context.Context, sc *spawnaws.Client, s3c *s3.Client, o rampOpt
 	fmt.Printf("\n========== RUNG N=%d ==========\n", n)
 	rungBase := fmt.Sprintf("%s/rung-%d", sessBase, n)
 	layout := calexec.RunLayout{
-		Bucket: o.bucket, ArtifactPfx: sessBase + "/artifacts",
+		RunID: o.runID, Bucket: o.bucket, ArtifactPfx: sessBase + "/artifacts",
 		ManifestKey: rungBase + "/manifest.json", ResultPrefix: rungBase + "/results",
 		SummaryKey: rungBase + "/summary.json", LogKey: rungBase + "/test.log",
 		Concurrency: o.concurrency, BatchSize: o.batchSize,

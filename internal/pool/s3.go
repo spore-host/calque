@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	calexec "github.com/spore-host/calque/internal/exec"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
@@ -50,7 +51,7 @@ type S3Results struct {
 
 // Sink implements ResultWriter.
 func (r *S3Results) Sink(man calexec.Manifest) warm.Sink {
-	return &calexec.S3Sink{Client: r.Client, Bucket: man.Bucket, Prefix: man.ResultPrefix}
+	return &calexec.S3Sink{Client: r.Client, Bucket: man.Bucket, Prefix: man.ResultPrefix, RunID: man.RunID}
 }
 
 // Summary is the completion record a pool claim writes. It carries just
@@ -86,9 +87,9 @@ func (r *S3Results) WriteSummary(ctx context.Context, man calexec.Manifest, fail
 	if err != nil {
 		return err
 	}
-	_, err = r.Client.PutObject(ctx, &s3.PutObjectInput{
+	_, err = calquetags.PutObject(ctx, r.Client, &s3.PutObjectInput{
 		Bucket: aws.String(man.Bucket), Key: aws.String(man.SummaryKey), Body: bytes.NewReader(body),
-	})
+	}, calquetags.ObjectTagging(man.RunID)) // calque#227
 	if err != nil {
 		return fmt.Errorf("write summary %s: %w", man.SummaryKey, err)
 	}

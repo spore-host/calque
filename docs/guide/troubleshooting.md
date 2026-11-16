@@ -179,7 +179,8 @@ the termination call.
    If you don't remember the exact `--run-id`, drop that filter and use
    `Name=tag:calque:managed,Values=true` instead to see every
    calque-launched instance still running, then narrow by
-   `calque:command`/`LaunchTime`. Then:
+   `calque:command`/`LaunchTime`. Since calque#227 every calque resource,
+   not only instances, also carries `spore-host:managed-by=calque`. Then:
    ```
    aws ec2 terminate-instances --region YOUR-REGION --instance-ids i-XXXXXXXX
    ```

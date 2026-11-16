@@ -34,6 +34,18 @@ Two different things need permissions, and they're easy to conflate:
    when it is torn down), and use `iam:GetRolePolicy` and
    `iam:ListRolePolicies` best-effort, to migrate the pre-calque#226 shared
    policy and to explain a full role.
+
+   **Tagging (calque#227).** calque tags everything it creates (see the
+   next section), which needs: `iam:TagRole` and `iam:TagInstanceProfile`
+   (tagging the role and profile at create, and bringing an existing one's
+   tags up to date; the reads use `iam:GetRole` and `iam:GetInstanceProfile`,
+   which the role setup already needs), `s3:PutObjectTagging` on your bucket
+   (S3 refuses a tagged `PutObject` without it), `ec2:CreateTags` (which
+   launching already needs), and for `calque pool`/`calque fleetrun`
+   `sqs:TagQueue` and `sqs:ListQueueTags`. A missing tagging permission
+   never fails a run: calque creates or writes the resource untagged and
+   prints a `[tags] WARNING` naming the permission. An untagged resource
+   works, but calque's cleanup will not recognise it as calque's.
 2. **The EC2 instance itself** gets a SEPARATE, narrower role that calque
    creates and manages for you — you never need to hand-write this one.
    `internal/plan/iam.go`'s `RealRunPolicy` grants:
@@ -41,7 +53,7 @@ Two different things need permissions, and they're easy to conflate:
    {
      "Version": "2012-10-17",
      "Statement": [
-       {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": ["arn:aws:s3:::YOUR-BUCKET/*"]},
+       {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectTagging"], "Resource": ["arn:aws:s3:::YOUR-BUCKET/*"]},
        {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketLocation"], "Resource": ["arn:aws:s3:::YOUR-BUCKET"]},
        {"Effect": "Allow", "Action": ["ecr:GetAuthorizationToken"], "Resource": ["*"]},
        {"Effect": "Allow", "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"], "Resource": ["arn:aws:ecr:REGION:ACCOUNT:repository/*"]}
@@ -49,7 +61,8 @@ Two different things need permissions, and they're easy to conflate:
    }
    ```
    The S3 statements are scoped to the ONE bucket you passed via `--bucket`
-   — nothing account-wide. The ECR statements (calque#176) are granted
+   — nothing account-wide. `s3:PutObjectTagging` (calque#227) lets the
+   instance tag the results and summary it writes. The ECR statements (calque#176) are granted
    unconditionally, not just when a given run's script actually pulls a
    registry image, since the role is reused across every future run
    against this bucket rather than recreated per run;
@@ -72,6 +85,38 @@ results, summary, bootstrap log). The instance carries `calque:run-id`,
 `calque:managed=true`, and `calque:command` tags (calque#166) — useful for
 finding it by tag filter if a run gets interrupted; see
 [`troubleshooting.md`](troubleshooting.md).
+
+**Everything calque creates is tagged** (calque#227) with the spore.host
+set `spore-host:managed-by=calque`, `spore-host:scope`,
+`spore-host:created` and `spore-host:schema`, plus `calque:managed=true`.
+That is how calque's cleanup (calque#228) will find what calque made, and
+nothing else:
+
+| Resource | Scope | Also tagged |
+|---|---|---|
+| EC2 instances (real, smoke, ramp, spawn-run, fleet, ami bake, gpuprobe) | `run:<run-id>` (none for gpuprobe, which has no run id) | `calque:run-id`, `calque:command` |
+| Pool worker instances | `pool:<model>` | `calque:pool-model`, `calque:role` |
+| Fleet worker instances | `run:<run-id>` | `calque:fleet-run`, `calque:run-id` |
+| SQS `calque-pool-<model>` | `pool:<model>` | `calque:pool-model` |
+| SQS `calque-fleet-<run-id>` | `run:<run-id>` | `calque:fleet-run`, `calque:run-id` |
+| IAM role + profile `calque-real-run-<hash>` | `bucket:<bucket>` | |
+| IAM roles + profiles `calque-pool-worker` / `calque-fleet-worker` | `pool-workers` / `fleet-workers` | |
+| Security group `calque-nfs-sg` | `vpc:<vpc-id>` | |
+| Baked AMI and its snapshots | `run:<run-id>` | `calque:baked-image`, `calque:baked-at` |
+| S3 objects calque writes from Go (artifacts, manifest, Dockerfile, results, summary) | `run:<run-id>` | `calque:run-id` (no `spore-host:created`: an object's LastModified says when) |
+
+An instance calque launches through spawn also carries spawn's own
+`spawn:*` tags, and spawn's TTL backstop keys on those, so it still
+applies. Its `spore-host:managed-by` is `calque`, not `spawn`, because
+calque owns its lifecycle (it terminates the instance, drains the fleet,
+deletes the pool). An IAM role, security group or queue that an older
+calque created untagged is tagged the next time calque uses it.
+
+Not tagged yet: objects the instance writes with the AWS CLI rather than
+from Go (the bootstrap log, the `ami bake` done marker and log, the
+occupancy files, and `Volume` commits via `aws s3 sync`), since `aws s3 cp`
+can't tag. A message retention period expires a queue's messages, never
+the queue itself; a leftover queue stays until it is deleted.
 
 **One thing that's NOT per-run**: the IAM role+instance profile itself is
 created ONCE PER BUCKET and REUSED across every subsequent real run

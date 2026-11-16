@@ -83,7 +83,7 @@ func spawnRun(ctx context.Context, app ir.App, sites []calexec.SpawnCallSite, o 
 	}
 
 	base := "spawn/" + o.runID
-	sharedLayout := calexec.RunLayout{Bucket: o.bucket, ArtifactPfx: base + "/artifacts"}
+	sharedLayout := calexec.RunLayout{RunID: o.runID, Bucket: o.bucket, ArtifactPfx: base + "/artifacts"}
 	if err := calexec.UploadArtifacts(ctx, s3c, sharedLayout, warmdBin, "worker/warm-runner/runner.py", "worker/warm-runner/occupancy.py"); err != nil {
 		return fmt.Errorf("upload artifacts: %w", err)
 	}
@@ -232,7 +232,7 @@ func warmUnitForSpawnCallable(app ir.App, callable calexec.SpawnCallable) (warmU
 func runSpawnShard(ctx context.Context, app ir.App, s3c *s3.Client, ec2c *ec2.Client, spawnClient *spawnaws.Client, o spawnOpts,
 	sh calexec.NamedShard, callable calexec.SpawnCallable, places []plan.Placement, rep *syncReport) error {
 	shardLayout := calexec.RunLayout{
-		Bucket: o.bucket, ArtifactPfx: "spawn/" + o.runID + "/artifacts",
+		RunID: o.runID, Bucket: o.bucket, ArtifactPfx: "spawn/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
 	}
 	// calque#198: resolve this callable's own sibling functions/constants/
