@@ -11,6 +11,51 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Added
 
+- **`calque footprint` and `calque teardown`: calque can now find and remove
+  what it created** (calque#228, part of leave-no-trace
+  spore-host/spore-host#752). Before, nothing deleted calque's roles, its
+  `calque-nfs-sg` group or its S3 staging. `calque footprint [--region R |
+  --all-regions] [--bucket B ...] [-o table|json]` lists the
+  `calque-real-run-*`, `calque-pool-worker` and `calque-fleet-worker` roles
+  and profiles with their per-queue grants (`q-*`), the `calque-pool-*` and
+  `calque-fleet-*` queues with message and worker counts, `calque-nfs-sg` in
+  each VPC with its network interfaces, baked AMIs and their snapshots,
+  instances tagged `calque:managed=true`, and, in the buckets you name, the
+  objects tagged `spore-host:managed-by=calque` under `runs/`, `fleet/` and
+  `ami-bake/`. calque keeps no record of the buckets it wrote to, so it
+  looks only in the ones passed with `--bucket`. Each resource is classed
+  `active`, `user-data` or `litter`, and attributed `tagged`, or
+  `legacy-name` when only its name matched (made before calque#227);
+  `-o json` is the shared `libs/footprint` report. `calque teardown --plan
+  <file|-> [--mode report|reap]` runs that report through the shared
+  executor: report mode, the default, deletes nothing; `--mode reap` needs
+  `--yes` and calque's teardown lease, re-checks each resource just before
+  deleting it, and deletes dependents first. Only `tagged` resources are
+  deleted, and never baked AMIs, run results, instances, or a managed
+  policy: a role's managed policies, spawn's `spored-*` among them, are
+  detached, not deleted. Deleting `calque-nfs-sg` revokes the rules that
+  reference it first, including in your EFS mount target's group.
+
+- **`pkg/calquefootprint`**, the inventory, classification and deleter
+  behind those commands, as a package spawn's reaper can import
+  (spore-host/spawn#1654) so its account-idle sweep covers calque. It
+  depends only on the AWS SDK and `spore-host/libs`, which a test enforces.
+  `calque pool delete` and the fleet cleanup now delete queues through it,
+  and the queue, role, grant and security-group names come from it.
+
+- **New IAM actions for footprint and teardown**, listed in
+  `docs/guide/getting-started.md`. Reading: `iam:ListRoles`,
+  `iam:ListAttachedRolePolicies`, `iam:ListInstanceProfiles`,
+  `iam:ListInstanceProfilesForRole`, `sqs:ListQueues`,
+  `ec2:DescribeNetworkInterfaces`, `ec2:DescribeSecurityGroupRules`,
+  `ec2:DescribeSnapshots`, `ec2:DescribeRegions` and `s3:GetObjectTagging`.
+  Reaping: `iam:DeleteRole`, `iam:DeleteInstanceProfile`,
+  `iam:RemoveRoleFromInstanceProfile`, `iam:DetachRolePolicy`,
+  `ec2:DeleteSecurityGroup`, `ec2:RevokeSecurityGroupIngress`,
+  `ec2:RevokeSecurityGroupEgress` and `s3:DeleteObject`, plus
+  `dynamodb:GetItem`, `dynamodb:UpdateItem` and `dynamodb:DeleteItem` on
+  `spore-host-lifecycle` for the lease.
+
 - **Everything calque creates is tagged `spore-host:managed-by=calque`**
   (calque#227, part of the leave-no-trace epic spore-host/spore-host#752).
   Each resource gets the shared spore.host set from `libs/tags`
@@ -50,8 +95,9 @@ per [semver.org](https://semver.org/#spec-item-4).
   messages, not the queue: an idle pool queue still lives until
   `calque pool delete`, and calque#228 adds the backstop.
 
-- **`github.com/spore-host/libs` v0.52.0** is now a direct dependency (for
-  `libs/tags`); spawn stays at v0.131.0.
+- **`github.com/spore-host/libs` v0.53.0** is now a direct dependency (for
+  `libs/tags`, and since calque#228 `libs/footprint` and `libs/lifecycle`);
+  spawn stays at v0.131.0.
 
 - **Go dependencies:** truffle v0.49.0 → v0.60.0, spawn v0.100.0 → v0.106.0,
   lagotto v0.53.0 → v0.63.0, and the AWS SDK modules and smithy-go to the

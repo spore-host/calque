@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 
 	"github.com/spore-host/calque/internal/calquetags"
+	"github.com/spore-host/calque/pkg/calquefootprint"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 )
 
@@ -146,5 +147,5 @@ func RealRunRoleTags(bucket string, now time.Time) map[string]string {
 // number of distinct buckets any one caller will ever pass).
 func roleNameForBucket(bucket string) string {
 	h := sha256.Sum256([]byte(bucket))
-	return fmt.Sprintf("calque-real-run-%x", h[:8])
+	return fmt.Sprintf("%s%x", calquefootprint.RealRunRolePrefix, h[:8])
 }

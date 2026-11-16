@@ -30,13 +30,14 @@ import (
 	"time"
 
 	calexec "github.com/spore-host/calque/internal/exec"
+	"github.com/spore-host/calque/pkg/calquefootprint"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
 // poolQueuePrefix is prepended to every slugged model to form the final SQS
 // queue name — kept as a named const so slugModel's length budget (queuePrefix
 // vs. the 80-char SQS cap) stays in lockstep with PoolQueueName's own prefix.
-const poolQueuePrefix = "calque-pool-"
+const poolQueuePrefix = calquefootprint.PoolQueuePrefix
 
 // PoolQueueName derives the SQS queue name for a pool, keyed by MODEL (not run
 // id, unlike spawn's taskpool.QueueName(runID)) — decision 2 of
@@ -55,40 +56,7 @@ func PoolQueueName(model string) string {
 // [a-z0-9_-] replaced with "-", runs of "-" collapsed to one, leading/
 // trailing "-" trimmed, and truncated so poolQueuePrefix+slug never exceeds
 // SQS's 80-char QueueName limit.
-func slugModel(model string) string {
-	lower := strings.ToLower(model)
-	var b strings.Builder
-	b.Grow(len(lower))
-	lastDash := false
-	for _, r := range lower {
-		var out rune
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
-			out = r
-		default:
-			out = '-'
-		}
-		if out == '-' {
-			if lastDash {
-				continue // collapse consecutive '-'
-			}
-			lastDash = true
-		} else {
-			lastDash = false
-		}
-		b.WriteRune(out)
-	}
-	slug := strings.Trim(b.String(), "-")
-
-	maxLen := 80 - len(poolQueuePrefix)
-	if maxLen < 0 {
-		maxLen = 0
-	}
-	if len(slug) > maxLen {
-		slug = strings.TrimRight(slug[:maxLen], "-")
-	}
-	return slug
-}
+func slugModel(model string) string { return calquefootprint.Slug(model) }
 
 // ClaimRef is what travels on a pool's queue: a pointer to an S3-staged
 // manifest fragment, not the items inline (mirrors taskpool.TaskRef's

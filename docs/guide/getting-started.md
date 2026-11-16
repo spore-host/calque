@@ -46,6 +46,29 @@ Two different things need permissions, and they're easy to conflate:
    never fails a run: calque creates or writes the resource untagged and
    prints a `[tags] WARNING` naming the permission. An untagged resource
    works, but calque's cleanup will not recognise it as calque's.
+
+   **Footprint and teardown (calque#228).** `calque footprint` only reads:
+   `iam:ListRoles`, `iam:GetRole`, `iam:ListRolePolicies`,
+   `iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`,
+   `iam:ListInstanceProfiles`, `iam:GetInstanceProfile`,
+   `sqs:ListQueues`, `sqs:GetQueueAttributes`, `sqs:ListQueueTags`,
+   `ec2:DescribeInstances`, `ec2:DescribeSecurityGroups`,
+   `ec2:DescribeNetworkInterfaces`, `ec2:DescribeImages`,
+   `ec2:DescribeSnapshots`, `ec2:DescribeRegions` (for `--all-regions`), and
+   for `--bucket` `s3:ListBucket` and `s3:GetObjectTagging`.
+   `calque teardown` re-reads with the same calls plus
+   `iam:ListInstanceProfilesForRole`, `sqs:GetQueueUrl`,
+   `ec2:DescribeSecurityGroupRules` and `s3:GetObject` (for `HeadObject`),
+   and with `--mode reap` deletes with `sqs:DeleteQueue`,
+   `iam:DeleteRolePolicy`, `iam:DetachRolePolicy`,
+   `iam:RemoveRoleFromInstanceProfile`, `iam:DeleteInstanceProfile`,
+   `iam:DeleteRole`, `ec2:RevokeSecurityGroupIngress`,
+   `ec2:RevokeSecurityGroupEgress`, `ec2:DeleteSecurityGroup` and
+   `s3:DeleteObject`. The teardown lease needs `dynamodb:GetItem`,
+   `dynamodb:UpdateItem` and `dynamodb:DeleteItem` on the
+   `spore-host-lifecycle` table in `--lease-region`. Teardown never calls
+   `iam:DeletePolicy`, `ec2:TerminateInstances` or
+   `ec2:DeregisterImage`.
 2. **The EC2 instance itself** gets a SEPARATE, narrower role that calque
    creates and manages for you — you never need to hand-write this one.
    `internal/plan/iam.go`'s `RealRunPolicy` grants:
@@ -89,7 +112,7 @@ finding it by tag filter if a run gets interrupted; see
 **Everything calque creates is tagged** (calque#227) with the spore.host
 set `spore-host:managed-by=calque`, `spore-host:scope`,
 `spore-host:created` and `spore-host:schema`, plus `calque:managed=true`.
-That is how calque's cleanup (calque#228) will find what calque made, and
+That is how `calque footprint` (calque#228) finds what calque made, and
 nothing else:
 
 | Resource | Scope | Also tagged |
@@ -131,10 +154,19 @@ still-in-flight bucket grant. Two runs against the SAME bucket still
 correctly share one role, as before. If you audit your account after a run
 and still see one of these roles, that's expected — each is a persistent,
 shared-per-bucket resource, not something a `--i-understand-this-*` flag
-ever tears down. Delete it yourself via the IAM console/CLI if you want it
-gone; calque has no `--i-understand-this-deletes-the-shared-role` verb for
-that (there's nothing sensitive stored in it — it's just a capability
+ever tears down. `calque footprint --all-regions` lists it, and once no
+live instance uses it, `calque teardown` removes it with its instance
+profile (there's nothing sensitive stored in it — it's just a capability
 grant, scoped to that one bucket).
+
+**Finding and removing what calque left behind.** `calque footprint`
+lists everything above, says which of it is in use, and which is litter.
+Pass `--all-regions`, since an IAM role can only be called unused when no
+instance in any region uses it, and `--bucket` for each bucket you ran
+against, since calque keeps no record of them. Its JSON is the plan
+`calque teardown` acts on: report mode (the default) says what would go,
+and `--mode reap --yes` deletes it. Baked AMIs and run results are yours
+and are never deleted; see `docs/guide/cli-reference.md`.
 
 **Pool and fleet workers** (`calque pool`, `calque fleetrun`) run under two
 shared roles, `calque-pool-worker` and `calque-fleet-worker`. Each pool or

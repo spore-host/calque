@@ -235,6 +235,9 @@ The Go control plane understands **decorators** (configuration). It does **not**
   `.spawn()`/`.get()` idiom.
 - **`calque session`** — check a MIG slice or MPS client-slot in/out on an
   already-running instance (institutional multi-tenancy).
+- **`calque footprint`** / **`calque teardown`** — list what calque created in an
+  account and which of it is idle, then remove the idle part (report mode by default;
+  `--mode reap --yes` deletes). Baked AMIs and run results are never deleted.
 
 `smoke`/`real`/`ramp`/`pool create`/`pool scale`/`spawn-run` acquire billable AWS
 hardware and refuse to run without an explicit `--i-understand-this-spends-money`

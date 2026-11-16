@@ -38,6 +38,7 @@ import (
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/plan"
 	"github.com/spore-host/calque/internal/target"
+	"github.com/spore-host/calque/pkg/calquefootprint"
 )
 
 // bakedImageTag namespaces calque's own AMI tags. spawn v0.131.0's CreateAMI
@@ -45,7 +46,7 @@ import (
 // adds none of its own (pkg/aws/ami_mgmt.go), so bakedAMITags is the whole
 // tag set either carries.
 const (
-	bakedImageTagKey = "calque:baked-image"
+	bakedImageTagKey = calquefootprint.BakedImageTag
 	bakedAtTagKey    = "calque:baked-at"
 )
 

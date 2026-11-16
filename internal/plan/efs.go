@@ -18,6 +18,7 @@ import (
 	"github.com/spore-host/calque/internal/calquetags"
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
+	"github.com/spore-host/calque/pkg/calquefootprint"
 )
 
 // NetworkFileSystem plumbing (calque#91 Workstream B).
@@ -223,7 +224,7 @@ func NFSMountCommands(mounts []NFSMountResolved, dnsByName map[string]string) []
 // uses — a fixed name, one per VPC, reused across runs rather than created
 // fresh every time (mirrors RealRunInstanceProfile's per-bucket IAM role
 // reuse-not-recreate posture in iam.go).
-const nfsSecurityGroupName = "calque-nfs-sg"
+const nfsSecurityGroupName = calquefootprint.NFSSecurityGroupName
 
 // EnsureNFSSecurityGroup resolves (creating if needed) a security group in
 // vpcID allowing NFS (TCP/2049) ingress from ITSELF — the standard
