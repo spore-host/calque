@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	warm "github.com/spore-host/calque/worker/warm-runner"
 )
 
@@ -59,6 +60,9 @@ type S3Sink struct {
 	Client *s3.Client
 	Bucket string
 	Prefix string // e.g. "runs/<runID>/results"
+	// RunID tags each result object (calque#227: spore-host:managed-by=calque,
+	// calque:run-id), via calquetags.PutObject. Empty tags without a run id.
+	RunID string
 
 	// secs accumulates the per-item wall-clock series for the tach hook (§8). One
 	// float per item is cheap even at 100k (~800KB); the results themselves stream
@@ -82,11 +86,11 @@ func (s *S3Sink) Put(ctx context.Context, r warm.Result) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.Client.PutObject(ctx, &s3.PutObjectInput{
+	_, err = calquetags.PutObject(ctx, s.Client, &s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.key(r.Index)),
 		Body:   bytes.NewReader(body),
-	})
+	}, calquetags.ObjectTagging(s.RunID))
 	if err == nil {
 		s.secs = append(s.secs, r.Seconds)
 	}

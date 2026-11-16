@@ -76,7 +76,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 
 	// Artifacts are shared across shards (same warmd + scripts); upload once.
 	base := "fleet/" + o.runID
-	sharedLayout := calexec.RunLayout{Bucket: o.bucket, ArtifactPfx: base + "/artifacts"}
+	sharedLayout := calexec.RunLayout{RunID: o.runID, Bucket: o.bucket, ArtifactPfx: base + "/artifacts"}
 	if err := calexec.UploadArtifacts(ctx, s3c, sharedLayout, warmdBin, "worker/warm-runner/runner.py", "worker/warm-runner/occupancy.py"); err != nil {
 		return fmt.Errorf("upload artifacts: %w", err)
 	}
@@ -233,7 +233,12 @@ func fleetRun(o realOpts, shards int) (err error) {
 			fmt.Fprintf(os.Stderr, "[fleet] WARNING: drain fleet workers failed for run %s: %v (workers' own TTL will reap)\n", o.runID, derr)
 		}
 		if derr := calpool.DeleteRunQueueIfExists(context.Background(), sqsClient, o.runID); derr != nil {
-			fmt.Fprintf(os.Stderr, "[fleet] WARNING: delete run queue failed for run %s: %v (12h retention will reap)\n", o.runID, derr)
+			// Not "retention will reap": MessageRetentionPeriod expires the
+			// queue's messages, never the queue (calque#227). It stays, tagged
+			// spore-host:managed-by=calque, until it is deleted by hand or by
+			// calque#228's teardown.
+			fmt.Fprintf(os.Stderr, "[fleet] WARNING: delete run queue failed for run %s: %v (SQS queue %s in %s stays until it is deleted)\n",
+				o.runID, derr, calpool.RunQueueName(o.runID), o.region)
 		}
 		// calque#226: remove ONLY this run's inline policy from the shared
 		// calque-fleet-worker role. Unlike pool delete this runs even if the
@@ -290,7 +295,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 	var wg sync.WaitGroup
 	for i := range shs {
 		if err := calexec.WriteManifestBody(ctx, s3c, calexec.RunLayout{
-			Bucket: o.bucket, ArtifactPfx: sharedLayout.ArtifactPfx,
+			RunID: o.runID, Bucket: o.bucket, ArtifactPfx: sharedLayout.ArtifactPfx,
 			ManifestKey: shs[i].ManifestKey, ResultPrefix: shs[i].ResultPrefix, SummaryKey: shs[i].SummaryKey, LogKey: shs[i].LogKey,
 		}, shardBody, hostWorkerDir, shs[i].Items, shardVolumeSync, shardVolumeCommit); err != nil {
 			shardErrs[i] = fmt.Errorf("shard %d write manifest: %w", shs[i].ID, err)
@@ -361,7 +366,7 @@ func fleetRun(o realOpts, shards int) (err error) {
 		sub.ManifestKey, sub.ResultPrefix, sub.SummaryKey, sub.LogKey = mk, shs[i].ResultPrefix, sk, lk
 		fmt.Fprintf(os.Stderr, "[fleet] shard %d completed with %d permanently-failed item(s); re-driving just those on the SAME pool\n", shs[i].ID, len(shardFailed[i]))
 		if werr := calexec.WriteManifestBody(ctx, s3c, calexec.RunLayout{
-			Bucket: o.bucket, ArtifactPfx: sharedLayout.ArtifactPfx,
+			RunID: o.runID, Bucket: o.bucket, ArtifactPfx: sharedLayout.ArtifactPfx,
 			ManifestKey: sub.ManifestKey, ResultPrefix: sub.ResultPrefix, SummaryKey: sub.SummaryKey, LogKey: sub.LogKey,
 		}, shardBody, hostWorkerDir, sub.Items, shardVolumeSync, shardVolumeCommit); werr != nil {
 			shardErrs[i] = fmt.Errorf("shard %d item-redrive write manifest: %w", shs[i].ID, werr)
@@ -624,7 +629,7 @@ func runShard(ctx context.Context, s3c *s3.Client, ec2c *ec2.Client, spawnClient
 	volumeSync, volumeCommit []calexec.VolumeSyncSpec, cloudBucketMountLines, cloudBucketMountBuckets []string,
 	nfsMountLines, nfsSecurityGroupIDs []string) (measure.Measurement, error) {
 	shardLayout := calexec.RunLayout{
-		Bucket: o.bucket, ArtifactPfx: "fleet/" + o.runID + "/artifacts",
+		RunID: o.runID, Bucket: o.bucket, ArtifactPfx: "fleet/" + o.runID + "/artifacts",
 		ManifestKey: sh.ManifestKey, ResultPrefix: sh.ResultPrefix, SummaryKey: sh.SummaryKey, LogKey: sh.LogKey,
 	}
 	if err := calexec.WriteManifestBody(ctx, s3c, shardLayout, body, hostWorkerDir, sh.Items, volumeSync, volumeCommit); err != nil {

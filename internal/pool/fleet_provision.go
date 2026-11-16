@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	"github.com/spore-host/cohort"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 	"github.com/spore-host/spawn/pkg/launcher"
@@ -24,6 +25,9 @@ import (
 // calque#226: written as the run's OWN inline policy on the shared
 // calque-fleet-worker role (QueueGrantPolicyName), and deleted by
 // RevokeFleetWorkerGrant when the run cleans up. See iam.go.
+//
+// calque#227: like WorkerPolicy, the results statement also grants
+// s3:PutObjectTagging for the worker's tagged PutObject.
 func FleetWorkerPolicy(account, region, runID, manifestBucket, resultsBucket string) string {
 	queueARN := runQueueARN(account, region, runID)
 	manifestObj := fmt.Sprintf("arn:aws:s3:::%s/*", manifestBucket)
@@ -35,7 +39,7 @@ func FleetWorkerPolicy(account, region, runID, manifestBucket, resultsBucket str
 		fmt.Sprintf(`{"Effect":"Allow","Action":["sqs:GetQueueUrl","sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueAttributes"],"Resource":[%q]}`, queueARN),
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject"],"Resource":[%q]}`, manifestObj),
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, manifestBkt),
-		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":[%q]}`, resultsObj),
+		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:PutObjectTagging"],"Resource":[%q]}`, resultsObj),
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, resultsBkt),
 	}
 	return `{"Version":"2012-10-17","Statement":[` + strings.Join(stmts, ",") + `]}`
@@ -128,6 +132,20 @@ type FleetCreateConfig struct {
 // fleet registry, mirroring pool mode's own no-registry design).
 const fleetWorkerTag = "calque:fleet-run"
 
+// fleetWorkerTags is the tag set of a fleet worker instance: calque:* plus the
+// spore-host:* set with managed-by=calque and scope run:<runID> (calque#227).
+// calque:fleet-run and calque:run-id carry the run id verbatim (EC2 takes any
+// tag value), since DrainFleetWorkers matches on fleetWorkerTag's exact value.
+func fleetWorkerTags(runID string, now time.Time) map[string]string {
+	m := calquetags.ForRun(runID, now)
+	m[fleetWorkerTag] = runID
+	m[calquetags.RunID] = runID // calque#166: same value as fleetWorkerTag, under the repo-wide key
+	m["calque:role"] = "fleet-worker"
+	m["calque:command"] = "fleet"
+	m["calque:created-at"] = now.UTC().Format(time.RFC3339)
+	return m
+}
+
 // ProvisionFleetWorkers launches a fleet run's worker cohort via
 // taskcohort + cohort — ProvisionWorkers' run-scoped sibling (calque#145),
 // reusing the exact same partial-cohort/best-effort provisioning shape,
@@ -200,14 +218,7 @@ func ProvisionFleetWorkers(ctx context.Context, client *spawnaws.Client, cfg Fle
 		IdleTimeout:        cfg.IdleTimeout,
 		OnComplete:         "terminate",
 		UserData:           launcher.EncodeLinuxUserData(userData),
-		Tags: map[string]string{
-			fleetWorkerTag:      cfg.RunID,
-			"calque:role":       "fleet-worker",
-			"calque:run-id":     cfg.RunID, // calque#166: same value as fleetWorkerTag, under the
-			"calque:managed":    "true",    // repo-wide calque:* tag convention other launch paths use
-			"calque:command":    "fleet",
-			"calque:created-at": time.Now().UTC().Format(time.RFC3339),
-		},
+		Tags:               fleetWorkerTags(cfg.RunID, time.Now()),
 	}
 
 	act := &taskcohort.Actuator{Client: client, Region: cfg.Region, BaseConfig: base}

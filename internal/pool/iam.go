@@ -19,6 +19,7 @@ import (
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 )
 
@@ -66,9 +67,11 @@ const (
 	roleInlinePolicyBudget = 10240
 )
 
-// IAMAPI is the slice of the IAM SDK the per-queue grants need. A real
-// *iam.Client satisfies it; tests use an in-memory fake.
+// IAMAPI is the slice of the IAM SDK the per-queue grants and the worker
+// roles' tags (calque#227) need. A real *iam.Client satisfies it; tests use an
+// in-memory fake.
 type IAMAPI interface {
+	calquetags.IAMAPI
 	PutRolePolicy(ctx context.Context, in *iam.PutRolePolicyInput, opts ...func(*iam.Options)) (*iam.PutRolePolicyOutput, error)
 	DeleteRolePolicy(ctx context.Context, in *iam.DeleteRolePolicyInput, opts ...func(*iam.Options)) (*iam.DeleteRolePolicyOutput, error)
 	GetRolePolicy(ctx context.Context, in *iam.GetRolePolicyInput, opts ...func(*iam.Options)) (*iam.GetRolePolicyOutput, error)
@@ -118,6 +121,17 @@ type workerGrant struct {
 	PolicyDoc string
 }
 
+// WorkerRoleTags is the tag set of a shared worker role and its instance
+// profile (calque#227): the calque/spore-host set, scoped to every pool's
+// (or every fleet run's) workers, since the role outlives any one of them.
+func WorkerRoleTags(role string, now time.Time) map[string]string {
+	scope := calquetags.ScopePoolWorkers
+	if role == FleetWorkerRoleName {
+		scope = calquetags.ScopeFleetWorkers
+	}
+	return calquetags.For(scope, now)
+}
+
 // ensureWorkerProfile resolves the shared worker role's instance profile and
 // writes THIS queue's grant onto it as its own inline policy.
 //
@@ -126,14 +140,21 @@ type workerGrant struct {
 // and the last caller wins (calque#226). Without it spawn still creates the
 // role and profile if missing and attaches SSM and spored-baseline-policy,
 // but touches no other inline policy.
+//
+// calque#227: spawn tags the role and profile (WorkerRoleTags) only when it
+// creates them, so they are then brought up to date on every call, which
+// tags a role an older calque created; failing to tag is a warning.
 func ensureWorkerProfile(ctx context.Context, profiles instanceProfileEnsurer, iamc IAMAPI, g workerGrant) (string, error) {
+	now := time.Now()
 	profile, err := profiles.CreateOrGetInstanceProfile(ctx, spawnaws.IAMRoleConfig{
 		RoleName:      g.Role,
 		TrustServices: []string{"ec2"},
+		Tags:          WorkerRoleTags(g.Role, now), // a fresh map: spawn adds its spawn:* keys to it
 	})
 	if err != nil {
 		return "", fmt.Errorf("set up worker IAM instance profile: %w", err)
 	}
+	calquetags.WarnRoleTags(ctx, iamc, g.Role, WorkerRoleTags(g.Role, now))
 	if err := putQueueGrant(ctx, iamc, g); err != nil {
 		return "", err
 	}

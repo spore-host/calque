@@ -12,9 +12,11 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/iam v1.64.4
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.4
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.5
+	github.com/aws/aws-sdk-go-v2/service/sts v1.51.4
 	github.com/aws/smithy-go v1.28.5
 	github.com/spore-host/cohort v0.2.0
 	github.com/spore-host/lagotto v0.64.1
+	github.com/spore-host/libs v0.52.0
 	github.com/spore-host/spawn v0.131.0
 	github.com/spore-host/truffle v0.62.1
 )
@@ -52,7 +54,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.79.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.38.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.4 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sts v1.51.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/xray v1.36.23 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -105,7 +106,6 @@ require (
 	github.com/sigstore/sigstore-go v1.2.2 // indirect
 	github.com/sigstore/timestamp-authority/v2 v2.1.2 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
-	github.com/spore-host/libs v0.51.2 // indirect
 	github.com/theupdateframework/go-tuf/v2 v2.4.2 // indirect
 	github.com/transparency-dev/formats v0.1.1 // indirect
 	github.com/transparency-dev/merkle v0.0.2 // indirect

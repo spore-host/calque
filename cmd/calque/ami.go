@@ -33,15 +33,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	calexec "github.com/spore-host/calque/internal/exec"
 	"github.com/spore-host/calque/internal/leak"
 	"github.com/spore-host/calque/internal/plan"
 	"github.com/spore-host/calque/internal/target"
 )
 
-// bakedImageTag namespaces calque's own AMI tags, distinct from spawn's own
-// spawn:* tags (which CreateAMI already sets automatically — this file adds
-// ONLY these two on top, never duplicating spawn's own tagging).
+// bakedImageTag namespaces calque's own AMI tags. spawn v0.131.0's CreateAMI
+// writes exactly the tags it is given, to the image AND its snapshots, and
+// adds none of its own (pkg/aws/ami_mgmt.go), so bakedAMITags is the whole
+// tag set either carries.
 const (
 	bakedImageTagKey = "calque:baked-image"
 	bakedAtTagKey    = "calque:baked-at"
@@ -221,10 +223,7 @@ func amiBake(o amiBakeOpts) (err error) {
 		InstanceID:  acquired.InstanceID,
 		Name:        o.name,
 		Description: fmt.Sprintf("calque-baked AMI: %s pre-pulled (calque#144)", o.image),
-		Tags: map[string]string{
-			bakedImageTagKey: o.image,
-			bakedAtTagKey:    time.Now().UTC().Format(time.RFC3339),
-		},
+		Tags:        bakedAMITags(o.image, o.runID, time.Now()),
 	})
 	if err != nil {
 		return fmt.Errorf("create AMI: %w", err)
@@ -238,6 +237,18 @@ func amiBake(o amiBakeOpts) (err error) {
 
 	fmt.Printf("[5/5] done.\n\nbaked AMI: %s\n\nUse it with: calque real --ami %s ...\n", amiID, amiID)
 	return nil
+}
+
+// bakedAMITags is the tag set of a baked AMI and its snapshots: the
+// calque:baked-* pair `calque ami list` reads, plus calque:managed and the
+// spore-host:* set with managed-by=calque and scope run:<runID> (calque#227),
+// so leave-no-trace cleanup can find the image and the snapshots it would
+// otherwise strand.
+func bakedAMITags(image, runID string, now time.Time) map[string]string {
+	m := calquetags.ForRun(runID, now)
+	m[bakedImageTagKey] = image
+	m[bakedAtTagKey] = now.UTC().Format(time.RFC3339)
+	return m
 }
 
 // amiBakeBootstrapCommand builds the minimal one-time setup script the bake

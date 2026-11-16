@@ -37,10 +37,60 @@ type fakeIAM struct {
 	// conflicts is how many upcoming PutRolePolicy calls fail with
 	// ConcurrentModification before one succeeds.
 	conflicts int
+	// roleTags/profileTags are the roles' and instance profiles' tags
+	// (calque#227). Every role and profile is taken to exist.
+	roleTags, profileTags map[string]map[string]string
 }
 
 func newFakeIAM() *fakeIAM {
-	return &fakeIAM{policies: map[string]map[string]string{}, budget: roleInlinePolicyBudget}
+	return &fakeIAM{
+		policies: map[string]map[string]string{}, budget: roleInlinePolicyBudget,
+		roleTags: map[string]map[string]string{}, profileTags: map[string]map[string]string{},
+	}
+}
+
+func (f *fakeIAM) GetRole(_ context.Context, in *iam.GetRoleInput, _ ...func(*iam.Options)) (*iam.GetRoleOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &iam.GetRoleOutput{Role: &iamtypes.Role{RoleName: in.RoleName, Tags: iamTagList(f.roleTags[awssdk.ToString(in.RoleName)])}}, nil
+}
+
+func (f *fakeIAM) GetInstanceProfile(_ context.Context, in *iam.GetInstanceProfileInput, _ ...func(*iam.Options)) (*iam.GetInstanceProfileOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := awssdk.ToString(in.InstanceProfileName)
+	return &iam.GetInstanceProfileOutput{InstanceProfile: &iamtypes.InstanceProfile{InstanceProfileName: in.InstanceProfileName, Tags: iamTagList(f.profileTags[name])}}, nil
+}
+
+func (f *fakeIAM) TagRole(_ context.Context, in *iam.TagRoleInput, _ ...func(*iam.Options)) (*iam.TagRoleOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	addIAMTags(f.roleTags, awssdk.ToString(in.RoleName), in.Tags)
+	return &iam.TagRoleOutput{}, nil
+}
+
+func (f *fakeIAM) TagInstanceProfile(_ context.Context, in *iam.TagInstanceProfileInput, _ ...func(*iam.Options)) (*iam.TagInstanceProfileOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	addIAMTags(f.profileTags, awssdk.ToString(in.InstanceProfileName), in.Tags)
+	return &iam.TagInstanceProfileOutput{}, nil
+}
+
+func iamTagList(m map[string]string) []iamtypes.Tag {
+	var out []iamtypes.Tag
+	for k, v := range m {
+		out = append(out, iamtypes.Tag{Key: awssdk.String(k), Value: awssdk.String(v)})
+	}
+	return out
+}
+
+func addIAMTags(into map[string]map[string]string, name string, ts []iamtypes.Tag) {
+	if into[name] == nil {
+		into[name] = map[string]string{}
+	}
+	for _, t := range ts {
+		into[name][awssdk.ToString(t.Key)] = awssdk.ToString(t.Value)
+	}
 }
 
 func compactLen(doc string) int {

@@ -3,6 +3,7 @@ package plan
 import (
 	"time"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 )
 
@@ -84,9 +85,9 @@ type SpawnLauncher struct {
 	// RunID and Command populate the calque:run-id/calque:command tags
 	// (calque#166) — without these, an interrupted run leaves an instance
 	// discoverable only by launch time/instance type (see
-	// docs/guide/troubleshooting.md's pre-#166 workaround). Empty RunID
-	// skips tagging entirely (some callers, e.g. spawn-run's per-callable
-	// launches, may not have a single run-id concept yet).
+	// docs/guide/troubleshooting.md's pre-#166 workaround). An empty RunID
+	// leaves out calque:run-id and spore-host:scope only: since calque#227
+	// every instance calque launches is tagged as calque's.
 	RunID   string
 	Command string // "real", "ramp", "smoke", "spawn-run", ...
 }
@@ -122,18 +123,32 @@ func (s SpawnLauncher) Build() spawnaws.LaunchConfig {
 	}
 }
 
-// tags builds the calque:* tag set (calque#166). Returns nil (not an empty
-// map) when RunID is unset, so callers that don't yet have a run-id concept
-// launch exactly as before — spawn's own buildTags() treats a nil user-tag
-// map as "no additional tags", not an error.
+// tags builds the instance's calque tag set: calque:* (calque#166) plus the
+// shared spore-host:* set (calque#227), with spore-host:managed-by=calque.
+//
+// managed-by is calque, not spawn, on an instance calque launches through
+// spawn: calque owns its lifecycle (it terminates it, drains it, deletes its
+// pool), so calque is the tool that must remove it. spawn still writes its
+// own spawn:* tags, and its TTL enforcement keys on those, so the backstop is
+// unchanged. spawn v0.131.0 appends these caller tags after its own and keeps
+// the FIRST of any repeated key (pkg/aws/tags.go buildTags, appendTagUnique);
+// it writes no spore-host:* key itself, so calque's value is the one the
+// instance gets.
+//
+// Every launch is tagged, including one with no RunID (gpuprobe): an
+// instance calque launched but did not tag would be invisible to calque's
+// cleanup. Without a RunID, calque:run-id and spore-host:scope are left out.
 func (s SpawnLauncher) tags() map[string]string {
-	if s.RunID == "" {
-		return nil
+	now := time.Now()
+	m := calquetags.ForRun(s.RunID, now)
+	if s.RunID != "" {
+		// EC2 takes any tag value; keep the run id verbatim, as before
+		// calque#227, so an existing tag filter on it still matches.
+		m[calquetags.RunID] = s.RunID
 	}
-	return map[string]string{
-		"calque:run-id":     s.RunID,
-		"calque:managed":    "true",
-		"calque:command":    s.Command,
-		"calque:created-at": time.Now().UTC().Format(time.RFC3339),
+	m["calque:created-at"] = now.UTC().Format(time.RFC3339)
+	if s.Command != "" {
+		m["calque:command"] = s.Command
 	}
+	return m
 }

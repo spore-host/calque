@@ -5,7 +5,11 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+
+	"github.com/spore-host/calque/internal/calquetags"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 )
 
@@ -44,7 +48,7 @@ func RealRunPolicy(account, region, bucket string, extraBuckets []string) string
 	bkt := fmt.Sprintf("arn:aws:s3:::%s", bucket)
 	ecrRepos := fmt.Sprintf("arn:aws:ecr:%s:%s:repository/*", region, account)
 	stmts := []string{
-		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":[%q]}`, obj),
+		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:PutObjectTagging"],"Resource":[%q]}`, obj),
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, bkt),
 		`{"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":["*"]}`,
 		fmt.Sprintf(`{"Effect":"Allow","Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],"Resource":[%q]}`, ecrRepos),
@@ -97,20 +101,38 @@ func RealRunPolicy(account, region, bucket string, extraBuckets []string) string
 // extraBuckets (calque#91 Workstream A) threads through to RealRunPolicy —
 // see its doc comment. nil/empty (the default, every pre-#91 caller)
 // reproduces prior behavior byte-for-byte.
+//
+// calque#227: the role and profile are tagged spore-host:managed-by=calque
+// with scope bucket:<bucket> (RealRunRoleTags). spawn applies IAMRoleConfig.Tags
+// only when it CREATES the role, so a role an older calque made is brought up
+// to date afterwards, on every call (calquetags.EnsureRoleTags); a failure to
+// tag is a warning, not a failed run.
 func RealRunInstanceProfile(ctx context.Context, client *spawnaws.Client, region, bucket string, extraBuckets ...string) (string, error) {
 	account, err := client.GetAccountID(ctx)
 	if err != nil {
 		return "", fmt.Errorf("resolve account id: %w", err)
 	}
+	role := roleNameForBucket(bucket)
+	now := time.Now()
 	profile, err := client.CreateOrGetInstanceProfile(ctx, spawnaws.IAMRoleConfig{
-		RoleName:         roleNameForBucket(bucket),
+		RoleName:         role,
 		TrustServices:    []string{"ec2"},
 		InlinePolicyJSON: RealRunPolicy(account, region, bucket, extraBuckets),
+		// A fresh map: spawn adds its own spawn:* keys to the one it is given.
+		Tags: RealRunRoleTags(bucket, now),
 	})
 	if err != nil {
 		return "", fmt.Errorf("set up real-run IAM instance profile: %w", err)
 	}
+	calquetags.WarnRoleTags(ctx, iam.NewFromConfig(client.Config()), role, RealRunRoleTags(bucket, now))
 	return profile, nil
+}
+
+// RealRunRoleTags is the tag set of the per-bucket real-run role and its
+// instance profile (calque#227): the calque/spore-host set with scope
+// bucket:<bucket>, since the role is shared by every run against that bucket.
+func RealRunRoleTags(bucket string, now time.Time) map[string]string {
+	return calquetags.For(calquetags.BucketScope(bucket), now)
 }
 
 // roleNameForBucket derives a stable, IAM-name-legal role name from a

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	smithy "github.com/aws/smithy-go"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	"github.com/spore-host/spawn/pkg/taskpool"
 )
 
@@ -20,9 +22,14 @@ import (
 // calque#131's heartbeat extension — which taskpool.SQSAPI does not declare
 // (spawn's fungible, short-lived CPU tasks have no heartbeat need). A real
 // *sqs.Client satisfies both this and taskpool.SQSAPI unchanged.
+//
+// ListQueueTags and TagQueue (calque#227) bring an existing queue's tags up
+// to date; see createTaggedQueue.
 type SQSAPI interface {
 	taskpool.SQSAPI
 	ChangeMessageVisibility(ctx context.Context, in *sqs.ChangeMessageVisibilityInput, opts ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
+	ListQueueTags(ctx context.Context, in *sqs.ListQueueTagsInput, opts ...func(*sqs.Options)) (*sqs.ListQueueTagsOutput, error)
+	TagQueue(ctx context.Context, in *sqs.TagQueueInput, opts ...func(*sqs.Options)) (*sqs.TagQueueOutput, error)
 }
 
 // SQSQueue is the production pool.Queue: an SQS-backed adapter reusing spawn's
@@ -39,8 +46,8 @@ type SQSAPI interface {
 // on it would silently kill a long-idle-but-still-valid pool. So this type
 // mirrors taskpool's Claim/Ack/CreateQueue/OpenQueue LOGIC (idempotent create,
 // eventual-consistency retry on GetQueueUrl) against calque's own naming and
-// SQS defaults (no forced retention override), rather than importing the
-// run-scoped type verbatim.
+// SQS's default 4-day message retention (poolQueueRetentionSeconds), rather
+// than importing the run-scoped type verbatim.
 type SQSQueue struct {
 	client SQSAPI
 	url    string
@@ -48,26 +55,111 @@ type SQSQueue struct {
 
 var _ Queue = (*SQSQueue)(nil)
 
+// poolQueueRetentionSeconds is a pool queue's MessageRetentionPeriod: 4
+// days, which is SQS's own default, now stated rather than implied
+// (calque#227). It bounds how long an unclaimed claim ref waits; it does NOT
+// expire the queue. SQS has no queue expiry: retention drops MESSAGES, and an
+// idle pool queue lives until `calque pool delete` (or calque#228's
+// teardown, which finds it by its spore-host:managed-by=calque tag).
+//
+// It must stay the SQS default. CreateQueue on an existing name succeeds only
+// when every attribute it is given matches the queue's, and pool queues made
+// before calque#227 have the default, so any other value would make
+// `calque pool create` fail on every pool that already exists.
+const poolQueueRetentionSeconds = "345600"
+
 // CreatePoolQueue creates (idempotently) the queue for a named model pool.
 // visibilityTimeout must exceed the longest expected single-claim drain time,
 // or a slow claim gets redelivered and double-run while still in flight —
 // same sizing rule as taskpool.CreateQueue.
+//
+// The queue is tagged PoolQueueTags(model) (calque#227); see
+// createTaggedQueue.
 func CreatePoolQueue(ctx context.Context, client SQSAPI, model string, visibilityTimeout int) (*SQSQueue, error) {
 	name := PoolQueueName(model)
-	out, err := client.CreateQueue(ctx, &sqs.CreateQueueInput{
-		QueueName: aws.String(name),
-		Attributes: map[string]string{
-			"VisibilityTimeout": fmt.Sprintf("%d", visibilityTimeout),
-			// No MessageRetentionPeriod override: SQS's own default (4 days) is
-			// fine here since, unlike a run-scoped queue, nothing else expires
-			// this queue on a fixed schedule — its lifetime is "as long as the
-			// pool exists," ended by an explicit `calque pool delete`, not time.
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create pool queue %s: %w", name, err)
+	return createTaggedQueue(ctx, client, name, map[string]string{
+		"VisibilityTimeout": fmt.Sprintf("%d", visibilityTimeout),
+		// The lifetime of the queue itself is "as long as the pool exists",
+		// ended by an explicit `calque pool delete`, not time; see
+		// poolQueueRetentionSeconds.
+		"MessageRetentionPeriod": poolQueueRetentionSeconds,
+	}, PoolQueueTags(model, time.Now()))
+}
+
+// PoolQueueTags is the tag set of a pool's queue (calque#227): the
+// calque/spore-host set with scope pool:<model>, plus calque:pool-model.
+func PoolQueueTags(model string, now time.Time) map[string]string {
+	m := calquetags.For(calquetags.PoolScope(model), now)
+	m[calquetags.PoolModel] = calquetags.Value(model)
+	return m
+}
+
+// RunQueueTags is the tag set of a fleet run's queue (calque#227): the
+// calque/spore-host set with scope run:<runID>, plus calque:fleet-run and
+// calque:run-id.
+func RunQueueTags(runID string, now time.Time) map[string]string {
+	m := calquetags.ForRun(runID, now)
+	m[calquetags.FleetRun] = calquetags.Value(runID)
+	return m
+}
+
+// createTaggedQueue creates (idempotently) the named queue with attrs, tagged
+// want at create (calque#227), and returns a handle to it.
+//
+// Tagging at create needs sqs:TagQueue as well as sqs:CreateQueue. Like
+// spawn's taskpool.CreateQueue, a caller without it gets an untagged queue
+// and a warning rather than a failed pool or fleet run.
+//
+// CreateQueue on an existing name returns that queue without applying the
+// tags it was given, so a queue an older calque created stays untagged by
+// it. (SQS documents only attributes as having to match an existing
+// queue's. In case tags count too, a QueueAlreadyExists on a tagged create is
+// retried once untagged; if that fails as well, the attributes really differ
+// and the error is returned.) The queue's tags are therefore read back and
+// anything missing or wrong is added with TagQueue (calquetags.Converge,
+// which also keeps the queue's first spore-host:created). That costs one ListQueueTags per create
+// and, for a queue already tagged, nothing else. Failing to read or write
+// tags is a warning: the queue works either way.
+func createTaggedQueue(ctx context.Context, client SQSAPI, name string, attrs, want map[string]string) (*SQSQueue, error) {
+	in := &sqs.CreateQueueInput{QueueName: aws.String(name), Attributes: attrs, Tags: maps.Clone(want)}
+	out, err := client.CreateQueue(ctx, in)
+	if err != nil && calquetags.IsAccessDenied(err) {
+		_, _ = fmt.Fprintf(calquetags.Warn, "[tags] WARNING: creating queue %s tagged was refused (needs sqs:TagQueue); "+
+			"creating it untagged, so calque's cleanup will not recognise it: %v\n", name, err)
+		in.Tags = nil
+		out, err = client.CreateQueue(ctx, in)
+		if err != nil {
+			return nil, fmt.Errorf("create queue %s: %w", name, err)
+		}
+		return &SQSQueue{client: client, url: aws.ToString(out.QueueUrl)}, nil
 	}
-	return &SQSQueue{client: client, url: aws.ToString(out.QueueUrl)}, nil
+	if err != nil && isQueueAlreadyExists(err) {
+		in.Tags = nil
+		out, err = client.CreateQueue(ctx, in)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create queue %s: %w", name, err)
+	}
+	url := aws.ToString(out.QueueUrl)
+	convergeQueueTags(ctx, client, name, url, want)
+	return &SQSQueue{client: client, url: url}, nil
+}
+
+func convergeQueueTags(ctx context.Context, client SQSAPI, name, url string, want map[string]string) {
+	have, err := client.ListQueueTags(ctx, &sqs.ListQueueTagsInput{QueueUrl: aws.String(url)})
+	if err != nil {
+		_, _ = fmt.Fprintf(calquetags.Warn, "[tags] WARNING: could not read queue %s's tags (needs sqs:ListQueueTags), "+
+			"so an untagged queue from an older calque stays untagged: %v\n", name, err)
+		return
+	}
+	add := calquetags.Converge(have.Tags, want)
+	if len(add) == 0 {
+		return
+	}
+	if _, err := client.TagQueue(ctx, &sqs.TagQueueInput{QueueUrl: aws.String(url), Tags: add}); err != nil {
+		_, _ = fmt.Fprintf(calquetags.Warn, "[tags] WARNING: could not tag queue %s (needs sqs:TagQueue); "+
+			"calque's cleanup will not recognise it: %v\n", name, err)
+	}
 }
 
 // poolOpenRetryDelay mirrors taskpool's openQueueRetryDelay — a package var so
@@ -104,6 +196,17 @@ func OpenPoolQueue(ctx context.Context, client SQSAPI, model string) (*SQSQueue,
 		}
 	}
 	return nil, fmt.Errorf("resolve pool queue %s: not visible after %d attempts: %w", name, poolOpenMaxAttempts, lastErr)
+}
+
+// isQueueAlreadyExists recognises CreateQueue's refusal for an existing name
+// whose attributes differ from the request's.
+func isQueueAlreadyExists(err error) bool {
+	var qne *types.QueueNameExists
+	if errors.As(err, &qne) {
+		return true
+	}
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "QueueAlreadyExists"
 }
 
 func isNonExistentQueue(err error) bool {
@@ -218,10 +321,10 @@ func (q *SQSQueue) Depth(ctx context.Context) (visible, inFlight int, err error)
 
 // DeleteQueue removes the pool's queue entirely — the destructive half of
 // `calque pool delete`'s full teardown (calque#130), mirroring
-// taskpool.Queue.Delete's shape exactly. Unlike a run-scoped taskpool queue
-// (which also expires on its own via MessageRetentionPeriod), a pool queue's
-// only end-of-life path is this explicit call — see CreatePoolQueue's own
-// comment ("ended by an explicit `calque pool delete`, not time").
+// taskpool.Queue.Delete's shape exactly. No SQS queue expires on its own
+// (MessageRetentionPeriod drops messages, not the queue), so this explicit
+// call is a queue's only end of life today; calque#228's teardown is the
+// backstop, finding a leftover queue by its calque#227 tags.
 func (q *SQSQueue) DeleteQueue(ctx context.Context) error {
 	_, err := q.client.DeleteQueue(ctx, &sqs.DeleteQueueInput{QueueUrl: aws.String(q.url)})
 	if err != nil {
@@ -255,8 +358,8 @@ func DeletePoolQueueIfExists(ctx context.Context, client SQSAPI, model string) e
 // keyed by RUN ID (not model) — the opposite scoping decision from
 // PoolQueueName, and deliberately so (calque#145): a fleet run's queue does
 // NOT outlive the run the way a pool's queue outlives any one run, so it's
-// scoped to (and expires with, via CreateRunQueue's MessageRetentionPeriod)
-// the run that created it, mirroring spawn's own taskpool.QueueName(runID)
+// scoped to the run that created it (and deleted by that run's cleanup,
+// DeleteRunQueueIfExists), mirroring spawn's own taskpool.QueueName(runID)
 // shape exactly rather than PoolQueueName's model-scoped one. Slugged the
 // same way PoolQueueName slugs a model — a runID is expected to already be
 // SQS-safe (calque's own runIDs are typically date-stamped identifiers), but
@@ -271,33 +374,25 @@ func RunQueueName(runID string) string {
 // too.
 const fleetQueuePrefix = "calque-fleet-"
 
-// runQueueRetentionSeconds mirrors spawn's taskpool.CreateQueue's own 12h
-// choice ("a queue outlives a slow run but a leaked queue still expires") —
-// the exact reasoning applies unchanged to a fleet run's queue, unlike a
-// pool queue's deliberately-unbounded lifetime (see CreatePoolQueue's own
-// comment on why IT has no retention override).
+// runQueueRetentionSeconds is a fleet run queue's MessageRetentionPeriod:
+// 12h, mirroring spawn's taskpool.CreateQueue. It bounds how long a shard's
+// claim can sit unclaimed. It does NOT expire the queue: SQS retention drops
+// messages, never the queue itself (calque#227 corrected a comment that said
+// otherwise). A run queue whose run's cleanup failed stays until something
+// deletes it; it is tagged (RunQueueTags) so calque#228's teardown can.
 const runQueueRetentionSeconds = "43200"
 
 // CreateRunQueue creates (idempotently) the shard queue for one fleet run,
 // keyed by runID (calque#145) — the run-scoped sibling to CreatePoolQueue's
-// model-scoped queue. Unlike a pool queue, this DOES set
-// MessageRetentionPeriod: a fleet run's queue is meant to expire on its own
-// if the run's own explicit teardown (DeleteRunQueueIfExists) is somehow
-// skipped, rather than living forever the way a pool's queue deliberately
-// does.
+// model-scoped queue, with a shorter message retention
+// (runQueueRetentionSeconds). Neither retention removes the queue: the run's
+// own teardown (DeleteRunQueueIfExists) does, and if that is skipped the
+// queue stays, tagged RunQueueTags(runID) (calque#227) so it can be found.
 func CreateRunQueue(ctx context.Context, client SQSAPI, runID string, visibilityTimeout int) (*SQSQueue, error) {
-	name := RunQueueName(runID)
-	out, err := client.CreateQueue(ctx, &sqs.CreateQueueInput{
-		QueueName: aws.String(name),
-		Attributes: map[string]string{
-			"VisibilityTimeout":      fmt.Sprintf("%d", visibilityTimeout),
-			"MessageRetentionPeriod": runQueueRetentionSeconds,
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create run queue %s: %w", name, err)
-	}
-	return &SQSQueue{client: client, url: aws.ToString(out.QueueUrl)}, nil
+	return createTaggedQueue(ctx, client, RunQueueName(runID), map[string]string{
+		"VisibilityTimeout":      fmt.Sprintf("%d", visibilityTimeout),
+		"MessageRetentionPeriod": runQueueRetentionSeconds,
+	}, RunQueueTags(runID, time.Now()))
 }
 
 // OpenRunQueue resolves an EXISTING fleet run's shard queue by run id (the

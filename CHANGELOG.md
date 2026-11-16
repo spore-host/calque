@@ -9,7 +9,49 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+### Added
+
+- **Everything calque creates is tagged `spore-host:managed-by=calque`**
+  (calque#227, part of the leave-no-trace epic spore-host/spore-host#752).
+  Each resource gets the shared spore.host set from `libs/tags`
+  (`spore-host:managed-by`, `spore-host:scope`, `spore-host:created`,
+  `spore-host:schema`) plus `calque:managed=true`, so calque#228's cleanup can
+  find exactly what calque made. Before, the SQS queues, the `calque-nfs-sg`
+  security group and the IAM roles carried no calque tag at all (the roles
+  only spawn's). Now tagged: the `calque-pool-<model>` and
+  `calque-fleet-<run-id>` queues (plus `calque:pool-model` /
+  `calque:fleet-run`); `calque-nfs-sg`; the `calque-real-run-<hash>`,
+  `calque-pool-worker` and `calque-fleet-worker` roles and their instance
+  profiles; baked AMIs and their snapshots; every instance calque launches,
+  including `gpuprobe`'s and a scaled-up pool worker's, which had none or
+  only some; and the S3 objects calque writes from Go (artifacts, manifest,
+  Dockerfile, results, summaries), with `calque:run-id`. On an instance spawn
+  launches for calque, `managed-by` is `calque`: calque owns its lifecycle,
+  and spawn's TTL backstop keys on its own `spawn:*` tags. A role, security
+  group or queue an older calque created untagged is tagged the next time
+  calque uses it, keeping any `spore-host:created` it already has. The
+  manifest now carries the run id (`run_id`) so warmd can tag what it writes.
+  Objects the instance writes with `aws s3 cp` (logs, markers) are not tagged
+  yet.
+
+- **New IAM actions for tagging:** `iam:TagRole`, `iam:TagInstanceProfile`,
+  `s3:PutObjectTagging`, `sqs:TagQueue` and `sqs:ListQueueTags`
+  (`ec2:CreateTags` was already needed). The instance roles calque manages
+  now grant `s3:PutObjectTagging` on the staging bucket. A missing tagging
+  permission never fails a run: the resource is created or written untagged
+  with a `[tags] WARNING`. `docs/guide/getting-started.md` lists them.
+
 ### Changed
+
+- **Pool queues state their message retention**: `MessageRetentionPeriod`
+  is now set to 345600 s (4 days), SQS's default, which pool queues already
+  had implicitly. It has to stay the default, since `CreateQueue` on an
+  existing pool queue fails when an attribute differs. Retention expires
+  messages, not the queue: an idle pool queue still lives until
+  `calque pool delete`, and calque#228 adds the backstop.
+
+- **`github.com/spore-host/libs` v0.52.0** is now a direct dependency (for
+  `libs/tags`); spawn stays at v0.131.0.
 
 - **Go dependencies:** truffle v0.49.0 → v0.60.0, spawn v0.100.0 → v0.106.0,
   lagotto v0.53.0 → v0.63.0, and the AWS SDK modules and smithy-go to the
@@ -23,6 +65,11 @@ per [semver.org](https://semver.org/#spec-item-4).
   just relocates the staleness somewhere quieter.
 
 ### Fixed
+
+- **The fleet cleanup warning no longer claims "12h retention will reap"** a
+  run queue it failed to delete. `MessageRetentionPeriod` expires messages,
+  never the queue; the warning now names the queue that stays. The same
+  wrong claim is corrected in `internal/pool/queue.go`'s comments.
 
 - **Concurrent pools and fleet runs no longer revoke each other's queue
   access** (calque#226). Every pool's workers run under the shared

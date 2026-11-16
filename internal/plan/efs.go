@@ -5,14 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/efs"
 
+	"github.com/spore-host/libs/tags/ec2tags"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 	spawnstorage "github.com/spore-host/spawn/pkg/storage"
 
+	"github.com/spore-host/calque/internal/calquetags"
 	"github.com/spore-host/calque/internal/ir"
 	"github.com/spore-host/calque/internal/leak"
 )
@@ -235,22 +238,36 @@ const nfsSecurityGroupName = "calque-nfs-sg"
 // nfsSecurityGroupName), CreateSecurityGroup fails with
 // InvalidGroup.Duplicate and this falls back to DescribeSecurityGroups
 // instead of erroring.
+//
+// calque#227: the group is tagged at create (NFSSecurityGroupTags:
+// spore-host:managed-by=calque, scope vpc:<vpc-id>, calque:managed=true). A
+// group found instead of created, e.g. one an older calque made untagged, has
+// its tags brought up to date with CreateTags; failing that is a warning,
+// since the group still works.
 func EnsureNFSSecurityGroup(ctx context.Context, ec2Client *ec2.Client, vpcID string) (string, error) {
-	if sgID, err := findNFSSecurityGroup(ctx, ec2Client, vpcID); err == nil && sgID != "" {
-		return sgID, nil
+	want := NFSSecurityGroupTags(vpcID, time.Now())
+	if sg, err := findNFSSecurityGroup(ctx, ec2Client, vpcID); err == nil && sg.id != "" {
+		convergeSGTags(ctx, ec2Client, sg, want)
+		return sg.id, nil
 	}
 
 	desc := "calque NFS/EFS ingress (calque#91 Workstream B)"
 	created, err := ec2Client.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
-		GroupName:   strPtr(nfsSecurityGroupName),
-		Description: strPtr(desc),
-		VpcId:       strPtr(vpcID),
+		GroupName:         strPtr(nfsSecurityGroupName),
+		Description:       strPtr(desc),
+		VpcId:             strPtr(vpcID),
+		TagSpecifications: ec2tags.Specifications(want, ec2types.ResourceTypeSecurityGroup),
 	})
 	if err != nil {
 		// Idempotency: someone else (a concurrent run, or a prior one whose
 		// DescribeSecurityGroups lookup above raced) already created it.
 		if isDuplicateGroupErr(err) {
-			return findNFSSecurityGroup(ctx, ec2Client, vpcID)
+			sg, ferr := findNFSSecurityGroup(ctx, ec2Client, vpcID)
+			if ferr != nil {
+				return "", ferr
+			}
+			convergeSGTags(ctx, ec2Client, sg, want)
+			return sg.id, nil
 		}
 		return "", fmt.Errorf("create NFS security group: %w", err)
 	}
@@ -293,7 +310,20 @@ func DefaultVPCID(ctx context.Context, ec2Client *ec2.Client) (string, error) {
 	return *out.Vpcs[0].VpcId, nil
 }
 
-func findNFSSecurityGroup(ctx context.Context, ec2Client *ec2.Client, vpcID string) (string, error) {
+// NFSSecurityGroupTags is the tag set of the calque-nfs-sg group in vpcID
+// (calque#227). The group is shared by every run in the VPC, so its scope is
+// the VPC.
+func NFSSecurityGroupTags(vpcID string, now time.Time) map[string]string {
+	return calquetags.For(calquetags.VPCScope(vpcID), now)
+}
+
+// nfsSecurityGroup is a found calque-nfs-sg: its ID and current tags.
+type nfsSecurityGroup struct {
+	id   string
+	tags map[string]string
+}
+
+func findNFSSecurityGroup(ctx context.Context, ec2Client *ec2.Client, vpcID string) (nfsSecurityGroup, error) {
 	out, err := ec2Client.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
 		Filters: []ec2types.Filter{
 			{Name: strPtr("group-name"), Values: []string{nfsSecurityGroupName}},
@@ -301,12 +331,29 @@ func findNFSSecurityGroup(ctx context.Context, ec2Client *ec2.Client, vpcID stri
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("describe NFS security group: %w", err)
+		return nfsSecurityGroup{}, fmt.Errorf("describe NFS security group: %w", err)
 	}
-	if len(out.SecurityGroups) == 0 {
-		return "", fmt.Errorf("no existing %s security group in vpc %s", nfsSecurityGroupName, vpcID)
+	if len(out.SecurityGroups) == 0 || out.SecurityGroups[0].GroupId == nil {
+		return nfsSecurityGroup{}, fmt.Errorf("no existing %s security group in vpc %s", nfsSecurityGroupName, vpcID)
 	}
-	return *out.SecurityGroups[0].GroupId, nil
+	g := out.SecurityGroups[0]
+	return nfsSecurityGroup{id: *g.GroupId, tags: ec2tags.ToMap(g.Tags)}, nil
+}
+
+// convergeSGTags adds whatever of want an existing group lacks (see
+// calquetags.Converge). Best-effort: a failure is warned about, not returned.
+func convergeSGTags(ctx context.Context, ec2Client *ec2.Client, sg nfsSecurityGroup, want map[string]string) {
+	add := calquetags.Converge(sg.tags, want)
+	if len(add) == 0 {
+		return
+	}
+	if _, err := ec2Client.CreateTags(ctx, &ec2.CreateTagsInput{
+		Resources: []string{sg.id},
+		Tags:      ec2tags.FromMap(add),
+	}); err != nil {
+		_, _ = fmt.Fprintf(calquetags.Warn, "[tags] WARNING: could not tag security group %s (%s; needs ec2:CreateTags); "+
+			"it works, but calque's cleanup will not recognise it: %v\n", sg.id, nfsSecurityGroupName, err)
+	}
 }
 
 // isDuplicateGroupErr reports whether err is EC2's InvalidGroup.Duplicate —
