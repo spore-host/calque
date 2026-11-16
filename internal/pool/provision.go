@@ -7,6 +7,7 @@ import (
 	"time"
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
 	"github.com/spore-host/cohort"
@@ -22,8 +23,12 @@ import (
 // bucket. A worker never needs write access to the queue itself (Submit is
 // the SUBMITTER's operation, not the worker's) — mirrors spawn's own
 // least-privilege split.
+//
+// calque#226: this document is written as the pool's OWN inline policy on the
+// shared calque-pool-worker role, named QueueGrantPolicyName(queue ARN), not
+// as the role's single shared policy. See iam.go.
 func WorkerPolicy(account, region, model, manifestBucket, resultsBucket string) string {
-	queueARN := fmt.Sprintf("arn:aws:sqs:%s:%s:%s", region, account, PoolQueueName(model))
+	queueARN := poolQueueARN(account, region, model)
 	manifestObj := fmt.Sprintf("arn:aws:s3:::%s/*", manifestBucket)
 	manifestBkt := fmt.Sprintf("arn:aws:s3:::%s", manifestBucket)
 	resultsObj := fmt.Sprintf("arn:aws:s3:::%s/*", resultsBucket)
@@ -37,6 +42,16 @@ func WorkerPolicy(account, region, model, manifestBucket, resultsBucket string) 
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, resultsBkt),
 	}
 	return `{"Version":"2012-10-17","Statement":[` + strings.Join(stmts, ",") + `]}`
+}
+
+// poolWorkerGrant is a pool's queue grant on the shared pool worker role
+// (calque#226).
+func poolWorkerGrant(account string, cfg CreateConfig) workerGrant {
+	return workerGrant{
+		Role:      PoolWorkerRoleName,
+		QueueARN:  poolQueueARN(account, cfg.Region, cfg.Model),
+		PolicyDoc: WorkerPolicy(account, cfg.Region, cfg.Model, cfg.ManifestBucket, cfg.ResultsBucket),
+	}
 }
 
 // defaultVisibilityTimeout mirrors cmd/calque/pool.go's own
@@ -116,13 +131,9 @@ func ProvisionWorkers(ctx context.Context, client *spawnaws.Client, cfg CreateCo
 	if err != nil {
 		return fmt.Errorf("resolve account id: %w", err)
 	}
-	iamProfile, err := client.CreateOrGetInstanceProfile(ctx, spawnaws.IAMRoleConfig{
-		RoleName:         "calque-pool-worker",
-		TrustServices:    []string{"ec2"},
-		InlinePolicyJSON: WorkerPolicy(account, cfg.Region, cfg.Model, cfg.ManifestBucket, cfg.ResultsBucket),
-	})
+	iamProfile, err := ensureWorkerProfile(ctx, client, iam.NewFromConfig(client.Config()), poolWorkerGrant(account, cfg))
 	if err != nil {
-		return fmt.Errorf("set up worker IAM instance profile: %w", err)
+		return err
 	}
 
 	visibilityTimeout := cfg.VisibilityTimeout
@@ -290,13 +301,9 @@ func ScaleWorkers(ctx context.Context, client *spawnaws.Client, cfg CreateConfig
 	if err != nil {
 		return fmt.Errorf("resolve account id: %w", err)
 	}
-	iamProfile, err := client.CreateOrGetInstanceProfile(ctx, spawnaws.IAMRoleConfig{
-		RoleName:         "calque-pool-worker",
-		TrustServices:    []string{"ec2"},
-		InlinePolicyJSON: WorkerPolicy(account, cfg.Region, cfg.Model, cfg.ManifestBucket, cfg.ResultsBucket),
-	})
+	iamProfile, err := ensureWorkerProfile(ctx, client, iam.NewFromConfig(client.Config()), poolWorkerGrant(account, cfg))
 	if err != nil {
-		return fmt.Errorf("set up worker IAM instance profile: %w", err)
+		return err
 	}
 
 	visibilityTimeout := cfg.VisibilityTimeout
@@ -469,11 +476,22 @@ func discoverPoolWorkerIDs(ctx context.Context, client taskcohort.LaunchAPI, mod
 // *spawnaws.Client rather than an interface. All the actual logic lives in
 // deletePool, which takes taskcohort.LaunchAPI + taskpool.SQSAPI so tests can
 // fake both without real AWS.
+//
+// calque#226: once the queue is gone, DeletePool also deletes THIS pool's
+// queue grant from the shared calque-pool-worker role (revokeQueueGrant), and
+// only that one. Other pools' grants on the same role are untouched. If the
+// queue could not be deleted the grant is kept, so a half-deleted pool's
+// surviving workers aren't cut off and a retried `calque pool delete` still
+// finds it.
 func DeletePool(ctx context.Context, client *spawnaws.Client, model, region string) error {
-	return deletePool(ctx, client, sqs.NewFromConfig(client.Config()), model, region)
+	account, err := client.GetAccountID(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve account id: %w", err)
+	}
+	return deletePool(ctx, client, sqs.NewFromConfig(client.Config()), iam.NewFromConfig(client.Config()), account, model, region)
 }
 
-func deletePool(ctx context.Context, client taskcohort.LaunchAPI, sqsClient SQSAPI, model, region string) error {
+func deletePool(ctx context.Context, client taskcohort.LaunchAPI, sqsClient SQSAPI, iamc IAMAPI, account, model, region string) error {
 	ids, err := discoverPoolWorkerIDs(ctx, client, model, region)
 	if err != nil {
 		return fmt.Errorf("discover pool %q workers: %w", model, err)
@@ -493,6 +511,13 @@ func deletePool(ctx context.Context, client taskcohort.LaunchAPI, sqsClient SQSA
 			return fmt.Errorf("%w (also failed to delete queue: %v)", drainErr, err)
 		}
 		return fmt.Errorf("delete pool %q queue: %w", model, err)
+	}
+
+	if err := revokeQueueGrant(ctx, iamc, PoolWorkerRoleName, poolQueueARN(account, region, model)); err != nil {
+		if drainErr != nil {
+			return fmt.Errorf("%w (also failed to revoke queue grant: %v)", drainErr, err)
+		}
+		return fmt.Errorf("delete pool %q: %w", model, err)
 	}
 	return drainErr
 }

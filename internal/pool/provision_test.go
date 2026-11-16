@@ -157,6 +157,8 @@ func (f *fakeLaunchAPI) terminatedCount() int {
 type fakeSQS struct {
 	mu     sync.Mutex
 	queues map[string]*fakeQueueState
+	// failDelete makes DeleteQueue fail (calque#226's keep-the-grant path).
+	failDelete bool
 }
 
 type fakeQueueState struct {
@@ -235,6 +237,9 @@ func (f *fakeSQS) DeleteQueue(_ context.Context, in *sqs.DeleteQueueInput, _ ...
 	url := aws.ToString(in.QueueUrl)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failDelete {
+		return nil, fmt.Errorf("fakeSQS: DeleteQueue failed (injected)")
+	}
 	for _, q := range f.queues {
 		if q.url == url {
 			q.deleted = true
@@ -268,7 +273,7 @@ func TestDeletePool_TerminatesOnlyThisModelsWorkers(t *testing.T) {
 	sqsc.seedQueue(PoolQueueName("resnet"), 2, 1)
 	sqsc.seedQueue(PoolQueueName("bert"), 0, 0)
 
-	if err := deletePool(context.Background(), launch, sqsc, "resnet", "us-east-1"); err != nil {
+	if err := deletePool(context.Background(), launch, sqsc, newFakeIAM(), testAccount, "resnet", "us-east-1"); err != nil {
 		t.Fatalf("deletePool: %v", err)
 	}
 
@@ -300,7 +305,7 @@ func TestDeletePool_NoWorkersStillDeletesQueue(t *testing.T) {
 	sqsc := newFakeSQS()
 	sqsc.seedQueue(PoolQueueName("resnet"), 0, 0)
 
-	if err := deletePool(context.Background(), launch, sqsc, "resnet", "us-east-1"); err != nil {
+	if err := deletePool(context.Background(), launch, sqsc, newFakeIAM(), testAccount, "resnet", "us-east-1"); err != nil {
 		t.Fatalf("deletePool: %v", err)
 	}
 	if !sqsc.queueDeleted(PoolQueueName("resnet")) {
@@ -316,7 +321,7 @@ func TestDeletePool_NoQueueIsNotAnError(t *testing.T) {
 	launch.seed("calque-pool-resnet-worker-0", "i-1", "resnet")
 	sqsc := newFakeSQS() // no queue seeded at all
 
-	if err := deletePool(context.Background(), launch, sqsc, "resnet", "us-east-1"); err != nil {
+	if err := deletePool(context.Background(), launch, sqsc, newFakeIAM(), testAccount, "resnet", "us-east-1"); err != nil {
 		t.Fatalf("deletePool with no pre-existing queue should succeed, got: %v", err)
 	}
 	if launch.terminatedCount() != 1 {

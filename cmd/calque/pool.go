@@ -175,7 +175,7 @@ func poolDeleteCmd(args []string) error {
 	fs := flag.NewFlagSet("pool delete", flag.ExitOnError)
 	model := fs.String("model", "", "pool identity to delete (required)")
 	region := fs.String("region", "us-east-1", "AWS region")
-	confirm := fs.Bool("i-understand-this-terminates-instances", false, "required: terminates every running worker instance in this pool and deletes its queue")
+	confirm := fs.Bool("i-understand-this-terminates-instances", false, "required: terminates every running worker instance in this pool and deletes its queue and IAM grant")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -196,7 +196,7 @@ func poolDeleteCmd(args []string) error {
 		return fmt.Errorf("delete pool %q: %w", *model, err)
 	}
 
-	fmt.Printf("pool %q deleted: workers terminated, queue removed\n", *model)
+	fmt.Printf("pool %q deleted: workers terminated, queue and its IAM grant removed\n", *model)
 	return nil
 }
 

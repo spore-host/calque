@@ -180,7 +180,7 @@ existing workers.
 |---|---|---|
 | `--model` | *(required)* | Pool identity to delete. |
 | `--region` | `us-east-1` | AWS region. |
-| `--i-understand-this-terminates-instances` | `false` | **Required.** Terminates EVERY running worker instance in this pool and deletes its queue. |
+| `--i-understand-this-terminates-instances` | `false` | **Required.** Terminates EVERY running worker instance in this pool, deletes its queue, and removes the pool's own queue grant from the shared `calque-pool-worker` role (calque#226). |
 
 ### `calque pool status [flags]` / `calque pool list [flags]` — read-only
 

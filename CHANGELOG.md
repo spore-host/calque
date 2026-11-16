@@ -24,6 +24,25 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Fixed
 
+- **Concurrent pools and fleet runs no longer revoke each other's queue
+  access** (calque#226). Every pool's workers run under the shared
+  `calque-pool-worker` role and every fleet run's under `calque-fleet-worker`.
+  Each provisioning call wrote its one-queue grant through spawn's
+  `CreateOrGetInstanceProfile`, which stores it as the role's single
+  `spawn-scoped-policy` and replaces the previous document. So creating
+  pool B removed pool A's queue grant, and pool A's workers lost access to
+  their queue. Each queue now gets its own inline policy, `q-<12 hex of
+  sha256(queue ARN)>`, added when the pool or fleet run is provisioned and
+  removed by `calque pool delete` or the fleet run's cleanup. Other inline
+  policies on the role are never touched. If a grant would push the role past
+  IAM's 10,240-byte inline-policy limit, provisioning fails with an error
+  that says so. It does not fall back to a broader grant. A leftover
+  `spawn-scoped-policy` from an older calque is logged and left in place,
+  then removed once the queue it grants is torn down. `calque pool` and
+  `calque fleetrun` now need `iam:DeleteRolePolicy`, and use
+  `iam:GetRolePolicy` and `iam:ListRolePolicies` where allowed
+  (`docs/guide/getting-started.md`).
+
 - **`gpu="A100-80GB"` gets 80 GB GPUs** (truffle#245). Resolving a card with a
   memory size returned p4d.24xlarge (8× A100 **40 GB**) as well as
   p4de.24xlarge (80 GB), so an 80 GB job could be placed on GPUs too small for

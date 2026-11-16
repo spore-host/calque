@@ -219,6 +219,11 @@ func fleetRun(o realOpts, shards int) (err error) {
 	}
 	if err := calpool.ProvisionFleetWorkers(ctx, spawnClient, fleetCfg); err != nil {
 		_ = calpool.DeleteRunQueueIfExists(ctx, sqsClient, o.runID) // nothing to drain — provisioning itself failed
+		// calque#226: provisioning may have failed AFTER this run's queue grant
+		// was written; remove it (a no-op if it never was).
+		if rerr := calpool.RevokeFleetWorkerGrant(context.Background(), spawnClient, o.runID, o.region); rerr != nil {
+			fmt.Fprintf(os.Stderr, "[fleet] WARNING: revoke fleet worker queue grant failed for run %s: %v\n", o.runID, rerr)
+		}
 		return fmt.Errorf("provision fleet workers: %w", err)
 	}
 	fmt.Printf("[fleet] %d worker(s) ready for run %s\n", ceiling, o.runID)
@@ -229,6 +234,13 @@ func fleetRun(o realOpts, shards int) (err error) {
 		}
 		if derr := calpool.DeleteRunQueueIfExists(context.Background(), sqsClient, o.runID); derr != nil {
 			fmt.Fprintf(os.Stderr, "[fleet] WARNING: delete run queue failed for run %s: %v (12h retention will reap)\n", o.runID, derr)
+		}
+		// calque#226: remove ONLY this run's inline policy from the shared
+		// calque-fleet-worker role. Unlike pool delete this runs even if the
+		// queue delete failed: a fleet run is one-shot, nothing retries this
+		// cleanup, and its workers are already drained.
+		if derr := calpool.RevokeFleetWorkerGrant(context.Background(), spawnClient, o.runID, o.region); derr != nil {
+			fmt.Fprintf(os.Stderr, "[fleet] WARNING: revoke fleet worker queue grant failed for run %s: %v\n", o.runID, derr)
 		}
 	}()
 

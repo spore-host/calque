@@ -29,7 +29,11 @@ Two different things need permissions, and they're easy to conflate:
    `iam:CreateInstanceProfile`, `iam:AddRoleToInstanceProfile`,
    `iam:PutRolePolicy`, `iam:AttachRolePolicy`, `iam:PassRole`) — an admin
    role satisfies this trivially; a narrowly-scoped role needs all of the
-   above explicitly.
+   above explicitly. `calque pool` and `calque fleetrun` additionally need
+   `iam:DeleteRolePolicy` (to remove a pool's or fleet run's queue grant
+   when it is torn down), and use `iam:GetRolePolicy` and
+   `iam:ListRolePolicies` best-effort, to migrate the pre-calque#226 shared
+   policy and to explain a full role.
 2. **The EC2 instance itself** gets a SEPARATE, narrower role that calque
    creates and manages for you — you never need to hand-write this one.
    `internal/plan/iam.go`'s `RealRunPolicy` grants:
@@ -86,6 +90,23 @@ ever tears down. Delete it yourself via the IAM console/CLI if you want it
 gone; calque has no `--i-understand-this-deletes-the-shared-role` verb for
 that (there's nothing sensitive stored in it — it's just a capability
 grant, scoped to that one bucket).
+
+**Pool and fleet workers** (`calque pool`, `calque fleetrun`) run under two
+shared roles, `calque-pool-worker` and `calque-fleet-worker`. Each pool or
+fleet run gets its OWN inline policy on that role, named `q-<12 hex>` from
+its queue's ARN (calque#226), granting that queue and the pool's buckets.
+It is added when the pool or fleet run is provisioned and removed by
+`calque pool delete` or the fleet run's cleanup; other pools' grants are
+never touched. IAM caps a role's inline policies at 10,240 bytes in total,
+which fits about a dozen concurrent pools (or fleet runs): each grant is
+about 700 bytes, and spawn's own baseline policy on the role about 1.3 KB. Past that, provisioning fails with an error saying so
+rather than falling back to a broader grant; delete pools you no longer
+need. Older calque versions wrote every pool's grant into one shared
+`spawn-scoped-policy`, so concurrent pools revoked each other's queue
+access. If a role still has that policy, calque logs it, leaves it in
+place, and removes it once the queue it grants is torn down (or a
+re-provisioned pool's own grant duplicates it). A legacy policy whose
+queue an older calque already deleted is not removed automatically.
 
 ### What region does calque use?
 
