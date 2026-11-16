@@ -93,6 +93,16 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "footprint":
+		if err := footprintCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	case "teardown":
+		if err := teardownCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	case "version":
 		printVersion()
 	default:
@@ -424,6 +434,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  calque ami delete <ami-id> [--region R] --i-understand-this-deletes-the-ami")
 	fmt.Fprintln(os.Stderr, "  calque spawn-run --bucket B --run-id ID --ami AMI [--instance m7i.large] <script.py> --i-understand-this-spends-money")
 	fmt.Fprintln(os.Stderr, "  calque session <checkout|checkin|status|list> ... (institutional MIG/MPS slice check-out/check-in, docs/tenancy-vs-session.md)")
+	fmt.Fprintln(os.Stderr, "  calque footprint [--region R | --all-regions] [--bucket B ...] [-o table|json]   # what calque created here (read-only)")
+	fmt.Fprintln(os.Stderr, "  calque teardown --plan <file|-> [--mode report|reap] [--yes]   # remove it; report mode is the default")
 	fmt.Fprintln(os.Stderr, "  calque version")
 }
 

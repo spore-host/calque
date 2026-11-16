@@ -185,9 +185,11 @@ the termination call.
    aws ec2 terminate-instances --region YOUR-REGION --instance-ids i-XXXXXXXX
    ```
 3. **The IAM role/instance profile is NOT something you need to clean up**
-   — it's a persistent, shared, reused resource across every run (see
-   [`getting-started.md`](getting-started.md)'s resource-inventory note),
-   not a per-run artifact left behind by an interrupted run.
+   after one interrupted run — it's a persistent, shared, reused resource
+   across every run (see [`getting-started.md`](getting-started.md)'s
+   resource-inventory note), not a per-run artifact. When you are done with
+   calque in an account, `calque footprint --all-regions` lists it and
+   everything else calque left, and `calque teardown` removes what is idle.
 4. **S3 objects under `runs/<run-id>/`** are harmless to leave — they're
    just artifacts/results, cost negligible storage, and don't represent
    ongoing spend the way a running instance does.

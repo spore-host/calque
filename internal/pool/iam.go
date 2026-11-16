@@ -2,8 +2,6 @@ package pool
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +18,7 @@ import (
 	"github.com/aws/smithy-go"
 
 	"github.com/spore-host/calque/internal/calquetags"
+	"github.com/spore-host/calque/pkg/calquefootprint"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 )
 
@@ -47,9 +46,9 @@ import (
 
 const (
 	// PoolWorkerRoleName is the shared role every pool's workers run under.
-	PoolWorkerRoleName = "calque-pool-worker"
+	PoolWorkerRoleName = calquefootprint.PoolWorkerRole
 	// FleetWorkerRoleName is the shared role every fleet run's workers run under.
-	FleetWorkerRoleName = "calque-fleet-worker"
+	FleetWorkerRoleName = calquefootprint.FleetWorkerRole
 
 	// legacySharedPolicyName is the inline policy pre-calque#226 calque wrote
 	// through spawn's CreateOrGetInstanceProfile (IAMRoleConfig.InlinePolicyJSON
@@ -59,7 +58,7 @@ const (
 	// queueGrantPrefix marks a calque per-queue grant. Only policies with this
 	// prefix are ever deleted by calque, and only the one for the queue being
 	// torn down.
-	queueGrantPrefix = "q-"
+	queueGrantPrefix = calquefootprint.QueueGrantPrefix
 
 	// roleInlinePolicyBudget is IAM's aggregate inline-policy size limit per
 	// role (whitespace excluded), quoted in the error a caller sees when a
@@ -106,8 +105,7 @@ func runQueueARN(account, region, runID string) string {
 // not the bare queue name, is hashed so the same model in two regions or two
 // accounts gets two grants.
 func QueueGrantPolicyName(queueARN string) string {
-	h := sha256.Sum256([]byte(queueARN))
-	return queueGrantPrefix + hex.EncodeToString(h[:])[:12]
+	return calquefootprint.QueueGrantPolicyName(queueARN)
 }
 
 // ErrRolePolicyBudget is returned (wrapped) when a queue grant doesn't fit in

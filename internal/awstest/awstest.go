@@ -41,6 +41,23 @@ const MiddlewareID = "calque/awstest"
 // check create calls: the Detector sits right after the SDK's service
 // metadata middleware, before this one at the end of Initialize.
 func Config(svcs Services) aws.Config {
+	r := RegionalServices{}
+	for name, h := range svcs {
+		r[name] = func(_, op string, in any) (any, error) { return h(op, in) }
+	}
+	return ConfigRegional(r)
+}
+
+// RegionalHandler is a Handler that is also told the region the call was
+// made in, for fakes that model resources per region.
+type RegionalHandler func(region, operation string, input any) (output any, err error)
+
+// RegionalServices maps an SDK service ID to its RegionalHandler.
+type RegionalServices map[string]RegionalHandler
+
+// ConfigRegional is Config for RegionalHandlers. Copy the config and set
+// Region to make calls in another region.
+func ConfigRegional(svcs RegionalServices) aws.Config {
 	cfg := aws.Config{Region: "us-east-1", Credentials: aws.AnonymousCredentials{}}
 	cfg.APIOptions = append(cfg.APIOptions, func(stack *middleware.Stack) error {
 		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc(MiddlewareID, func(ctx context.Context, in middleware.InitializeInput, _ middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
@@ -55,7 +72,7 @@ func Config(svcs Services) aws.Config {
 			if !ok {
 				return middleware.InitializeOutput{}, middleware.Metadata{}, fmt.Errorf("awstest: no handler for service %q (operation %s)", service, op)
 			}
-			out, err := h(op, in.Parameters)
+			out, err := h(awsmiddleware.GetRegion(ctx), op, in.Parameters)
 			return middleware.InitializeOutput{Result: out}, middleware.Metadata{}, err
 		}), middleware.After)
 	})

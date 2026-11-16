@@ -16,6 +16,7 @@ because the risk each guards against is a different *kind*:
 |---|---|---|
 | `--i-understand-this-spends-money` | ordinary AWS billing (acquiring an instance) | `smoke`, `real`, `ramp`, `pool create`/`scale`, `spawn-run` |
 | `--i-understand-this-terminates-instances` | destroying running infrastructure other commands don't touch | `pool delete` |
+| `--yes` | deleting what `calque footprint` found idle | `teardown --mode reap` |
 | `--i-understand-shared-gpu-has-no-isolation` | a *correctness/security* risk (no hardware isolation between tenants), not spend | `session checkout --backend mps` only — `--backend mig` needs none, since MIG is hardware-isolated |
 
 Every billable command refuses to run at all without its flag — there is
@@ -283,6 +284,81 @@ match, and does NOT release the slice on mismatch).
 
 `--instance-id` (required). Read-only — reports live occupancy and
 per-slice holders.
+
+## `calque footprint [flags]` — read-only
+
+Source: `cmd/calque/footprint.go`, `pkg/calquefootprint`. Lists what calque
+created in the account (calque#228, part of leave-no-trace
+spore-host/spore-host#752), classifies each resource, and says whether
+teardown may delete it. It deletes nothing.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--region` | `us-east-1` | Region to list. IAM is global and always listed. |
+| `--all-regions` | `false` | List every region enabled in the account. Exclusive with `--region`. Without it, IAM roles and instance profiles are always classed `active`, because an instance in a region not listed could be using them. |
+| `--bucket` | *(none)* | S3 bucket calque wrote into; repeatable, or comma-separated. calque keeps no record of the buckets you pass it, so it looks only in these, only under `runs/`, `fleet/` and `ami-bake/`, and reports only objects tagged `spore-host:managed-by=calque`. Untagged objects there are counted in a warning, not listed. |
+| `-o` | `table` | `table`, or `json`: the shared `libs/footprint` report (schema 1) plus a `details` object with message and worker counts, ENIs and the instances using each role. |
+| `--max-objects` | `10000` | Most S3 objects examined per bucket (one `GetObjectTagging` each). |
+
+What it lists: the `calque-real-run-*`, `calque-pool-worker` and
+`calque-fleet-worker` roles and instance profiles, and the per-queue
+grants (`q-*`) on the two worker roles; the `calque-pool-*` and
+`calque-fleet-*` queues; `calque-nfs-sg` in each VPC; baked AMIs and their
+snapshots (`calque:baked-image`); instances tagged `calque:managed=true`;
+and the S3 objects above.
+
+Each resource gets an **ownership**: `tagged` (it carries
+`spore-host:managed-by=calque`), `legacy-name` (only its name or a
+`calque:*` tag matched, from before calque#227), or `foreign` (another
+tool's `managed-by`). Only `tagged` resources are ever deleted.
+
+And a **class**:
+
+- `active`: instances; a queue with workers or messages; a security group
+  with network interfaces; a role or profile a live instance uses, or whose
+  queue grant is active; anything created or written within the 24 h grace;
+  and anything a failed listing could not rule out.
+- `user-data`: baked AMIs and their snapshots (delete them with
+  `calque ami delete`), and a run's `results/` and `summary.json`.
+- `litter`: the rest, such as idle queues, unused roles, grants whose queue is
+  gone or idle, security groups without network interfaces, and S3 staging
+  older than 24 h.
+
+`deletable` is the shared delete guard's verdict on ownership, name and
+class. An `active` resource passes it; teardown still leaves it, because
+its re-check just before the delete finds it in use.
+
+## `calque teardown --plan <file|-> [flags]` — destructive with `--mode reap`
+
+Source: `cmd/calque/footprint.go`. Takes a `calque footprint -o json`
+report as its plan and runs it through the shared executor
+(`libs/footprint.Execute`). The plan must be for the account the
+credentials belong to.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--plan` | *(required)* | The footprint JSON, a file or `-` for stdin. |
+| `--mode` | `report` | `report` re-checks every resource and says what would be deleted, deleting nothing. `reap` deletes. |
+| `--yes` | `false` | **Required** with `--mode reap`. |
+| `--lease-region` | `us-east-1` | Region of the `spore-host-lifecycle` table holding calque's account-wide teardown lease. |
+| `-o` | `table` | `table` or `json` (the executor's result). |
+
+Dependents go first: a queue before its grant, a grant and an instance
+profile before their role. Just before each delete the resource is read
+again: one whose tags changed (`spore-host:role=service`, another
+`managed-by`) is refused, and one in use by then (`in-use` in the output)
+is left, along with everything it depends on. Deleting a role removes it
+from its instance profiles, deletes the profiles calque owns, deletes its
+inline policies, detaches its managed policies, and deletes the role.
+Managed policies (spawn's `spored-*`, AWS's) are only ever detached, never
+deleted. Deleting `calque-nfs-sg` first revokes every rule that references
+it, including in your own EFS mount target's group. Instances, AMIs and
+snapshots are never deleted.
+
+Reap needs calque's teardown lease (`libs/lifecycle`), which a backstop
+claims once calque has been idle in the account for 24 h; it stops this
+teardown racing someone else's calque run in a shared account. Without
+it, reap refuses.
 
 ## `calque version`
 

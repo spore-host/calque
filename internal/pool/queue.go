@@ -14,6 +14,7 @@ import (
 	smithy "github.com/aws/smithy-go"
 
 	"github.com/spore-host/calque/internal/calquetags"
+	"github.com/spore-host/calque/pkg/calquefootprint"
 	"github.com/spore-host/spawn/pkg/taskpool"
 )
 
@@ -209,18 +210,7 @@ func isQueueAlreadyExists(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "QueueAlreadyExists"
 }
 
-func isNonExistentQueue(err error) bool {
-	var qde *types.QueueDoesNotExist
-	if errors.As(err, &qde) {
-		return true
-	}
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		code := apiErr.ErrorCode()
-		return code == "AWS.SimpleQueueService.NonExistentQueue" || code == "QueueDoesNotExist"
-	}
-	return false
-}
+func isNonExistentQueue(err error) bool { return calquefootprint.IsQueueNotFound(err) }
 
 // Claim receives up to one message, long-polling for waitSeconds (0..20).
 // Implements pool.Queue. A malformed body is dropped (deleted) immediately,
@@ -342,16 +332,7 @@ func (q *SQSQueue) DeleteQueue(ctx context.Context) error {
 // visible on the first lookup here is either already deleted or never
 // existed, and either way there is nothing further to wait for.
 func DeletePoolQueueIfExists(ctx context.Context, client SQSAPI, model string) error {
-	name := PoolQueueName(model)
-	out, err := client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(name)})
-	if err != nil {
-		if isNonExistentQueue(err) {
-			return nil // already gone — deletion is idempotent
-		}
-		return fmt.Errorf("resolve pool queue %s for deletion: %w", name, err)
-	}
-	q := &SQSQueue{client: client, url: aws.ToString(out.QueueUrl)}
-	return q.DeleteQueue(ctx)
+	return calquefootprint.DeleteQueueIfExists(ctx, client, PoolQueueName(model))
 }
 
 // RunQueueName derives the SQS queue name for a fleet run's shard queue,
@@ -372,7 +353,7 @@ func RunQueueName(runID string) string {
 // fleetQueuePrefix mirrors poolQueuePrefix's role for RunQueueName — a named
 // const so slugModel's length budget stays in lockstep with the prefix here
 // too.
-const fleetQueuePrefix = "calque-fleet-"
+const fleetQueuePrefix = calquefootprint.FleetQueuePrefix
 
 // runQueueRetentionSeconds is a fleet run queue's MessageRetentionPeriod:
 // 12h, mirroring spawn's taskpool.CreateQueue. It bounds how long a shard's
@@ -429,16 +410,7 @@ func OpenRunQueue(ctx context.Context, client SQSAPI, runID string) (*SQSQueue, 
 // tolerating the queue already being gone — mirrors
 // DeletePoolQueueIfExists's exact idempotent-delete shape and rationale.
 func DeleteRunQueueIfExists(ctx context.Context, client SQSAPI, runID string) error {
-	name := RunQueueName(runID)
-	out, err := client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(name)})
-	if err != nil {
-		if isNonExistentQueue(err) {
-			return nil // already gone — deletion is idempotent
-		}
-		return fmt.Errorf("resolve run queue %s for deletion: %w", name, err)
-	}
-	q := &SQSQueue{client: client, url: aws.ToString(out.QueueUrl)}
-	return q.DeleteQueue(ctx)
+	return calquefootprint.DeleteQueueIfExists(ctx, client, RunQueueName(runID))
 }
 
 // atoiDefault parses a decimal string, returning 0 on any non-digit —
