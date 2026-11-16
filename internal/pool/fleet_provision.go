@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+
 	"github.com/spore-host/cohort"
 	spawnaws "github.com/spore-host/spawn/pkg/aws"
 	"github.com/spore-host/spawn/pkg/launcher"
@@ -18,8 +20,12 @@ import (
 // needs write access to the queue itself either — Submit is fleetRun's
 // (the submitter's) operation, matching WorkerPolicy's own least-privilege
 // split.
+//
+// calque#226: written as the run's OWN inline policy on the shared
+// calque-fleet-worker role (QueueGrantPolicyName), and deleted by
+// RevokeFleetWorkerGrant when the run cleans up. See iam.go.
 func FleetWorkerPolicy(account, region, runID, manifestBucket, resultsBucket string) string {
-	queueARN := fmt.Sprintf("arn:aws:sqs:%s:%s:%s", region, account, RunQueueName(runID))
+	queueARN := runQueueARN(account, region, runID)
 	manifestObj := fmt.Sprintf("arn:aws:s3:::%s/*", manifestBucket)
 	manifestBkt := fmt.Sprintf("arn:aws:s3:::%s", manifestBucket)
 	resultsObj := fmt.Sprintf("arn:aws:s3:::%s/*", resultsBucket)
@@ -33,6 +39,16 @@ func FleetWorkerPolicy(account, region, runID, manifestBucket, resultsBucket str
 		fmt.Sprintf(`{"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":[%q]}`, resultsBkt),
 	}
 	return `{"Version":"2012-10-17","Statement":[` + strings.Join(stmts, ",") + `]}`
+}
+
+// fleetWorkerGrant is a fleet run's queue grant on the shared fleet worker
+// role (calque#226).
+func fleetWorkerGrant(account string, cfg FleetCreateConfig) workerGrant {
+	return workerGrant{
+		Role:      FleetWorkerRoleName,
+		QueueARN:  runQueueARN(account, cfg.Region, cfg.RunID),
+		PolicyDoc: FleetWorkerPolicy(account, cfg.Region, cfg.RunID, cfg.ManifestBucket, cfg.ResultsBucket),
+	}
 }
 
 // buildFleetWorkerBootstrapCommand emits the on-instance command that runs
@@ -142,13 +158,9 @@ func ProvisionFleetWorkers(ctx context.Context, client *spawnaws.Client, cfg Fle
 	if err != nil {
 		return fmt.Errorf("resolve account id: %w", err)
 	}
-	iamProfile, err := client.CreateOrGetInstanceProfile(ctx, spawnaws.IAMRoleConfig{
-		RoleName:         "calque-fleet-worker",
-		TrustServices:    []string{"ec2"},
-		InlinePolicyJSON: FleetWorkerPolicy(account, cfg.Region, cfg.RunID, cfg.ManifestBucket, cfg.ResultsBucket),
-	})
+	iamProfile, err := ensureWorkerProfile(ctx, client, iam.NewFromConfig(client.Config()), fleetWorkerGrant(account, cfg))
 	if err != nil {
-		return fmt.Errorf("set up worker IAM instance profile: %w", err)
+		return err
 	}
 
 	visibilityTimeout := cfg.VisibilityTimeout
