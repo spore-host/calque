@@ -17,7 +17,7 @@ require (
 	github.com/aws/smithy-go v1.28.5
 	github.com/spore-host/cohort v0.2.0
 	github.com/spore-host/lagotto v0.64.1
-	github.com/spore-host/libs v0.53.1-0.20261117005106-898366172245
+	github.com/spore-host/libs v0.55.0
 	github.com/spore-host/spawn v0.131.0
 	github.com/spore-host/truffle v0.62.1
 )
