@@ -11,6 +11,20 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ### Added
 
+- **The last mile, in report mode** (spore-host/libs#78, part of
+  leave-no-trace spore-host/spore-host#752). After `analyze`, `smoke`,
+  `real`, `ramp`, `pool`, `ami` and `spawn-run`, calque runs libs'
+  `lastmile` check: it reports a calque teardown whose lease went stale
+  (with what that teardown would still delete) and an empty
+  `spore-host-lifecycle` table in `us-east-1`. It deletes nothing, writes
+  nothing to the lifecycle table, never prints to stdout and never changes
+  the exit status. It adds at most 3 s to a command and checks at most once
+  per 6 h. Its findings go to the new debug log, `CALQUE_DEBUG=1` (stderr).
+  `SPORE_LASTMILE=off` turns it off. It does not run after `version`,
+  `help`, `footprint`, `teardown`, `run` or `session`. It needs
+  `dynamodb:GetItem` and `dynamodb:Scan` on `spore-host-lifecycle` in
+  `us-east-1`; without them it skips quietly.
+
 - **`calque footprint` and `calque teardown`: calque can now find and remove
   what it created** (calque#228, part of leave-no-trace
   spore-host/spore-host#752). Before, nothing deleted calque's roles, its
@@ -97,7 +111,8 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 - **`github.com/spore-host/libs` v0.53.0** is now a direct dependency (for
   `libs/tags`, and since calque#228 `libs/footprint` and `libs/lifecycle`);
-  spawn stays at v0.131.0.
+  spawn stays at v0.131.0. For the last mile it moves to the commit that
+  adds `libs/lastmile` (libs#84): libs v0.54.0 was tagged without it.
 
 - **Go dependencies:** truffle v0.49.0 → v0.60.0, spawn v0.100.0 → v0.106.0,
   lagotto v0.53.0 → v0.63.0, and the AWS SDK modules and smithy-go to the

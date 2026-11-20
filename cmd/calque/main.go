@@ -35,80 +35,69 @@ import (
 const bedrockRegion = "us-east-1"
 
 func main() {
-	if len(os.Args) < 2 {
+	os.Exit(realMain(os.Args[1:], defaultLastMileEnv(), dispatch))
+}
+
+// realMain runs one calque command and returns its exit status. The last mile
+// (lastmile.go) starts alongside the command and is joined before returning;
+// it never changes the status dispatch returns.
+func realMain(args []string, lm lastMileEnv, cmd func([]string) int) int {
+	finish := startLastMile(args, lm)
+	code := cmd(args)
+	finish()
+	return code
+}
+
+// dispatch runs the subcommand args[0] and returns its exit status: 0 on
+// success, 1 on error, 2 on a usage error.
+func dispatch(args []string) int {
+	if len(args) < 1 {
 		usage()
-		os.Exit(2)
+		return 2
 	}
-	switch os.Args[1] {
+	var err error
+	switch args[0] {
 	case "analyze":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			usage()
-			os.Exit(2)
+			return 2
 		}
-		if err := analyze(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = analyze(args[1:])
 	case "run":
-		if err := runCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = runCmd(args[1:])
 	case "smoke":
-		if err := smokeCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = smokeCmd(args[1:])
 	case "real":
-		if err := realCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = realCmd(args[1:])
 	case "ramp":
-		if err := rampCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = rampCmd(args[1:])
 	case "pool":
-		if err := poolCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = poolCmd(args[1:])
 	case "ami":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			usage()
-			os.Exit(2)
+			return 2
 		}
-		if err := amiCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = amiCmd(args[1:])
 	case "spawn-run":
-		if err := spawnRunCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = spawnRunCmd(args[1:])
 	case "session":
-		if err := sessionCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = sessionCmd(args[1:])
 	case "footprint":
-		if err := footprintCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = footprintCmd(args[1:])
 	case "teardown":
-		if err := teardownCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		err = teardownCmd(args[1:])
 	case "version":
 		printVersion()
 	default:
 		usage()
-		os.Exit(2)
+		return 2
 	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	return 0
 }
 
 func runCmd(args []string) error {

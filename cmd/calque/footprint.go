@@ -164,6 +164,10 @@ type teardownOpts struct {
 	output      string
 }
 
+// defaultLeaseRegion is where calque keeps its one lifecycle item (scope
+// global): the --lease-region default, and where the last mile looks.
+const defaultLeaseRegion = "us-east-1"
+
 // noLeaseFlag is hidden from --help: it is a last resort, not an option.
 const noLeaseFlag = "i-understand-no-lease"
 
@@ -173,7 +177,7 @@ func parseTeardownArgs(args []string) (teardownOpts, error) {
 	mode := fs.String("mode", string(footprint.ModeReport), "report (say what would be deleted) or reap (delete it)")
 	yes := fs.Bool("yes", false, "required with --mode reap")
 	noLease := fs.Bool(noLeaseFlag, false, "reap without the shared-account teardown lease")
-	leaseRegion := fs.String("lease-region", "us-east-1", "region of the spore-host-lifecycle table holding calque's account-wide teardown lease")
+	leaseRegion := fs.String("lease-region", defaultLeaseRegion, "region of the spore-host-lifecycle table holding calque's account-wide teardown lease")
 	out := fs.String("o", "table", "output: table or json")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(fs.Output(), "usage: calque teardown --plan <file|-> [--mode report|reap] [--yes] [--lease-region R] [-o table|json]")

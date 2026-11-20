@@ -360,6 +360,36 @@ claims once calque has been idle in the account for 24 h; it stops this
 teardown racing someone else's calque run in a shared account. Without
 it, reap refuses.
 
+## After a command: the last mile
+
+Source: `cmd/calque/lastmile.go` (spore-host/libs#78, part of
+leave-no-trace spore-host/spore-host#752). After `analyze`, `smoke`,
+`real`, `ramp`, `pool`, `ami` and `spawn-run`, calque runs libs'
+`lastmile` check, in report mode: it looks for a calque teardown lease in
+the `spore-host-lifecycle` table in `us-east-1` whose holder stopped
+heartbeating, and for an empty lifecycle table there, and says what it
+would do. It deletes nothing and writes nothing to the table. It never
+writes to stdout, never changes the exit status, and adds at most 3 s to
+a command (the account lookup it needs runs alongside the command). Each
+check is rate-limited to once per 6 h per account, in
+`~/.spore-host/lifecycle.json`, so most invocations only read that file.
+
+It does not run after `version`, `help`, `footprint`, `teardown`, `run`
+(local, never touches AWS) or `session` (runs on the GPU host, local state
+only). None of calque's commands stream or run until interrupted, so none
+is skipped for being long-running: `smoke`, `real`, `ramp`, `spawn-run`,
+`ami bake` and `pool create` end once their resources are released, which
+is when a leftover would show.
+
+| Variable | Effect |
+|---|---|
+| `SPORE_LASTMILE` | `off` turns the last mile off. `report` (also unset or unknown) reports. `reap` is reserved for libs#79 and runs as `report` for now. |
+| `CALQUE_DEBUG` | Any value but empty, `0`, `false`, `no` or `off` prints the last mile's findings and its one-line summary to stderr, prefixed `debug:`. |
+
+Without `dynamodb:GetItem` and `dynamodb:Scan` on that table it skips
+quietly (a `CALQUE_DEBUG` line); see
+[`getting-started.md`](getting-started.md) for the permissions.
+
 ## `calque version`
 
 Source: `cmd/calque/version.go`. No flags. Prints `Version`/`GitCommit`/

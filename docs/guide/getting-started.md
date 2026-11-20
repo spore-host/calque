@@ -69,6 +69,20 @@ Two different things need permissions, and they're easy to conflate:
    `spore-host-lifecycle` table in `--lease-region`. Teardown never calls
    `iam:DeletePolicy`, `ec2:TerminateInstances` or
    `ec2:DeregisterImage`.
+
+   **The last mile (spore-host/libs#78).** After most commands calque
+   spends a moment checking whether a calque teardown in your account was
+   left half-done, and notes what it would do about it. It only reports:
+   it deletes nothing, writes nothing to the lifecycle table, never prints
+   to stdout and never changes the exit status, and it checks at most once
+   every 6 h (its state is in `~/.spore-host/lifecycle.json`). It needs
+   `dynamodb:GetItem` and `dynamodb:Scan` on the `spore-host-lifecycle`
+   table in `us-east-1`, which none of the permissions above include; if
+   it finds a stale teardown, it also uses the `calque footprint` reads
+   above to list what that teardown would still delete. Without them it
+   skips quietly: grant those two DynamoDB reads to enable it. Set
+   `CALQUE_DEBUG=1` to see what it checked (on stderr), and
+   `SPORE_LASTMILE=off` to turn it off.
 2. **The EC2 instance itself** gets a SEPARATE, narrower role that calque
    creates and manages for you — you never need to hand-write this one.
    `internal/plan/iam.go`'s `RealRunPolicy` grants:
