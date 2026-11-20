@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.9
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.15
 	github.com/aws/aws-sdk-go-v2/service/bedrock v1.74.0
+	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.70.3
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.340.0
 	github.com/aws/aws-sdk-go-v2/service/efs v1.50.0
 	github.com/aws/aws-sdk-go-v2/service/iam v1.64.4
@@ -16,7 +17,7 @@ require (
 	github.com/aws/smithy-go v1.28.5
 	github.com/spore-host/cohort v0.2.0
 	github.com/spore-host/lagotto v0.64.1
-	github.com/spore-host/libs v0.53.0
+	github.com/spore-host/libs v0.53.1-0.20261117005106-898366172245
 	github.com/spore-host/spawn v0.131.0
 	github.com/spore-host/truffle v0.62.1
 )
@@ -34,7 +35,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/account v1.32.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.73.0 // indirect
-	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.70.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ebs v1.34.7 // indirect
 	github.com/aws/aws-sdk-go-v2/service/eventbridge v1.55.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/fsx v1.65.10 // indirect
