@@ -9,6 +9,8 @@ per [semver.org](https://semver.org/#spec-item-4).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-20
+
 ### Added
 
 - **The last mile, in report mode** (spore-host/libs#78, part of
